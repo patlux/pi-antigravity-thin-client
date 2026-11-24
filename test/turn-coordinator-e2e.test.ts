@@ -18,6 +18,7 @@ import {
 	AgyTurnMirrorBroker,
 	createAgyMirrorToolDefinitions,
 } from "../src/tools/agy-mirror-tools.ts";
+import { THIN_CLIENT_DISABLED } from "./thin-client-skip.ts";
 
 /**
  * 生成一个纯 Node.js 标准库编写的跨平台模拟 `agy acp` 服务端脚本，
@@ -1135,7 +1136,7 @@ function createStubPiApi(): ExtensionAPI {
 }
 
 describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
-	it("模式 B (pi-tools)：完成 HTTP MCP Park-and-Yield 挂起、宿主工具执行与同轮续接", async () => {
+	it("模式 B (pi-tools)：完成 HTTP MCP Park-and-Yield 挂起、宿主工具执行与同轮续接", { skip: THIN_CLIENT_DISABLED }, async () => {
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-b-"));
 		const binPath = writeMockAgyExecutable(tmpRoot);
 		const cfg: BridgeConfig = {
@@ -1281,8 +1282,15 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 
 		try {
 			// 第 1 步：启动流，预期在原生 tool_call 处自动分片，产出 agy_edit 工具调用
+			// Pi's agent loop declares the active mirror tools in agy-tools mode.
+			const declaredMirrorTools = mirrorTools.map((t) => ({
+				name: t.name,
+				description: t.description,
+				parameters: t.parameters,
+			}));
 			const ctx1 = normalizeContext({
 				messages: [{ role: "user", content: "Update src/app.ts", timestamp: 1 }],
+				tools: declaredMirrorTools,
 			});
 			const stream1 = coord.streamSimple(TEST_MODEL, ctx1, { sessionId: "pi-sess-a" });
 			const events1: AssistantMessageEvent[] = [];
@@ -1325,6 +1333,7 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 						timestamp: 2,
 					},
 				],
+				tools: declaredMirrorTools,
 			});
 			const stream2 = coord.streamSimple(TEST_MODEL, ctx2, { sessionId: "pi-sess-a" });
 			const msg2 = await stream2.result();
@@ -1354,11 +1363,23 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 		const pm = new AcpProcessManager();
 		const broker = new AgyTurnMirrorBroker();
 		const coord = new TurnCoordinator(createStubPiApi(), pm, broker, cfg);
+		// Thin-client fork: only interactive sessions with declared mirror tools are served.
+		coord.setActiveContext({
+			hasUI: true,
+			cwd: tmpRoot,
+			ui: { setStatus() {} },
+		} as unknown as ExtensionContext);
+		const declaredMirrorTools = createAgyMirrorToolDefinitions(broker).map((t) => ({
+			name: t.name,
+			description: t.description,
+			parameters: t.parameters,
+		}));
 
 		try {
 			const ac = new AbortController();
 			const ctx = normalizeContext({
 				messages: [{ role: "user", content: "HANG_FOREVER", timestamp: 1 }],
+				tools: declaredMirrorTools,
 			});
 			const stream = coord.streamSimple(TEST_MODEL, ctx, {
 				sessionId: "pi-sess-esc",
@@ -1385,7 +1406,7 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 		}
 	});
 
-	it("运行中插入用户消息 (Steering) 不中断当前多步任务、未观测缓存前不伪造命中且后续追问正常吐字", async () => {
+	it("运行中插入用户消息 (Steering) 不中断当前多步任务、未观测缓存前不伪造命中且后续追问正常吐字", { skip: THIN_CLIENT_DISABLED }, async () => {
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-steer-"));
 		const binPath = writeMockAgyExecutable(tmpRoot);
 		const cfg: BridgeConfig = {
@@ -1499,7 +1520,7 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 		}
 	});
 
-	it("按下 Esc 取消运行中轮次后立即发送新消息仍能正常流式输出（不卡死）", async () => {
+	it("按下 Esc 取消运行中轮次后立即发送新消息仍能正常流式输出（不卡死）", { skip: THIN_CLIENT_DISABLED }, async () => {
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-cancel-next-"));
 		const binPath = writeMockAgyExecutable(tmpRoot);
 		const cfg: BridgeConfig = {
@@ -1553,7 +1574,7 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 		}
 	});
 
-	it("同次生成拆分多工具不重复累加 cacheRead、末步不倒灌累计 output 余量且 aborted 轮次绝不写入损坏锚点", async () => {
+	it("同次生成拆分多工具不重复累加 cacheRead、末步不倒灌累计 output 余量且 aborted 轮次绝不写入损坏锚点", { skip: THIN_CLIENT_DISABLED }, async () => {
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-telemetry-"));
 		const binPath = writeMockAgyExecutable(tmpRoot);
 		const cfg: BridgeConfig = {
@@ -1807,7 +1828,7 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 		}
 	});
 
-	it("轮次中修改 AGENTS.md 不触发死锁强杀、无 SSE 下动态工具经 session/resume 原地重载、hybrid 原生工具含 pi_tools 路径不误判", async () => {
+	it("轮次中修改 AGENTS.md 不触发死锁强杀、无 SSE 下动态工具经 session/resume 原地重载、hybrid 原生工具含 pi_tools 路径不误判", { skip: THIN_CLIENT_DISABLED }, async () => {
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-resilience-"));
 		const binPath = writeMockAgyExecutable(tmpRoot);
 		const agentsMdPath = path.join(tmpRoot, "AGENTS.md");
@@ -2007,7 +2028,7 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 		}
 	});
 
-	it("缓存命中率精度闭环：0% 未命中清零基准、跨生成不混入旧切片、多行 SQLite 仅取末条、大批量切片总扣减 <=1000 及中间步 WAL 延迟重试", async () => {
+	it("缓存命中率精度闭环：0% 未命中清零基准、跨生成不混入旧切片、多行 SQLite 仅取末条、大批量切片总扣减 <=1000 及中间步 WAL 延迟重试", { skip: THIN_CLIENT_DISABLED }, async () => {
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-cache-accuracy-"));
 		const binPath = writeMockAgyExecutable(tmpRoot);
 		const cfg: BridgeConfig = {
@@ -2246,7 +2267,7 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 		}
 	});
 
-	it("适配 pi-traffic-optimization 端到端：图片压缩零断连、批量 GC 在空闲边界按需重建瘦身会话、冷却期复用热缓存且关闭优化后还原完整上下文", async () => {
+	it("适配 pi-traffic-optimization 端到端：图片压缩零断连、批量 GC 在空闲边界按需重建瘦身会话、冷却期复用热缓存且关闭优化后还原完整上下文", { skip: THIN_CLIENT_DISABLED }, async () => {
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-traffic-opt-"));
 		const binPath = writeMockAgyExecutable(tmpRoot);
 		const cfg: BridgeConfig = {
@@ -2441,7 +2462,7 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 		}
 	});
 
-	it("超长历史与超长辅助压缩请求自动通过官方模板克隆 SQLite 多步预注入零额外调用恢复（保留 pi-bridge 规格），禁用 SQLite 时平滑降级至单步安全预算且保住末尾提问", async () => {
+	it("超长历史与超长辅助压缩请求自动通过官方模板克隆 SQLite 多步预注入零额外调用恢复（保留 pi-bridge 规格），禁用 SQLite 时平滑降级至单步安全预算且保住末尾提问", { skip: THIN_CLIENT_DISABLED }, async () => {
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-preload-"));
 		const binPath = writeMockAgyExecutable(tmpRoot, { seedTemplateDbOnNew: true });
 		const convDir = path.join(tmpRoot, ".gemini", "antigravity-cli", "conversations");
@@ -2638,7 +2659,7 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 		}
 	});
 
-	it("宿主 MCP 返回 > 9,600B 图片应延迟至同会话多模态 session/prompt 投递，<= 9,600B 小图直接走 MCP 内联", async () => {
+	it("宿主 MCP 返回 > 9,600B 图片应延迟至同会话多模态 session/prompt 投递，<= 9,600B 小图直接走 MCP 内联", { skip: THIN_CLIENT_DISABLED }, async () => {
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agy-mcp-deferred-img-"));
 		const mockBin = writeMockAgyExecutable(tmpRoot);
 		const cfg: BridgeConfig = {
@@ -2830,7 +2851,7 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 		}
 	});
 
-	it("并发双工具中第 1 个返回大图、第 2 个返回纯文本时应待第 2 个工具也结算后再统一切入投递大图", async () => {
+	it("并发双工具中第 1 个返回大图、第 2 个返回纯文本时应待第 2 个工具也结算后再统一切入投递大图", { skip: THIN_CLIENT_DISABLED }, async () => {
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agy-mcp-concurrent-img-"));
 		const mockBin = writeMockAgyExecutable(tmpRoot);
 		const cfg: BridgeConfig = {
@@ -2990,7 +3011,7 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 		}
 	});
 
-	it("宿主 MCP 返回 > 9,200B 大文本应切入同会话完整投递、并发超时剥离不丢结果，且隔离残留内置工具并自动续接 max_turn_requests", async () => {
+	it("宿主 MCP 返回 > 9,200B 大文本应切入同会话完整投递、并发超时剥离不丢结果，且隔离残留内置工具并自动续接 max_turn_requests", { skip: THIN_CLIENT_DISABLED }, async () => {
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-text-cutin-"));
 		const mockBin = writeMockAgyExecutable(tmpRoot);
 		const cfg: BridgeConfig = {

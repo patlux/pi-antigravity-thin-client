@@ -1,5 +1,13 @@
 # Pi Antigravity Bridge
 
+> **Thin-client fork (local).** Based on upstream v0.1.15 (`c74fd17`). For consumer `oauth-personal`
+> use this fork keeps Antigravity as the agent and Pi as a frontend only (`src/thin-client-policy.ts`):
+> `agy-tools` mode is pinned; Pi MCP servers, skills and `AGENTS.md` are never bridged; agy's
+> conversation databases are never written; earlier conversation, compaction summaries or another
+> model's history are never replayed; auxiliary requests (compaction, titles, recaps) and headless
+> use (subagents, workflows, `pi -p`) are refused. Start a new Pi session for each Antigravity
+> conversation. Upstream tests for the disabled features are skipped (`test/thin-client-skip.ts`).
+
 将 Google Antigravity CLI（`agy`）作为原生模型与 Agent 后端接入 [Pi](https://github.com/earendil-works/pi)（`@earendil-works/pi-coding-agent`），在完整的 Pi TUI 交互界面中直接使用 Antigravity 提供的模型、思考档位与工具生态。
 
 <p align="center">

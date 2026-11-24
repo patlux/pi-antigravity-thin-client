@@ -51,6 +51,7 @@ import {
 	QuotaSoftErrorFilter,
 	StepStreamWriter,
 } from "../src/stream/event-mapper.ts";
+import { THIN_CLIENT_DISABLED } from "./thin-client-skip.ts";
 
 describe("流式行尾缓冲、429 软错误拦截与 Usage 转换", () => {
 	it("零延迟放行正常文本并精确拦截跨块分片的 429 RESOURCE_EXHAUSTED 行", () => {
@@ -193,7 +194,7 @@ describe("流式行尾缓冲、429 软错误拦截与 Usage 转换", () => {
 });
 
 describe("会话摘要、历史重放与 SQLite 只读快照分叉", () => {
-	it("识别辅助摘要请求并在 FreshReplay 中保留历史多模态图片块", () => {
+	it("识别辅助摘要请求并在 FreshReplay 中保留历史多模态图片块", { skip: THIN_CLIENT_DISABLED }, () => {
 		const auxCtx = normalizeContext({
 			systemPrompt: "You are a context summarization assistant. Do not continue the conversation.",
 			messages: [
@@ -511,7 +512,7 @@ describe("会话摘要、历史重放与 SQLite 只读快照分叉", () => {
 		}
 	});
 
-	it("适配 pi-traffic-optimization：图片压缩与归档占位符保持结构摘要恒定、精准统计投影指纹且重放不裁切 ctx:// 句柄", () => {
+	it("适配 pi-traffic-optimization：图片压缩与归档占位符保持结构摘要恒定、精准统计投影指纹且重放不裁切 ctx:// 句柄", { skip: THIN_CLIENT_DISABLED }, () => {
 		const hash64 = "a".repeat(64);
 		const imgHash64 = "b".repeat(64);
 
@@ -605,7 +606,7 @@ describe("会话摘要、历史重放与 SQLite 只读快照分叉", () => {
 		assert.ok(!mergedReplayText.includes("[tool output truncated in replay]"));
 	});
 
-	it("buildFreshReplayPlan 与 buildPromptBlocksPreloadPlan 在单步内零开销直发，超限时生成严守双阈值的多步预注入与安全降级", () => {
+	it("buildFreshReplayPlan 与 buildPromptBlocksPreloadPlan 在单步内零开销直发，超限时生成严守双阈值的多步预注入与安全降级", { skip: THIN_CLIENT_DISABLED }, () => {
 		const baseAssistant: AssistantMessage = {
 			role: "assistant",
 			content: [{ type: "text", text: "ok" }],
@@ -931,7 +932,7 @@ describe("会话摘要、历史重放与 SQLite 只读快照分叉", () => {
 		}
 	});
 
-	it("重放截断保留单图归档 ctx://image/ 句柄、多图短文本不被误裁且预注入历史图片携带来源标签", () => {
+	it("重放截断保留单图归档 ctx://image/ 句柄、多图短文本不被误裁且预注入历史图片携带来源标签", { skip: THIN_CLIENT_DISABLED }, () => {
 		const imagePlaceholder =
 			"[已归档图片 ctx://image/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef]";
 		const longToolMsg: ToolResultMessage = {

@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import {
+	getCurrentSystemPrompt,
 	getCurrentTools,
 	type Api,
 	type AssistantMessage,
@@ -17,6 +18,12 @@ import {
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { BRIDGE_AGENT_NAME, type AcpClientConnection, type AcpProcessManager } from "../acp/process-manager.ts";
+import {
+	AUXILIARY_REFUSED,
+	enforceThinClientPolicy,
+	HEADLESS_REFUSED,
+	ThinClientPolicyError,
+} from "../thin-client-policy.ts";
 import type {
 	AcpAvailableModel,
 	AcpConfigOption,
@@ -92,6 +99,7 @@ import {
 	extractVisibleMessages,
 	inspectTrafficOptProjectionState,
 	isAuxiliarySingleTurnRequest,
+	SUMMARY_SYSTEM_HINT_PATTERN,
 	type PreloadedSqliteTurn,
 	type TrafficOptProjectionState,
 } from "./reconcile.ts";
@@ -372,7 +380,7 @@ export class TurnCoordinator {
 		this.pi = pi;
 		this.processManager = processManager;
 		this.mirrorBroker = mirrorBroker;
-		this.currentConfig = initialConfig;
+		this.currentConfig = enforceThinClientPolicy(initialConfig);
 		this.httpMcpBridge = new LocalHttpMcpBridge(initialConfig.mcpHoldLimitMs);
 
 		this.processManager.setHandlers({
@@ -387,8 +395,8 @@ export class TurnCoordinator {
 	}
 
 	setConfig(nextConfig: BridgeConfig): void {
-		this.currentConfig = nextConfig;
-		this.httpMcpBridge.setHoldLimitMs(nextConfig.mcpHoldLimitMs);
+		this.currentConfig = enforceThinClientPolicy(nextConfig);
+		this.httpMcpBridge.setHoldLimitMs(this.currentConfig.mcpHoldLimitMs);
 		updateAntigravityStatusBar(this.activeContext, this.currentConfig, this.getTelemetrySnapshot());
 	}
 
@@ -886,10 +894,19 @@ export class TurnCoordinator {
 			primaryLedger && (primaryLedger.activePump || primaryLedger.parkedCalls.size > 0),
 		);
 
-		// 1. 旁路隔离单轮无工具辅助请求（压缩摘要、分支总结、预热等）
-		if (isAuxiliarySingleTurnRequest(context, options, hasBusyPrimary)) {
-			await this.runEphemeralAuxiliaryTurn(writer, model, context, options);
-			return;
+		// Thin-client policy: interactive sessions only, no auxiliary requests.
+		if (!this.activeContext?.hasUI) {
+			throw new ThinClientPolicyError(HEADLESS_REFUSED);
+		}
+		// Pi's agent loop always declares the active (mirror) tools and keeps prompt
+		// caching on; one-off requests from compaction or extensions usually do neither.
+		if (
+			isAuxiliarySingleTurnRequest(context, options, hasBusyPrimary) ||
+			getCurrentTools(context.messages).length === 0 ||
+			options?.cacheRetention === "none" ||
+			SUMMARY_SYSTEM_HINT_PATTERN.test(getCurrentSystemPrompt(context.messages) ?? "")
+		) {
+			throw new ThinClientPolicyError(AUXILIARY_REFUSED);
 		}
 
 		const cwd = this.activeContext?.cwd ?? process.cwd();

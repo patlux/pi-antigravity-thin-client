@@ -25,6 +25,7 @@ import { buildInlineStdioShimCommand } from "../src/mcp/stdio-shim.ts";
 import { prepareCustomizationMount } from "../src/session/customization-mounter.ts";
 import { AgyTurnMirrorBroker, classifyAgyToolCall } from "../src/tools/agy-mirror-tools.ts";
 import { ToolActivationController } from "../src/ui/commands.ts";
+import { THIN_CLIENT_DISABLED } from "./thin-client-skip.ts";
 
 describe("MCP 工具参数 JSON Schema 预校验", () => {
 	const editSchema = {
@@ -284,7 +285,7 @@ describe("官方原生 Plugin 生态挂载、纯净模式上下文与零系统�
 		}
 	});
 
-	it("pi-tools 纯净模式下生成完整 <workspace_context> 用户上下文块，且兼容 edit 工具字符串化 edits 归一化", async () => {
+	it("pi-tools 纯净模式下生成完整 <workspace_context> 用户上下文块，且兼容 edit 工具字符串化 edits 归一化", { skip: THIN_CLIENT_DISABLED }, async () => {
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-pure-ctx-"));
 		try {
 			const wsDir = path.join(tmpRoot, "repo");
@@ -416,7 +417,7 @@ describe("官方原生 Plugin 生态挂载、纯净模式上下文与零系统�
 		}
 	});
 
-	it("生成符合 agy plugin validate --strict 规范的原生挂载包并自动去重工作区已有配置", () => {
+	it("生成符合 agy plugin validate --strict 规范的原生挂载包并自动去重工作区已有配置", { skip: THIN_CLIENT_DISABLED }, () => {
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-native-mount-"));
 		try {
 			const piAgentDir = path.join(tmpRoot, "pi-agent");
@@ -532,7 +533,7 @@ describe("官方原生 Plugin 生态挂载、纯净模式上下文与零系统�
 		}
 	});
 
-	it("agy-tools 开启 bridgePiMcp 时遵循 MCP 暴露策略、保留动态解锁工具，且 Stdio 转发桥支持并发与 SSE 变更通知", async () => {
+	it("agy-tools 开启 bridgePiMcp 时遵循 MCP 暴露策略、保留动态解锁工具，且 Stdio 转发桥支持并发与 SSE 变更通知", { skip: THIN_CLIENT_DISABLED }, async () => {
 		let activeTools = ["read", "bash", "codemode", "mcp__github__search"];
 		const fakePi = {
 			getActiveTools: () => [...activeTools],
@@ -727,7 +728,7 @@ describe("官方原生 Plugin 生态挂载、纯净模式上下文与零系统�
 		}
 	});
 
-	it("适配 pi-traffic-optimization：规整 context_recall 的 TypeBox 字面量 anyOf 为标准 enum，并在纯净模式注入 ctx:// 召回指引", () => {
+	it("适配 pi-traffic-optimization：规整 context_recall 的 TypeBox 字面量 anyOf 为标准 enum，并在纯净模式注入 ctx:// 召回指引", { skip: THIN_CLIENT_DISABLED }, () => {
 		const recallRawSchema = {
 			$schema: "http://json-schema.org/draft-07/schema#",
 			type: "object",
@@ -827,7 +828,7 @@ describe("官方原生 Plugin 生态挂载、纯净模式上下文与零系统�
 		}
 	});
 
-	it("支持跨 TCP 分片多字节中文解码、可选 null 剥离、超长工具短别名还原、精确公告门控及扩展准则与自定义段挂载", async () => {
+	it("支持跨 TCP 分片多字节中文解码、可选 null 剥离、超长工具短别名还原、精确公告门控及扩展准则与自定义段挂载", { skip: THIN_CLIENT_DISABLED }, async () => {
 		const bridge = new LocalHttpMcpBridge(10_000);
 		try {
 			const longToolName =

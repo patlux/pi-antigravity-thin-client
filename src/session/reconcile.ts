@@ -13,6 +13,7 @@ import {
 	withoutInitialSystemMessage,
 } from "@earendil-works/pi-ai";
 import type { AcpPromptBlock } from "../acp/protocol.ts";
+import { REPLAY_REFUSED, ThinClientPolicyError } from "../thin-client-policy.ts";
 
 /** 提取去除一切 `system` 消息后的模型可见对话序列 */
 export function extractVisibleMessages(
@@ -160,7 +161,7 @@ export function computeTranscriptDigest(
 const SUMMARY_USER_HINT_PATTERN =
 	/(?:<conversation>|summarize\s+(?:the|this)\s+(?:conversation|session|branch)|for\s+compaction|compaction\s+summary|context\s+summary|structured\s+checkpoint|update\s+the\s+previous\s+summary|create\s+a\s+(?:structured\s+)?checkpoint)/i;
 
-const SUMMARY_SYSTEM_HINT_PATTERN =
+export const SUMMARY_SYSTEM_HINT_PATTERN =
 	/(?:context\s+summarization\s+assistant|do\s+not\s+continue\s+the\s+conversation|summarize\s+the\s+conversation)/i;
 
 /**
@@ -846,6 +847,9 @@ export function buildFreshReplayPlan(options: FreshReplayPlanOptions): FreshRepl
 	}
 
 	const { historySlice, activeTail } = splitHistoryAndActiveTail(visibleMessages);
+	if (historySlice.length > 0) {
+		throw new ThinClientPolicyError(REPLAY_REFUSED);
+	}
 	const rawTailBlocks = buildActiveTailBlocks(activeTail);
 	const wsBytes = workspaceContextBlock ? Buffer.byteLength(workspaceContextBlock, "utf8") + 1 : 0;
 	const wsTokens = workspaceContextBlock ? estimateStepTokens(workspaceContextBlock) + 1 : 0;
@@ -1248,6 +1252,9 @@ export function buildFreshReplayPromptBlocks(
 
 	// 拆分前序历史上下文与末尾最新待响应的用户消息切片
 	const { historySlice, activeTail } = splitHistoryAndActiveTail(visibleMessages);
+	if (historySlice.length > 0) {
+		throw new ThinClientPolicyError(REPLAY_REFUSED);
+	}
 	const tailBlocks = buildActiveTailBlocks(activeTail);
 	const tailMeasured = measurePromptBlocksSize(tailBlocks);
 

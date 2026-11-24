@@ -24,6 +24,7 @@ import {
 	loadBridgeConfig,
 	resolveEffectiveFlags,
 } from "../src/config.ts";
+import { THIN_CLIENT_DISABLED } from "./thin-client-skip.ts";
 
 const SAMPLE_AVAILABLE_MODELS: AcpAvailableModel[] = [
 	{ modelId: "gemini-4-neon-high", name: "Gemini 4 Neon (High)" },
@@ -69,7 +70,7 @@ const SAMPLE_CONFIG_OPTIONS: AcpConfigOption[] = [
 ];
 
 describe("配置加载与有效开关推导", () => {
-	it("遵循环境变量 > 受信项目配置 > 全局配置 > 默认值优先级，并隔离未受信项目配置", () => {
+	it("遵循环境变量 > 受信项目配置 > 全局配置 > 默认值优先级，并隔离未受信项目配置", { skip: THIN_CLIENT_DISABLED }, () => {
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-cfg-"));
 		try {
 			const agentDir = path.join(tmpRoot, "agent");
@@ -128,7 +129,7 @@ describe("配置加载与有效开关推导", () => {
 		}
 	});
 
-	it("开箱默认使用 pi-tools，且 auto 开关在 pi-tools 与 agy-tools 模式下自动切换合理默认值", () => {
+	it("开箱默认使用 pi-tools，且 auto 开关在 pi-tools 与 agy-tools 模式下自动切换合理默认值", { skip: THIN_CLIENT_DISABLED }, () => {
 		const tmpEmptyAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-default-"));
 		try {
 			const defaultCfg = loadBridgeConfig({ env: { PI_CODING_AGENT_DIR: tmpEmptyAgentDir } });

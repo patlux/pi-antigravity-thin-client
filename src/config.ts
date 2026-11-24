@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { enforceThinClientPolicy } from "./thin-client-policy.ts";
 
 /** 工具系统主控模式 */
 export type ToolMode = "pi-tools" | "agy-tools" | "hybrid";
@@ -261,7 +262,7 @@ export function loadBridgeConfig(options: LoadBridgeConfigOptions = {}): BridgeC
 		);
 	}
 
-	return config;
+	return enforceThinClientPolicy(config);
 }
 
 /** 将用户对配置的持久化修改写回全局配置文件 `~/.pi/agent/antigravity.json` */
@@ -278,7 +279,8 @@ export function saveGlobalBridgeConfigPatch(
 }
 
 /** 根据当前 `toolMode` 计算 `"auto"` 选项的实际生效布尔值 */
-export function resolveEffectiveFlags(config: BridgeConfig): EffectiveBridgeFlags {
+export function resolveEffectiveFlags(rawConfig: BridgeConfig): EffectiveBridgeFlags {
+	const config = enforceThinClientPolicy(rawConfig);
 	const isPiTools = config.toolMode === "pi-tools";
 	return {
 		toolMode: config.toolMode,
