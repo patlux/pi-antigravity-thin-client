@@ -294,6 +294,22 @@ describe("registry recovery", () => {
 	it("publishes the first release over the 0.0.0 bootstrap placeholder", () => {
 		assert.equal(registryDecision({ ...artifact, version: "0.1.0" }, registry("0.0.0")), "publish");
 	});
+	it("treats npm's 0.0.0-stage placeholder as no previous release", () => {
+		const placeholder = { "dist-tags": { latest: "0.0.0-stage" }, versions: {} };
+		assert.equal(registryDecision({ ...artifact, version: "0.1.0" }, placeholder), "publish");
+		assert.throws(
+			() =>
+				registryDecision(
+					{ ...artifact, version: "0.1.0" },
+					{
+						"dist-tags": { latest: "0.0.0-stage" },
+						versions: { "0.1.0": { dist: { integrity: artifact.integrity } } },
+					},
+				),
+			/dist-tag/,
+			"a published version whose dist-tag still points at the placeholder needs investigation",
+		);
+	});
 	it("continues a partial release only for byte-identical published content", () => {
 		assert.equal(registryDecision(artifact, registry("0.2.0", artifact.integrity)), "existing");
 	});

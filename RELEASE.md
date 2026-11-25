@@ -33,7 +33,7 @@ The workflow file does not configure npm or GitHub. These settings exist outside
    | Environment          | `npm`                          |
    | Allowed action       | Direct `npm publish`           |
 
-   npm cannot register a Trusted Publisher for a name that does not exist yet. The name was claimed once with a `0.0.0` placeholder (no code); every real version comes from the workflow. Do not add an `NPM_TOKEN` secret.
+   npm cannot register a Trusted Publisher for a name that does not exist yet. On 2026-11-25 the name was claimed once with a `0.0.0` placeholder without code (dist-tag `bootstrap`); npm added its own `0.0.0-stage` stub for the new package. Both are deprecated, and the release check ignores the stub as a previous `latest`. Every real version comes from the workflow. Do not add an `NPM_TOKEN` secret.
 3. A tag ruleset that blocks updates and deletion of `v*` tags. Tag creation grants publication capability; review who can create tags.
 4. GitHub Actions enabled for the repository (forks start with Actions disabled).
 

@@ -12,6 +12,9 @@ export const PACKAGE = "pi-antigravity-thin-client";
 const REPOSITORY = "patlux/pi-antigravity-thin-client";
 const REGISTRY = `https://registry.npmjs.org/${PACKAGE}`;
 const VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-next\.(0|[1-9]\d*))?$/;
+// npm's public stub for a brand-new package ("Temporary package placeholder for staged
+// publishing"). It is no release of ours, so it never counts as a previous dist-tag.
+const NPM_STAGE_PLACEHOLDER = "0.0.0-stage";
 
 function versionParts(version) {
 	const match = VERSION.exec(version);
@@ -86,7 +89,8 @@ export function registryDecision(artifact, metadata) {
 			metadata["dist-tags"] !== null,
 		"Malformed registry metadata",
 	);
-	const current = metadata["dist-tags"][artifact.distTag];
+	const tagged = metadata["dist-tags"][artifact.distTag];
+	const current = tagged === NPM_STAGE_PLACEHOLDER ? undefined : tagged;
 	if (current) {
 		assert.ok(
 			compareVersions(artifact.version, current) >= 0,
