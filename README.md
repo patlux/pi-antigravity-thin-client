@@ -24,7 +24,7 @@ Replies in Google's AI Developers Forum describe when a third-party client may r
 | Unmodified `agy acp` with Antigravity's own sign-in | Starts the installed `agy acp`. Sign-in runs in `agy` itself (`/agy login` starts `agy acp --login`); the package never reads, stores or forwards OAuth tokens. |
 | Antigravity owns the system prompt | Sends no system prompt, no workspace context, no `AGENTS.md` and no skills from Pi. A prompt is the text (and images) you typed. |
 | Antigravity owns the tools | The `agy-tools` mode is pinned: Antigravity works with its own tools, and Pi shows the calls and asks you for approvals. Pi's tools and MCP servers are never passed to it; Antigravity loads its own MCP servers. There is no `/agy mode` or `/agy bridge`, and the matching settings are ignored. |
-| Antigravity owns the session history | Never replays earlier conversation, compaction summaries or another model's history, and never writes Antigravity's conversation databases. After a model switch, compaction or branch navigation, start a new Pi session. |
+| Antigravity owns the session history | Never replays earlier conversation, compaction summaries or another model's history, and never writes Antigravity's conversation databases. To continue a conversation, Pi reopens it in `agy` with ACP `session/resume`, which [the ACP docs](https://antigravity.google/docs/ide/extensions/acp#sessions) describe as "reopens the conversation without replaying its history". After a model switch, compaction or branch navigation, start a new Pi session. |
 | The human sends the prompts; no automated loops | Only prompts typed in the interactive Pi session reach Antigravity, each one once. Refused before any session work: Pi's automatic retries, `/goal` continuations and the context pi-goal adds, messages from extensions (`pi.sendMessage`, `pi.sendUserMessage`), RPC input, `!` shell output, compaction summaries, titles, recaps, subagents, workflows and `pi -p`. The package never makes up a prompt of its own, such as "Continue.". An empty quota fails as `Antigravity quota exceeded (429)`, which Pi does not retry. |
 
 Turns that Antigravity takes on its own (after a background task, a timer or a subagent) are Antigravity's own feature. The package only shows them; the display reads Antigravity's local files and sends nothing.
@@ -59,6 +59,13 @@ Do not install it together with `pi-antigravity-bridge`. Both register the same 
 1. Start a new Pi session (`/new`) for each Antigravity conversation.
 2. Select an `antigravity/…` model before the first message (`/model` or Ctrl+P).
 3. Type your prompts.
+
+### Continue a conversation
+
+- **A Pi session:** open it again (`/resume`, `pi --continue`) and type the next prompt. Pi reopens the same Antigravity conversation with `session/resume` and sends only what you typed; nothing goes out before that. Turns Antigravity took on its own after your last prompt stay part of the conversation.
+- **A conversation from `agy` or another ACP client:** `/agy sessions` lists Antigravity's conversations for the current directory. The one you pick opens in a new Pi session: `session/load` shows its history in Pi, and your next prompt continues it with `session/resume`.
+
+Continuing works only from the latest message. If the Antigravity conversation got further prompts after the point Pi shows (from a later message on another branch after `/tree`, a forked Pi session or another client), the package refuses the prompt: Antigravity cannot go back without rewriting its history. If the conversation is gone, it refuses too, because the only way out would be to replay Pi's history.
 
 `/agy status` shows the backend state; `/agy login` and `/agy logout` manage the Antigravity sign-in. `/agy agent-mode` switches Antigravity's own execution mode (`default`, `accept-edits`, `plan`).
 

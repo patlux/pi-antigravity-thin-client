@@ -11,6 +11,7 @@ Fork releases of pi-antigravity-thin-client. The upstream changelog of pi-antigr
 ### Changed
 
 - When the Antigravity conversation got further prompts after the point Pi continues from (`/tree` to an earlier message, a forked Pi session, another client), the refusal now says so instead of the generic replay refusal.
+- The README describes how to continue a Pi session or an Antigravity conversation (`/agy sessions`) and why that stays within the thin-client boundary.
 
 ## 0.2.1 - 2026-11-25
 
