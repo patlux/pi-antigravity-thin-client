@@ -53,9 +53,9 @@ const SCENARIOS = [
 		rows: 34,
 		steps: [
 			{ send: "Build and publish release 1.4.0" },
-			{ waitFor: /Hintergrund-Task[\s\S]*npm test/, timeout: 30_000 },
+			{ waitFor: /background task[\s\S]*npm test/, timeout: 30_000 },
 			{ capture: "background-task" },
-			{ waitFor: /arbeitet selbstständig\s+\d/, timeout: 40_000 },
+			{ waitFor: /working on its own\s+\d/, timeout: 40_000 },
 			{ sleep: 1500 },
 			{ capture: "own-turn-live" },
 			{ waitFor: /reports `?ok/, timeout: 30_000 },
@@ -67,7 +67,7 @@ const SCENARIOS = [
 		name: "timer",
 		steps: [
 			{ send: "Set a 20 second timer and remind me about the coffee" },
-			{ waitFor: /noch 1[0-4] s/, timeout: 30_000 },
+			{ waitFor: /1[0-4] s left/, timeout: 30_000 },
 			{ capture: "timer" },
 			{ waitFor: /coffee is ready/, timeout: 40_000 },
 		],
@@ -77,7 +77,7 @@ const SCENARIOS = [
 		rows: 40,
 		steps: [
 			{ send: "Use two subagents: review the changelog and check all links" },
-			{ waitFor: /2 Subagenten[\s\S]*(List commits|git log)/, timeout: 40_000 },
+			{ waitFor: /2 subagents[\s\S]*(List commits|git log)/, timeout: 40_000 },
 			{ sleep: 800 },
 			{ capture: "subagents-live" },
 			{ waitFor: /Both checks are done[\s\S]*Unreleased/, timeout: 60_000 },

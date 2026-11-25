@@ -4,6 +4,10 @@ Fork releases of pi-antigravity-thin-client. The upstream changelog of pi-antigr
 
 ## Unreleased
 
+### Added
+
+- README screenshots of the background widget, timers, the cards for turns Antigravity takes on its own, subagents and messages typed during a turn, plus a gallery preview image (`pi.image`). `scripts/screenshots/capture.mjs` takes them again against a scripted stand-in for `agy`.
+
 ### Removed
 
 - `/agy mode` and `/agy bridge`. The thin client always uses Antigravity's own tools and never passes Pi's MCP servers, skills or `AGENTS.md`; both subcommands now only say so.
@@ -15,6 +19,7 @@ Fork releases of pi-antigravity-thin-client. The upstream changelog of pi-antigr
 
 ### Fixed
 
+- A subagent that waits for its own timer shows "waiting for timer" right away, before agy writes the answer that ends its turn.
 - `/agy mode pi-tools` reported a switch, saved `toolMode` to `antigravity.json` and took Antigravity's mirror tools out of Pi's active tools, while the bridge kept running agy-tools.
 
 ## 0.1.0 - 2026-11-25

@@ -46,16 +46,49 @@ The package cannot tell a person from a program that types into the terminal. Ne
 
 ## What it shows
 
-- **Background tasks.** Antigravity moves long commands and `schedule` timers into background tasks. A widget above the editor lists each running task with its run time, the last line of its log or the timer countdown. The footer shows `agy ⏳ <count>`.
-- **Turns Antigravity takes on its own.** When a background task, a timer or a subagent finishes, Antigravity wakes up and continues without a prompt from Pi. The widget shows such a turn live (current tool, last line of the answer). When it ends, a card "Antigravity · on its own" shows what woke Antigravity and its answer. The card is stored in the Pi session but is never sent to a model.
-- **Subagents.** The `invoke_subagent` tool card names the subagent's role, model with reasoning level, and task. The widget lists each running subagent with the model and reasoning level it runs on and what it does right now. Cards for turns Antigravity took on its own name the model of that turn.
-- **Messages typed while Antigravity works.** They do not cancel the running Antigravity turn, because a cancel would also stop its background tasks and subagents. The message waits and goes out as the next prompt when the turn ends. Esc still cancels.
+The screenshots show Pi with this package; a scripted stand-in plays Antigravity (see [Details](#details)).
+
+### Background tasks
+
+Antigravity moves long commands and `schedule` timers into background tasks. A widget above the editor lists each running task with its run time, the last line of its log or the timer countdown. The footer shows `agy ⏳ <count>`.
+
+![A background task: the widget above the editor shows the task's run time and the last line of its log](https://raw.githubusercontent.com/patlux/pi-antigravity-thin-client/main/assets/screenshots/background-task.png)
+
+![A schedule timer: the widget counts down the seconds left](https://raw.githubusercontent.com/patlux/pi-antigravity-thin-client/main/assets/screenshots/timer.png)
+
+### Turns Antigravity takes on its own
+
+When a background task, a timer or a subagent finishes, Antigravity wakes up and continues without a prompt from Pi. The widget shows such a turn live (current tool, last line of the answer). When it ends, a card "Antigravity · on its own" shows what woke Antigravity, the model of that turn and its answer. The card is stored in the Pi session but is never sent to a model.
+
+![Antigravity continues on its own after the background task finished: the widget shows the tool it runs](https://raw.githubusercontent.com/patlux/pi-antigravity-thin-client/main/assets/screenshots/own-turn-live.png)
+
+![The card for the finished turn names the finished task, the model and Antigravity's answer](https://raw.githubusercontent.com/patlux/pi-antigravity-thin-client/main/assets/screenshots/own-turn-card.png)
+
+### Subagents
+
+The `invoke_subagent` tool card names the subagent's role, model with reasoning level, and task. The widget lists each running subagent with the model and reasoning level it runs on and what it does right now. When a subagent reports back, Antigravity wakes up, and the card of that turn shows the subagent's role and message.
+
+![Two subagents: their tool cards, and the widget with model, reasoning level and current tool of each](https://raw.githubusercontent.com/patlux/pi-antigravity-thin-client/main/assets/screenshots/subagents-live.png)
+
+![The subagents' reports wake Antigravity up; each turn gets its own card](https://raw.githubusercontent.com/patlux/pi-antigravity-thin-client/main/assets/screenshots/subagents-done.png)
+
+### Messages typed while Antigravity works
+
+They do not cancel the running Antigravity turn, because a cancel would also stop its background tasks and subagents. The message waits and goes out as the next prompt when the turn ends. Esc still cancels.
+
+![A message typed during a running command waits in Pi's queue](https://raw.githubusercontent.com/patlux/pi-antigravity-thin-client/main/assets/screenshots/steering-queued.png)
+
+![The message went out after the turn ended, and Antigravity answers it](https://raw.githubusercontent.com/patlux/pi-antigravity-thin-client/main/assets/screenshots/steering-sent.png)
+
+### Details
 
 The display reads Antigravity's local conversation files (`~/.gemini/antigravity-cli/brain/<id>/.system_generated/`) and the updates Antigravity sends over ACP. It never sends anything to Antigravity.
 
 `PI_AGY_TRACE=1` (or a file path) writes every `session/update` from Antigravity to a local JSONL file, for debugging.
 
 All interface texts are in English. Upstream's texts were Chinese and are translated here; source comments from upstream stay Chinese.
+
+`node scripts/screenshots/capture.mjs` takes the screenshots again. It runs Pi with this package against a scripted stand-in for `agy` (`scripts/screenshots/mock-agy.mjs`) in a temporary home, so nothing reaches Antigravity. It needs `pi` and `tmux`, and `resvg` with fixed fonts for the PNG files (through `nix` when they are not on `PATH`).
 
 ## Upstream
 

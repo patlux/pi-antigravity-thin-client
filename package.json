@@ -32,7 +32,8 @@
     "extensions": [
       "./src/index.ts"
     ],
-    "changelogPath": "./CHANGELOG.md"
+    "changelogPath": "./CHANGELOG.md",
+    "image": "https://raw.githubusercontent.com/patlux/pi-antigravity-thin-client/main/assets/screenshots/own-turn-card.png"
   },
   "files": [
     "src",
