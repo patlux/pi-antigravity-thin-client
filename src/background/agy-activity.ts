@@ -26,6 +26,8 @@ export interface TranscriptStep {
 	status: string;
 	content: string;
 	toolCalls: TranscriptToolCall[];
+	/** Model that produced a `PLANNER_RESPONSE`, e.g. `gemini-4-neon-high`. */
+	model?: string;
 }
 
 export interface TaskMessage {
@@ -69,6 +71,8 @@ export interface AutonomousTrigger {
 	taskId?: string;
 	/** Conversation id of the agent (e.g. a subagent) whose message woke agy up. */
 	agentId?: string;
+	/** First line of that agent's message. */
+	preview?: string;
 	title?: string;
 	outcome?: TriggerOutcome;
 	exitCode?: number;
@@ -171,6 +175,7 @@ export function parseTranscriptLine(line: string): TranscriptStep | undefined {
 		status: asString(obj.status) ?? "",
 		content: typeof obj.content === "string" ? obj.content : "",
 		toolCalls,
+		model: asString(obj.model),
 	};
 }
 
@@ -237,6 +242,21 @@ function outcomeOf(title: string | undefined, content: string, kind: BackgroundT
 		outcome = "ok";
 	}
 	return { outcome, exitCode };
+}
+
+/** First non-empty line as plain text: Markdown links keep their label, code marks go. */
+export function firstLine(text: string, max = 160): string | undefined {
+	const line = text
+		.split("\n")
+		.map((part) =>
+			part
+				.replace(/\[([^\]]+)\]\([^)\s]+\)/g, "$1")
+				.replace(/`/g, "")
+				.trim(),
+		)
+		.find((part) => part.length > 0);
+	if (!line) return undefined;
+	return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 }
 
 function summarizeAction(call: TranscriptToolCall): AutonomousAction {
@@ -374,7 +394,8 @@ export function deriveAgyActivity(
 				};
 			} else {
 				// A subagent (or another agent) sent agy a message.
-				trigger = { agentId: sender, title };
+				const preview = firstLine(note?.content ?? deliveredContent);
+				trigger = { agentId: sender, title, ...(preview ? { preview } : {}) };
 			}
 			if (current) {
 				current.triggers.push(trigger);
@@ -423,4 +444,126 @@ export function lastLogLine(logText: string): string | undefined {
 		})
 		.filter((line) => line.length > 0);
 	return lines.at(-1);
+}
+
+/** One entry of `<parent>/.system_generated/subagents/<id>.json`. */
+export interface SubagentRecord {
+	conversationId: string;
+	role?: string;
+	typeName?: string;
+	/** `SUBAGENT_STATE_ALIVE`, `SUBAGENT_STATE_KILLED`, ... */
+	state: string;
+	/** Parent transcript step that reported the spawn. */
+	spawnStepIndex?: number;
+}
+
+export function parseSubagentRecord(json: string): SubagentRecord | undefined {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(json);
+	} catch {
+		return undefined;
+	}
+	const obj = asRecord(parsed);
+	const conversationId = asString(obj?.conversationId);
+	if (!obj || !conversationId) return undefined;
+	const descriptor = asRecord(obj.subagentDescriptor);
+	return {
+		conversationId,
+		role: asString(descriptor?.role),
+		typeName: asString(descriptor?.typeName),
+		state: asString(obj.state) ?? "",
+		spawnStepIndex: typeof obj.spawnStepIndex === "number" ? obj.spawnStepIndex : undefined,
+	};
+}
+
+export interface SubagentStatus {
+	conversationId: string;
+	role?: string;
+	typeName?: string;
+	/** Model the subagent actually runs on, from its own transcript. */
+	model?: string;
+	/** Model the parent asked for (`invoke_subagent` `Model`), if any. */
+	requestedModel?: string;
+	/** Task the parent gave it (`invoke_subagent` `Prompt`). */
+	prompt?: string;
+	/** `working` until it answers without tool calls; `idle` then; `killed` when stopped. */
+	state: "working" | "idle" | "killed";
+	/** What it does right now, or its last answer when idle. */
+	activity?: string;
+	toolCalls: number;
+	startedAtMs?: number;
+	lastAtMs?: number;
+}
+
+/**
+ * Status of one subagent from its own transcript. The spawn arguments come from
+ * the parent's `invoke_subagent` call, matched by role (a call may start several).
+ */
+export function deriveSubagentStatus(
+	record: SubagentRecord,
+	ownSteps: readonly TranscriptStep[],
+	parentSteps: readonly TranscriptStep[],
+): SubagentStatus {
+	const ordered = [...ownSteps].sort((a, b) => a.index - b.index);
+	const planners = ordered.filter((step) => step.type === "PLANNER_RESPONSE");
+	const lastPlanner = planners.at(-1);
+	const last = ordered.at(-1);
+	let state: SubagentStatus["state"];
+	let activity: string | undefined;
+	if (record.state === "SUBAGENT_STATE_KILLED") {
+		state = "killed";
+		activity = "beendet";
+	} else if (!lastPlanner) {
+		state = "working";
+		activity = "startet …";
+	} else if (lastPlanner.toolCalls.length > 0) {
+		state = "working";
+		const action = summarizeAction(lastPlanner.toolCalls[0]);
+		const more = lastPlanner.toolCalls.length > 1 ? ` (+${lastPlanner.toolCalls.length - 1})` : "";
+		activity = `→ ${action.name}${action.summary ? ` ${action.summary}` : ""}${more}`;
+		if (last && last.index > lastPlanner.index && last.type !== "GENERIC") {
+			activity = "denkt nach …";
+		}
+	} else if (last && last.index > lastPlanner.index) {
+		// A message arrived after its last answer: it works again.
+		state = "working";
+		activity = "denkt nach …";
+	} else {
+		state = "idle";
+		activity = firstLine(lastPlanner.content);
+	}
+
+	const spawn = spawnArguments(record, parentSteps);
+	return {
+		conversationId: record.conversationId,
+		role: record.role ?? spawn?.Role,
+		typeName: record.typeName ?? spawn?.TypeName,
+		model: [...planners].reverse().find((step) => step.model)?.model,
+		requestedModel: spawn?.Model,
+		prompt: spawn?.Prompt,
+		state,
+		activity,
+		toolCalls: planners.reduce((sum, step) => sum + step.toolCalls.length, 0),
+		startedAtMs: ordered[0]?.createdAtMs,
+		lastAtMs: last?.createdAtMs,
+	};
+}
+
+function spawnArguments(
+	record: SubagentRecord,
+	parentSteps: readonly TranscriptStep[],
+): Record<string, string> | undefined {
+	const spawnStep = record.spawnStepIndex;
+	if (spawnStep === undefined) return undefined;
+	const planner = [...parentSteps]
+		.filter(
+			(step) =>
+				step.type === "PLANNER_RESPONSE" &&
+				step.index < spawnStep &&
+				step.toolCalls.some((call) => call.name === "invoke_subagent"),
+		)
+		.sort((a, b) => b.index - a.index)[0];
+	const calls = planner?.toolCalls.filter((call) => call.name === "invoke_subagent") ?? [];
+	return calls.find((call) => call.args.Role === record.role)?.args ?? (calls.length === 1 ? calls[0].args : undefined);
 }

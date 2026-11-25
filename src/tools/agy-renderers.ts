@@ -156,8 +156,13 @@ export function getMirrorToolRenderers(toolName: AgyMirrorToolName): ToolRendere
 						(typeof args?.agentRole === "string" && args.agentRole.trim()) ||
 						title ||
 						"subagent";
+					const count =
+						typeof args?.agentCount === "number" && args.agentCount > 1 ? `${args.agentCount}× ` : "";
+					const model =
+						(typeof args?.model === "string" && args.model) ||
+						(args?.agentType === "self" ? "Modell wie Hauptagent" : typeof args?.agentType === "string" ? args.agentType : "");
 					return new Text(
-						`${theme.fg("toolTitle", theme.bold("subagent"))} ${theme.fg("accent", role)}${duration}`,
+						`${theme.fg("toolTitle", theme.bold("subagent"))} ${count}${theme.fg("accent", role)}${model ? theme.fg("muted", ` · ${model}`) : ""}${duration}`,
 						0,
 						0,
 					);

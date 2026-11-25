@@ -25,7 +25,10 @@
 > background or a timer was set. This only reads local files; nothing is sent to agy.
 > agy >= 1.5.10 also streams such turns over ACP right away; the widget shows them live (current
 > tool, last line of the answer), the card still comes from the transcript. A message from a
-> subagent that wakes agy shows up as `✉ Subagent <id>` in the card.
+> subagent that wakes agy shows up as `✉ <role> <id>: <first line>` in the card.
+> Subagents (`invoke_subagent`): the tool card names role, model and task; the widget lists each
+> subagent with the model it runs on and what it does right now (`→ write_file …`, `denkt nach …`,
+> `fertig: …`), read from `subagents/<id>.json` of the parent and the subagent's own transcript.
 > `PI_AGY_TRACE=1` (or a file path) logs every `session/update` agy sends to a local JSONL file.
 >
 > Steering: a message typed while agy works no longer cancels the agy turn (cancelling stops

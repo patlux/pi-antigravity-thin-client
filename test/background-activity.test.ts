@@ -8,7 +8,10 @@ import { type ActivitySnapshot, AgyActivityWatcher } from "../src/background/act
 import {
 	type AutonomousTurn,
 	deriveAgyActivity,
+	deriveSubagentStatus,
+	firstLine,
 	lastLogLine,
+	parseSubagentRecord,
 	parseTaskMessage,
 	parseTranscriptLine,
 	type TranscriptStep,
@@ -17,6 +20,8 @@ import { AgyTurnMirrorBroker, classifyAgyToolCall } from "../src/tools/agy-mirro
 import {
 	describeTrigger,
 	LIVE_STALE_MS,
+	senderRole,
+	subagentStartNote,
 	renderActivityLines,
 	renderAutonomousEntry,
 	type ThemeLike,
@@ -151,12 +156,14 @@ describe("agy activity from local files", () => {
 			JSON.stringify({ step_index: 4, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", created_at: "2026-11-25T14:00:00Z", content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-25T14:00:00Z sender=${sub} priority=MESSAGE_PRIORITY_HIGH content=Datei angelegt.\n</SYSTEM_MESSAGE>` }),
 			JSON.stringify({ step_index: 5, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "Der Subagent ist fertig." }),
 		);
-		const note = parseTaskMessage(JSON.stringify({ id: "ddd", sender: sub, timestamp: "2026-11-25T14:00:00.200Z", renderDetails: { messageTitle: "writer: Datei angelegt" }, content: "Datei angelegt." }));
+		const note = parseTaskMessage(JSON.stringify({ id: "ddd", sender: sub, timestamp: "2026-11-25T14:00:00.200Z", renderDetails: { messageTitle: "Message from File Creator Subagent (self)" }, content: "Die Datei wurde angelegt.\nDetails folgen." }));
 		assert.ok(note);
 		assert.equal(note.taskId, undefined);
 		const turn = deriveAgyActivity(steps(lines), [note]).turns[0];
-		assert.deepEqual(turn.triggers, [{ agentId: sub, title: "writer: Datei angelegt" }]);
-		assert.equal(describeTrigger(turn.triggers[0], plainTheme), "✉ Subagent 9a9a9a9a · writer: Datei angelegt");
+		assert.deepEqual(turn.triggers, [{ agentId: sub, title: "Message from File Creator Subagent (self)", preview: "Die Datei wurde angelegt." }]);
+		assert.equal(describeTrigger(turn.triggers[0], plainTheme), "✉ File Creator Subagent 9a9a9a9a: Die Datei wurde angelegt.");
+		assert.equal(senderRole("Message from Reviewer"), "Reviewer");
+		assert.equal(senderRole("something else"), undefined);
 	});
 
 	it("ignores reminders and messages that arrive inside a prompted turn", () => {
@@ -167,6 +174,14 @@ describe("agy activity from local files", () => {
 			JSON.stringify({ step_index: 3, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "fertig" }),
 		];
 		assert.deepEqual(deriveAgyActivity(steps(lines), []).turns, []);
+	});
+
+	it("turns the first line of an answer into plain text", () => {
+		assert.equal(
+			firstLine("\n Die Datei [/tmp/a.txt](file:///tmp/a.txt) enthält `hallo`.\nmehr"),
+			"Die Datei /tmp/a.txt enthält hallo.",
+		);
+		assert.equal(firstLine("x".repeat(200), 10), `${"x".repeat(9)}…`);
 	});
 
 	it("reads the last visible log line through progress redraws and ANSI codes", () => {
@@ -286,6 +301,130 @@ describe("AgyActivityWatcher", () => {
 	});
 });
 
+/** Parent and subagent files as agy 1.5.13 wrote them for the subagent test prompt (abridged). */
+const SUB = "0db6b1dc-5462-49b5-b08c-c41c13d5d95b";
+function parentSpawnLines(): string[] {
+	const line = (obj: Record<string, unknown>) => JSON.stringify(obj);
+	return [
+		line({ step_index: 0, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", created_at: "2026-11-25T14:45:40Z", content: "<USER_REQUEST>starte bitte einen subagent …</USER_REQUEST>" }),
+		line({ step_index: 1, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-25T14:46:04Z", model: "gemini-4-neon-high", tool_calls: [{ name: "invoke_subagent", args: { Prompt: "\"Lege die Datei `/tmp/agy-test/hallo.txt` mit dem Inhalt `hallo` an.\"", Role: "\"File Creator Subagent\"", TypeName: "\"self\"" } }] }),
+		line({ step_index: 2, source: "MODEL", type: "GENERIC", status: "DONE", created_at: "2026-11-25T14:46:07Z", content: `Created the following subagent:\n{\n  "conversationId":  "${SUB}"\n}` }),
+		line({ step_index: 3, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-25T14:46:08Z", model: "gemini-4-neon-high", content: "Der Subagent wurde gestartet." }),
+	];
+}
+function subagentLines(): string[] {
+	const line = (obj: Record<string, unknown>) => JSON.stringify(obj);
+	return [
+		line({ step_index: 0, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", created_at: "2026-11-25T14:46:28Z", content: `[Message] timestamp=2026-11-25T14:46:08Z sender=${CONV} priority=MESSAGE_PRIORITY_HIGH content=Lege die Datei an.` }),
+		line({ step_index: 1, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-25T14:46:28Z", model: "gemini-4-neon-high", tool_calls: [{ name: "write_file", args: { Content: "\"hallo\"", Overwrite: "true", Path: "\"/tmp/agy-test/hallo.txt\"" } }] }),
+		line({ step_index: 2, source: "MODEL", type: "GENERIC", status: "DONE", created_at: "2026-11-25T14:46:34Z", content: "Created file" }),
+		line({ step_index: 3, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-25T14:46:35Z", model: "gemini-4-neon-high", tool_calls: [{ name: "send_message", args: { Message: "\"Die Datei wurde angelegt.\"", Recipient: `"${CONV}"` } }] }),
+		line({ step_index: 4, source: "MODEL", type: "GENERIC", status: "DONE", created_at: "2026-11-25T14:46:39Z", content: "Message sent" }),
+		line({ step_index: 5, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", created_at: "2026-11-25T14:46:41Z", content: "<SYSTEM_MESSAGE> Reminder </SYSTEM_MESSAGE>" }),
+		line({ step_index: 6, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-25T14:46:41Z", model: "gemini-4-neon-high", content: "Die Datei wurde angelegt und der Parent-Agent benachrichtigt." }),
+	];
+}
+const SUB_RECORD = JSON.stringify({ conversationId: SUB, subagentDescriptor: { typeName: "self", role: "File Creator Subagent" }, state: "SUBAGENT_STATE_ALIVE", spawnStepIndex: 2, workspaceUris: ["file:///tmp/agy-test"] });
+
+describe("agy subagents", () => {
+	it("reads the subagent record agy keeps next to the parent", () => {
+		assert.deepEqual(parseSubagentRecord(SUB_RECORD), {
+			conversationId: SUB,
+			role: "File Creator Subagent",
+			typeName: "self",
+			state: "SUBAGENT_STATE_ALIVE",
+			spawnStepIndex: 2,
+		});
+		assert.equal(parseSubagentRecord("{}"), undefined);
+	});
+
+	it("tells what a subagent runs: its model, task and current tool, then its answer", () => {
+		const record = parseSubagentRecord(SUB_RECORD);
+		assert.ok(record);
+		const parent = steps(parentSpawnLines());
+		const working = deriveSubagentStatus(record, steps(subagentLines().slice(0, 2)), parent);
+		assert.equal(working.state, "working");
+		assert.equal(working.activity, "→ write_file /tmp/agy-test/hallo.txt");
+		assert.equal(working.model, "gemini-4-neon-high");
+		assert.equal(working.prompt, "Lege die Datei `/tmp/agy-test/hallo.txt` mit dem Inhalt `hallo` an.");
+		assert.equal(working.typeName, "self");
+
+		assert.equal(deriveSubagentStatus(record, steps(subagentLines().slice(0, 3)), parent).activity, "→ write_file /tmp/agy-test/hallo.txt");
+		assert.equal(deriveSubagentStatus(record, steps(subagentLines().slice(0, 6)), parent).activity, "denkt nach …");
+		assert.equal(deriveSubagentStatus(record, [], parent).activity, "startet …");
+
+		const done = deriveSubagentStatus(record, steps(subagentLines()), parent);
+		assert.equal(done.state, "idle");
+		assert.equal(done.activity, "Die Datei wurde angelegt und der Parent-Agent benachrichtigt.");
+		assert.equal(done.toolCalls, 2);
+		assert.equal(done.lastAtMs, Date.parse("2026-11-25T14:46:41Z"));
+
+		const killed = deriveSubagentStatus({ ...record, state: "SUBAGENT_STATE_KILLED" }, steps(subagentLines().slice(0, 2)), parent);
+		assert.equal(killed.state, "killed");
+	});
+
+	it("writes the invoke_subagent card: who, which model, which task", () => {
+		const args = { agentRole: "File Creator Subagent", agentType: "self", prompt: "Lege die Datei an.\nDanach melden." };
+		assert.equal(
+			subagentStartNote(args, undefined),
+			"🤖 Subagent „File Creator Subagent“ gestartet · Modell wie Hauptagent\nWas er gerade tut, zeigt die Antigravity-Anzeige über dem Eingabefeld.\n\nAuftrag:\nLege die Datei an.\nDanach melden.",
+		);
+		const record = parseSubagentRecord(SUB_RECORD);
+		assert.ok(record);
+		const started = deriveSubagentStatus(record, steps(subagentLines().slice(0, 2)), steps(parentSpawnLines()));
+		assert.match(subagentStartNote(args, started), /^🤖 Subagent „File Creator Subagent“ gestartet · 0db6b1dc · gemini-4-neon-high\n/);
+		assert.match(subagentStartNote({ agentRole: "a, b", agentCount: 2 }, undefined), /^🤖 2 Subagenten \(a, b\) gestartet\n/);
+	});
+
+	it("follows the subagents of the watched conversation and shows them in the widget", () => {
+		const brain = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-brain-sub-"));
+		try {
+			const parentDir = path.join(brain, CONV, ".system_generated");
+			const childDir = path.join(brain, SUB, ".system_generated");
+			fs.mkdirSync(path.join(parentDir, "logs"), { recursive: true });
+			fs.mkdirSync(path.join(parentDir, "subagents"), { recursive: true });
+			fs.mkdirSync(path.join(childDir, "logs"), { recursive: true });
+			fs.writeFileSync(path.join(parentDir, "logs", "transcript.jsonl"), parentSpawnLines().map((l) => `${l}\n`).join(""));
+			fs.writeFileSync(path.join(parentDir, "subagents", `${SUB}.json`), SUB_RECORD);
+			fs.writeFileSync(path.join(childDir, "logs", "transcript.jsonl"), subagentLines().slice(0, 2).map((l) => `${l}\n`).join(""));
+
+			const snapshots: ActivitySnapshot[] = [];
+			const watcher = new AgyActivityWatcher({
+				agySessionId: CONV,
+				systemDir: parentDir,
+				isAlive: () => true,
+				onSnapshot: (snapshot) => snapshots.push(snapshot),
+				onTurnFinished: () => {},
+				now: () => Date.parse("2026-11-25T14:46:30Z"),
+			});
+			watcher.poll();
+			const snapshot = snapshots.at(-1);
+			assert.ok(snapshot);
+			assert.deepEqual(snapshot.subagents?.map((status) => [status.role, status.state, status.activity]), [
+				["File Creator Subagent", "working", "→ write_file /tmp/agy-test/hallo.txt"],
+			]);
+			assert.equal(watcher.findSubagent("File Creator Subagent")?.conversationId, SUB);
+
+			const lines = renderActivityLines(snapshot, Date.parse("2026-11-25T14:46:30Z"), 0, plainTheme);
+			assert.deepEqual(lines, [
+				"Antigravity · 1 Subagent",
+				" ⠋ 0db6b1dc  File Creator Subagent  0:02  gemini-4-neon-high  → write_file /tmp/agy-test/hallo.txt",
+			]);
+
+			fs.appendFileSync(path.join(childDir, "logs", "transcript.jsonl"), subagentLines().slice(2).map((l) => `${l}\n`).join(""));
+			watcher.poll();
+			const idle = snapshots.at(-1)?.subagents?.[0];
+			assert.equal(idle?.state, "idle");
+			assert.match(
+				renderActivityLines({ ...snapshot, subagents: idle ? [idle] : [] }, Date.parse("2026-11-25T14:46:43Z"), 0, plainTheme)[1],
+				/✓ 0db6b1dc {2}File Creator Subagent {2}0:13 {2}gemini-4-neon-high {2}fertig: Die Datei wurde angelegt/,
+			);
+		} finally {
+			fs.rmSync(brain, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("background activity display", () => {
 	it("renders the widget lines for a running command, a timer and an autonomous turn", () => {
 		const now = Date.parse("2026-11-25T13:55:05Z");
@@ -345,6 +484,32 @@ describe("mirror tool cards for agy's own tools", () => {
 			arguments: { title: "Run schedule", kind: "other", tool: "schedule" },
 		});
 		assert.equal(classifyAgyToolCall({ title: "Run manage_task", kind: "other" }).mirrorToolName, "agy_tool");
+		// The ACP tool_call agy 1.5.13 sent for the subagent test prompt.
+		assert.deepEqual(
+			classifyAgyToolCall({
+				title: "Run invoke_subagent",
+				kind: "other",
+				rawInput: { Prompt: "Lege die Datei an.", Role: "File Creator Subagent", TypeName: "self" },
+			}),
+			{
+				mirrorToolName: "agy_subagent",
+				arguments: {
+					title: "Run invoke_subagent",
+					kind: "other",
+					agentRole: "File Creator Subagent",
+					tool: "invoke_subagent",
+					agentType: "self",
+					prompt: "Lege die Datei an.",
+				},
+			},
+		);
+		const batch = classifyAgyToolCall({
+			title: "Run invoke_subagent",
+			kind: "other",
+			rawInput: { Subagents: [{ Role: "a", Prompt: "x" }, { Role: "b", Prompt: "y" }] },
+		});
+		assert.equal(batch.arguments.agentCount, 2);
+		assert.equal(batch.arguments.agentRole, "a, b");
 		assert.equal(
 			classifyAgyToolCall({ title: "sleep 60", kind: "execute", rawInput: { CommandLine: "sleep 60" } }).mirrorToolName,
 			"agy_bash",
@@ -369,7 +534,14 @@ describe("mirror tool cards for agy's own tools", () => {
 		const result = await broker.executeMirrorCall("call_1", undefined, undefined, interactiveContext(os.tmpdir()));
 		assert.deepEqual(result.content, [{ type: "text", text: "⏳ Läuft im Hintergrund als task-2." }]);
 		assert.deepEqual(seen, [
-			{ agySessionId: CONV, kind: "execute", title: "sleep 60; echo fertig", command: "sleep 60; echo fertig", toolName: undefined },
+			{
+				agySessionId: CONV,
+				kind: "execute",
+				title: "sleep 60; echo fertig",
+				command: "sleep 60; echo fertig",
+				toolName: undefined,
+				args: { title: "sleep 60; echo fertig", kind: "execute", command: "sleep 60; echo fertig" },
+			},
 		]);
 		assert.equal(broker.isTracking("call_1"), false);
 	});

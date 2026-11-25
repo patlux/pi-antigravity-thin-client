@@ -6,6 +6,7 @@ import type {
 	AutonomousTrigger,
 	AutonomousTurn,
 	BackgroundTask,
+	SubagentStatus,
 	TriggerOutcome,
 } from "../background/agy-activity.ts";
 
@@ -126,10 +127,20 @@ function outcomeMark(outcome: TriggerOutcome | undefined, theme: ThemeLike): str
 }
 
 /** One line per trigger, e.g. "✓ task-2 · Background sleep task finished (Exit 0)". */
+/** "Message from File Creator Subagent (self)" → "File Creator Subagent". */
+export function senderRole(title: string | undefined): string | undefined {
+	const match = /^Message from (.+?)(?: \([^)]*\))?$/.exec(title?.trim() ?? "");
+	return match?.[1];
+}
+
 export function describeTrigger(trigger: AutonomousTrigger, theme: ThemeLike): string {
 	if (trigger.agentId) {
-		const who = theme.fg("muted", `Subagent ${trigger.agentId.slice(0, 8)}`);
-		return `${theme.fg("accent", "✉")} ${who} · ${trigger.title ?? "Nachricht"}`;
+		const role = senderRole(trigger.title);
+		const who = role
+			? `${theme.fg("toolTitle", role)} ${theme.fg("muted", trigger.agentId.slice(0, 8))}`
+			: theme.fg("muted", `Subagent ${trigger.agentId.slice(0, 8)}`);
+		const what = trigger.preview ?? (role ? "Nachricht" : (trigger.title ?? "Nachricht"));
+		return `${theme.fg("accent", "✉")} ${who}: ${what}`;
 	}
 	const fallback =
 		trigger.outcome === "running"
@@ -198,6 +209,58 @@ function taskLabel(task: BackgroundTask): string {
 	return task.summary ?? task.description;
 }
 
+const MAX_SUBAGENT_LINES = 6;
+
+/** Model label: what the subagent runs on, else what was asked for, else its type. */
+export function subagentModelLabel(status: SubagentStatus): string {
+	if (status.model) return status.model;
+	if (status.requestedModel) return status.requestedModel;
+	if (status.typeName === "self") return "Modell wie Hauptagent";
+	return status.typeName ?? "";
+}
+
+/**
+ * Card text for an `invoke_subagent` call: who runs, on which model, with which
+ * task. `started` is the subagent agy already recorded on disk, if any.
+ */
+export function subagentStartNote(
+	args: Readonly<Record<string, string | number>>,
+	started: SubagentStatus | undefined,
+): string {
+	const role = typeof args.agentRole === "string" ? args.agentRole : undefined;
+	const count = typeof args.agentCount === "number" ? args.agentCount : 1;
+	const model =
+		started?.model ??
+		(typeof args.model === "string" ? args.model : undefined) ??
+		(args.agentType === "self" || started?.typeName === "self" ? "Modell wie Hauptagent" : undefined);
+	const who = count > 1 ? `${count} Subagenten (${role ?? "ohne Rolle"})` : `Subagent „${role ?? "ohne Rolle"}“`;
+	const details = [started?.conversationId.slice(0, 8), model].filter((part) => part !== undefined).join(" · ");
+	const lines = [
+		`🤖 ${who} gestartet${details ? ` · ${details}` : ""}`,
+		"Was er gerade tut, zeigt die Antigravity-Anzeige über dem Eingabefeld.",
+	];
+	const prompt = typeof args.prompt === "string" ? args.prompt : started?.prompt;
+	if (prompt) {
+		lines.push("", "Auftrag:", ...prompt.split("\n"));
+	}
+	return lines.join("\n");
+}
+
+function renderSubagentLine(status: SubagentStatus, now: number, spinner: string, theme: ThemeLike): string {
+	const mark =
+		status.state === "working"
+			? spinner
+			: status.state === "killed"
+				? theme.fg("error", "✗")
+				: theme.fg("success", "✓");
+	const end = status.state === "working" ? now : (status.lastAtMs ?? now);
+	const elapsed = status.startedAtMs !== undefined ? formatElapsed(end - status.startedAtMs) : "";
+	const role = status.role ?? "Subagent";
+	const activity =
+		status.state === "idle" ? `fertig${status.activity ? `: ${status.activity}` : ""}` : (status.activity ?? "");
+	return ` ${mark} ${theme.fg("muted", status.conversationId.slice(0, 8))}  ${theme.fg("toolTitle", role)}  ${theme.fg("dim", elapsed)}  ${theme.fg("muted", subagentModelLabel(status))}  ${theme.fg("toolOutput", activity)}`;
+}
+
 /** Widget lines for running background tasks and an autonomous turn in progress. */
 export function renderActivityLines(
 	snapshot: ActivityDisplay,
@@ -206,11 +269,15 @@ export function renderActivityLines(
 	theme: ThemeLike,
 ): string[] {
 	const running = snapshot.tasks.filter((task) => !task.finished);
+	const subagents = snapshot.subagents ?? [];
+	const working = subagents.filter((status) => status.state === "working");
 	const live = isLiveFresh(snapshot.live, now) ? snapshot.live : undefined;
-	if (snapshot.tasks.length === 0 && !snapshot.runningTurn && !live) return [];
+	if (snapshot.tasks.length === 0 && subagents.length === 0 && !snapshot.runningTurn && !live) return [];
 	const spinner = theme.fg("accent", SPINNER[frame % SPINNER.length]);
-	const header =
-		running.length === 0 ? "" : running.length === 1 ? " · 1 Hintergrund-Task" : ` · ${running.length} Hintergrund-Tasks`;
+	const parts: string[] = [];
+	if (running.length > 0) parts.push(running.length === 1 ? "1 Hintergrund-Task" : `${running.length} Hintergrund-Tasks`);
+	if (working.length > 0) parts.push(working.length === 1 ? "1 Subagent" : `${working.length} Subagenten`);
+	const header = parts.length > 0 ? ` · ${parts.join(" · ")}` : "";
 	const lines = [`${theme.fg("customMessageLabel", theme.bold("Antigravity"))}${theme.fg("muted", header)}`];
 	for (const task of snapshot.tasks) {
 		const mark = task.finished ? outcomeMark(task.finished.outcome, theme) : spinner;
@@ -227,6 +294,12 @@ export function renderActivityLines(
 		lines.push(
 			` ${mark} ${theme.fg("muted", task.taskId)}  ${theme.fg("toolTitle", taskLabel(task))}  ${theme.fg("dim", elapsed)}  ${theme.fg("toolOutput", detail)}`,
 		);
+	}
+	for (const status of subagents.slice(-MAX_SUBAGENT_LINES)) {
+		lines.push(renderSubagentLine(status, now, spinner, theme));
+	}
+	if (subagents.length > MAX_SUBAGENT_LINES) {
+		lines.push(theme.fg("muted", `   … ${subagents.length - MAX_SUBAGENT_LINES} weitere Subagenten`));
 	}
 	const turn = snapshot.runningTurn;
 	if (live) {
@@ -296,9 +369,12 @@ export class BackgroundActivityView {
 	show(ctx: ExtensionContext | undefined, snapshot: ActivityDisplay): void {
 		this.latest = snapshot;
 		if (!ctx?.hasUI) return;
-		const running = snapshot.tasks.filter((task) => !task.finished).length;
+		const subagents = snapshot.subagents ?? [];
+		const running =
+			snapshot.tasks.filter((task) => !task.finished).length +
+			subagents.filter((status) => status.state === "working").length;
 		const working = Boolean(snapshot.runningTurn) || isLiveFresh(snapshot.live, Date.now());
-		const visible = snapshot.tasks.length > 0 || working;
+		const visible = snapshot.tasks.length > 0 || subagents.length > 0 || working;
 		if (!visible) {
 			this.clear();
 			return;

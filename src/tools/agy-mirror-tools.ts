@@ -37,6 +37,10 @@ const MirrorToolParamsSchema = Type.Object(
 		query: Type.Optional(Type.String()),
 		agentRole: Type.Optional(Type.String()),
 		tool: Type.Optional(Type.String()),
+		prompt: Type.Optional(Type.String()),
+		agentType: Type.Optional(Type.String()),
+		model: Type.Optional(Type.String()),
+		agentCount: Type.Optional(Type.Number()),
 	},
 	{ additionalProperties: true },
 );
@@ -156,7 +160,9 @@ export function classifyAgyToolCall(input: {
 	const internalTool =
 		kind === "other" && command === undefined ? /^run ([a-z][a-z0-9_]*)$/.exec(lowerTitle)?.[1] : undefined;
 
-	if (internalTool) {
+	if (internalTool === "invoke_subagent") {
+		mirrorToolName = "agy_subagent";
+	} else if (internalTool) {
 		mirrorToolName = "agy_tool";
 	} else if (isExplicitSubagentTitle) {
 		mirrorToolName = "agy_subagent";
@@ -191,11 +197,54 @@ export function classifyAgyToolCall(input: {
 	if (query) args.query = query;
 	if (agentRole) args.agentRole = agentRole;
 	if (internalTool) args.tool = internalTool;
+	if (internalTool === "invoke_subagent") {
+		Object.assign(args, subagentSpawnArguments(rawObj));
+	}
 
 	return {
 		mirrorToolName,
 		arguments: args,
 	};
+}
+
+const MAX_SUBAGENT_PROMPT_CHARS = 4_000;
+
+function displayArguments(args: JsonObject): Record<string, string | number> {
+	const out: Record<string, string | number> = {};
+	for (const [key, value] of Object.entries(args)) {
+		if (typeof value === "string" || typeof value === "number") out[key] = value;
+	}
+	return out;
+}
+
+/**
+ * What `invoke_subagent` starts: role, type, model and task of one subagent, or the
+ * count and roles when one call starts several.
+ */
+function subagentSpawnArguments(rawObj: Record<string, unknown> | undefined): Record<string, string | number> {
+	const out: Record<string, string | number> = {};
+	if (!rawObj) return out;
+	const typeName = pickFirstString(rawObj, ["TypeName", "typeName"]);
+	const model = pickFirstString(rawObj, ["Model", "model"]);
+	const prompt = pickFirstString(rawObj, ["Prompt", "prompt"]);
+	if (typeName) out.agentType = typeName;
+	if (model) out.model = model;
+	if (prompt) {
+		out.prompt =
+			prompt.length > MAX_SUBAGENT_PROMPT_CHARS ? `${prompt.slice(0, MAX_SUBAGENT_PROMPT_CHARS - 1)}…` : prompt;
+		return out;
+	}
+	// Batch form: an array of subagent specs.
+	for (const value of Object.values(rawObj)) {
+		if (!Array.isArray(value)) continue;
+		const specs = value.map(asRecord).filter((spec) => spec !== undefined);
+		if (specs.length === 0 || !specs.some((spec) => "Prompt" in spec || "Role" in spec)) continue;
+		out.agentCount = specs.length;
+		const roles = specs.map((spec) => pickFirstString(spec, ["Role", "TypeName"])).filter((role) => role !== undefined);
+		if (roles.length > 0) out.agentRole = roles.join(", ");
+		break;
+	}
+	return out;
 }
 
 interface TrackedMirrorCallState {
@@ -210,6 +259,8 @@ interface TrackedMirrorCallState {
 	query?: string;
 	agentRole?: string;
 	tool?: string;
+	/** Classified display arguments, e.g. the task of a subagent. */
+	args: Record<string, string | number>;
 	status: AcpToolStatus;
 	contentBlocks: Array<TextContent | ImageContent>;
 	diffs: AgyDiffPayload[];
@@ -269,6 +320,8 @@ export interface EmptyResultContext {
 	command?: string;
 	/** agy-internal tool name such as `schedule`. */
 	toolName?: string;
+	/** Classified display arguments (role, task and model of a subagent, ...). */
+	args: Record<string, string | number>;
 }
 
 /**
@@ -334,6 +387,7 @@ export class AgyTurnMirrorBroker {
 						? classified.arguments.agentRole
 						: undefined,
 				tool: typeof classified.arguments.tool === "string" ? classified.arguments.tool : undefined,
+				args: displayArguments(classified.arguments),
 				status: payload.status ?? "pending",
 				contentBlocks: [],
 				diffs: [],
@@ -370,6 +424,7 @@ export class AgyTurnMirrorBroker {
 			if (typeof classified.arguments.tool === "string") {
 				state.tool = classified.arguments.tool;
 			}
+			state.args = { ...state.args, ...displayArguments(classified.arguments) };
 		}
 
 		if (payload.content && payload.content.length > 0) {
@@ -663,6 +718,7 @@ export class AgyTurnMirrorBroker {
 					title: state.title,
 					command: state.command,
 					toolName: state.tool,
+					args: state.args,
 				});
 			} catch {
 				note = undefined;

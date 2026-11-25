@@ -11,6 +11,7 @@ import {
 	isLiveFresh,
 	LIVE_STALE_MS,
 	type LiveActivity,
+	subagentStartNote,
 	toAutonomousEntryData,
 } from "../ui/background-activity.ts";
 import { type ActivitySnapshot, AgyActivityWatcher } from "./activity-watcher.ts";
@@ -136,6 +137,9 @@ export class BackgroundActivityController {
 				return `⏳ Läuft im Hintergrund als ${task.taskId}. Fortschritt und Ergebnis zeigt die Antigravity-Anzeige über dem Eingabefeld.`;
 			}
 		}
+		if (context.toolName === "invoke_subagent") {
+			return this.subagentNote(context);
+		}
 		if (context.toolName === "schedule") {
 			const timer = watcher.latestTimer();
 			if (timer) {
@@ -143,6 +147,14 @@ export class BackgroundActivityController {
 			}
 		}
 		return undefined;
+	}
+
+	/** Card text for `invoke_subagent`: who runs, on which model, with which task. */
+	private subagentNote(context: EmptyResultContext): string {
+		const args = context.args;
+		const role = typeof args.agentRole === "string" ? args.agentRole : undefined;
+		const single = typeof args.agentCount !== "number" || args.agentCount <= 1;
+		return subagentStartNote(args, single ? this.watcher?.findSubagent(role) : undefined);
 	}
 
 	stop(): void {
