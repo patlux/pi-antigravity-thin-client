@@ -44,7 +44,9 @@
   "scripts": {
     "typecheck": "node ./node_modules/typescript/bin/tsc --noEmit",
     "test": "node --experimental-strip-types --test",
-    "check": "npm run typecheck && npm test"
+    "check": "npm run typecheck && npm test",
+    "test:release": "node --test test/release.test.mjs",
+    "test:release-package": "node .github/scripts/package-smoke.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",

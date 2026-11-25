@@ -3,83 +3,157 @@ name: Release
 on:
   push:
     tags:
-      - "v*.*.*"
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Release tag (e.g. v0.1.0)"
-        required: false
-        default: "v0.1.0"
+      - "v*"
+
+# Shared across all versions so concurrent pushes cannot move a dist-tag backwards.
+# GitHub keeps at most one pending run; see RELEASE.md before pushing another tag.
+concurrency:
+  group: npm-release
+  cancel-in-progress: false
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 jobs:
-  release:
-    name: Publish and Release
+  validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    env:
-      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "24"
-          registry-url: "https://registry.npmjs.org"
-          cache: "npm"
+          node-version: 24
+      - run: node .github/scripts/release.mjs validate
 
-      - name: Upgrade npm
-        run: npm install -g npm@latest
+  checks:
+    needs: validate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Run typecheck and tests
-        run: npm run check
-
-      - name: Extract changelog notes
+  package:
+    needs: checks
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          # No dependency caches in release jobs.
+      - run: npm install --global npm@11.20.0
+      - name: Install Pi
         run: |
-          node -e '
-            const fs = require("node:fs");
-            const tag = "${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}";
-            const version = tag.replace(/^v/, "");
-            const content = fs.readFileSync("CHANGELOG.md", "utf8");
-            const lines = content.split(/\r?\n/);
-            let capturing = false;
-            const out = [];
-            for (const line of lines) {
-              if (/^##\s+/.test(line)) {
-                if (capturing) break;
-                if (line.includes(version)) capturing = true;
-                continue;
-              }
-              if (capturing) out.push(line);
-            }
-            const notes = out.join("\n").trim() || `Release ${tag}`;
-            fs.writeFileSync("release-notes.md", notes + "\n", "utf8");
-          '
-
-      - name: Create or update GitHub Release
+          npm install --global @earendil-works/pi-coding-agent@latest
+          echo "PI_BIN=$(npm prefix -g)/bin/pi" >> "$GITHUB_ENV"
+          pi --version
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run check
+      - run: npm audit --audit-level=moderate
+      - run: git diff --exit-code
+      - name: Pack once
+        id: pack
+        run: node .github/scripts/release.mjs pack
+      - name: Load the actual packed package in Pi
+        run: node .github/scripts/package-smoke.mjs "$TARBALL"
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        id: upload
+        with:
+          name: npm-release-${{ github.run_attempt }}
+          path: release-artifact/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm install --global npm@11.20.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact-id }}
+          merge-multiple: true
+          path: release-artifact/
+      - name: Verify artifact, current tag, main ancestry and registry state
+        id: registry
+        run: node .github/scripts/release.mjs registry-check
+      # No npm ci, host tests, caches or package lifecycle scripts with OIDC access.
+      - name: Publish exactly the tested tarball using npm Trusted Publishing
+        if: steps.registry.outputs.decision == 'publish'
+        run: npm publish "$TARBALL" --tag "$DIST_TAG" --access public --ignore-scripts
+        env:
+          TARBALL: ${{ steps.registry.outputs.tarball }}
+          DIST_TAG: ${{ steps.registry.outputs.dist_tag }}
+
+  verify:
+    needs: [package, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - run: npm install --global npm@11.20.0
+      - name: Install Pi
         run: |
-          TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --title "$TAG" --notes-file release-notes.md
-          else
-            gh release create "$TAG" --title "$TAG" --notes-file release-notes.md
-          fi
-
-      - name: Publish to npm
-        if: ${{ env.NPM_TOKEN != '' }}
+          npm install --global @earendil-works/pi-coding-agent@latest
+          echo "PI_BIN=$(npm prefix -g)/bin/pi" >> "$GITHUB_ENV"
+          pi --version
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact-id }}
+          merge-multiple: true
+          path: release-artifact/
+      - name: Download and verify exact public npm version
+        id: registry
+        run: node .github/scripts/release.mjs verify
+      - name: Load the package downloaded from npm in Pi
+        run: node .github/scripts/package-smoke.mjs "$TARBALL"
         env:
-          NODE_AUTH_TOKEN: ${{ env.NPM_TOKEN }}
-        run: npm publish --provenance --access public
+          TARBALL: ${{ steps.registry.outputs.tarball }}
+
+  github-release:
+    needs: [package, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact-id }}
+          merge-multiple: true
+          path: release-artifact/
+      - name: Create GitHub release only after registry verification
+        run: node .github/scripts/release.mjs github
+        env:
+          GH_TOKEN: ${{ github.token }}

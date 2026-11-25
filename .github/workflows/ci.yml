@@ -2,36 +2,93 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
-      - master
+    branches: [main]
   pull_request:
+    branches: [main]
+  workflow_dispatch:
+  # The tag release calls these same gates for its exact commit.
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   check:
-    name: Check (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    name: Check (${{ matrix.os }}, Node ${{ matrix.node }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-
+        node: [22, 24]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: "24"
-          cache: "npm"
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run check
+      - name: Checks leave the repository unchanged
+        shell: bash
+        run: test -z "$(git status --porcelain --untracked-files=all)"
 
-      - name: Install dependencies
-        run: npm ci
+  package:
+    name: Packed package loads in Pi
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Install Pi
+        run: |
+          npm install -g @earendil-works/pi-coding-agent@latest
+          echo "PI_BIN=$(npm prefix -g)/bin/pi" >> "$GITHUB_ENV"
+      - name: Verify Pi starts
+        run: '"$PI_BIN" --version'
+      - name: Pack and load the package with a stub agy
+        run: |
+          dir="$(mktemp -d)"
+          npm pack --ignore-scripts --pack-destination "$dir"
+          node .github/scripts/package-smoke.mjs "$dir"/pi-antigravity-thin-client-*.tgz
 
-      - name: Run typecheck and tests
-        run: npm run check
+  workflows:
+    name: Workflow syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker://rhysd/actionlint:1.7.7
 
-      - name: Verify package contents
-        run: npm pack --dry-run
+  audit:
+    name: npm audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm audit --audit-level=moderate
+
+  lifecycle-scripts:
+    name: No install lifecycle scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Refuse install-time scripts in the package
+        run: |
+          node -e '
+            const pkg = require("./package.json");
+            const dangerous = ["preinstall", "install", "postinstall", "prepublish", "prepare"];
+            const found = dangerous.filter((name) => pkg.scripts && pkg.scripts[name]);
+            if (found.length > 0) {
+              console.error("package.json has lifecycle scripts: " + found.join(", "));
+              process.exit(1);
+            }
+          '
