@@ -6,6 +6,7 @@ pi-antigravity-thin-client is a Pi extension that connects Pi to Google Antigrav
 
 - Never send prompts to Antigravity yourself: no tmux keystrokes into a Pi session that uses an `antigravity/…` model, no `pi -p`, no scripts. Only a person typing in the interactive session may prompt Antigravity. Ask the user to run live tests.
 - Tests must never reach a real `agy`. Use the mock in `test/turn-coordinator-e2e.test.ts` or a stub binary through `PI_AGY_BIN`.
+- The one exception to the tmux rule is `scripts/screenshots/capture.mjs`: it types into Pi only against `scripts/screenshots/mock-agy.mjs`, set as `PI_AGY_BIN` and as the first `agy` on `PATH` of a temporary home. Keep it that way; never point it at a real `agy`.
 - Keep the thin-client policy intact (`src/thin-client-policy.ts`, `src/human-prompt-gate.ts`, the refusals in `src/session/reconcile.ts` and `src/session/turn-coordinator.ts`). Never weaken or skip the thin-client tests.
 - Keep upstream code close to upstream so merges stay small; put fork features in their own modules (`src/background/`, `src/ui/background-activity.ts`).
 - All interface texts (notifications, errors, widget, cards, command help) are English. Translate Chinese texts that upstream merges bring in.
