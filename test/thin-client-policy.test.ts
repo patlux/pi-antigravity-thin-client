@@ -54,8 +54,19 @@ function withTempAgentDir<T>(fn: (dir: string) => T): T {
  * on PATH, and a test prompt must never reach Antigravity.
  */
 function writeRecordingAgy(dir: string): { bin: string; marker: string } {
-	const bin = path.join(dir, "recording-agy");
 	const marker = path.join(dir, "agy-started");
+	if (process.platform === "win32") {
+		// Windows cannot start a shell script; use a node script behind a .cmd wrapper.
+		const script = path.join(dir, "recording-agy.mjs");
+		fs.writeFileSync(
+			script,
+			`import fs from "node:fs";\nfs.appendFileSync(${JSON.stringify(marker)}, "started\\n");\nprocess.exit(1);\n`,
+		);
+		const bin = path.join(dir, "recording-agy.cmd");
+		fs.writeFileSync(bin, `@node "${script}" %*\r\n`);
+		return { bin, marker };
+	}
+	const bin = path.join(dir, "recording-agy");
 	fs.writeFileSync(bin, `#!/bin/sh\necho started >> '${marker}'\nexit 1\n`, { mode: 0o755 });
 	return { bin, marker };
 }
