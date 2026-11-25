@@ -23,6 +23,9 @@
 > for running tasks and a card (`antigravity-autonomous` session entry, never in the model
 > context) for every turn agy took by itself. Tool cards say when a command went to the
 > background or a timer was set. This only reads local files; nothing is sent to agy.
+> agy >= 1.5.10 also streams such turns over ACP right away; the widget shows them live (current
+> tool, last line of the answer), the card still comes from the transcript. A message from a
+> subagent that wakes agy shows up as `✉ Subagent <id>` in the card.
 > `PI_AGY_TRACE=1` (or a file path) logs every `session/update` agy sends to a local JSONL file.
 >
 > Steering: a message typed while agy works no longer cancels the agy turn (cancelling stops

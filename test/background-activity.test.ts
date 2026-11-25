@@ -15,6 +15,8 @@ import {
 } from "../src/background/agy-activity.ts";
 import { AgyTurnMirrorBroker, classifyAgyToolCall } from "../src/tools/agy-mirror-tools.ts";
 import {
+	describeTrigger,
+	LIVE_STALE_MS,
 	renderActivityLines,
 	renderAutonomousEntry,
 	type ThemeLike,
@@ -140,6 +142,21 @@ describe("agy activity from local files", () => {
 		assert.deepEqual(activity.turns[0].triggers, [
 			{ taskId: "task-2", title: "Background sleep task: Notification timeout reached", outcome: "running", exitCode: undefined, kind: "command" },
 		]);
+	});
+
+	it("names a subagent whose message woke agy up", () => {
+		const sub = "9a9a9a9a-5555-6666-7777-888888888888";
+		const lines = transcriptLines().slice(0, 4);
+		lines.push(
+			JSON.stringify({ step_index: 4, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", created_at: "2026-11-25T14:00:00Z", content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-25T14:00:00Z sender=${sub} priority=MESSAGE_PRIORITY_HIGH content=Datei angelegt.\n</SYSTEM_MESSAGE>` }),
+			JSON.stringify({ step_index: 5, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "Der Subagent ist fertig." }),
+		);
+		const note = parseTaskMessage(JSON.stringify({ id: "ddd", sender: sub, timestamp: "2026-11-25T14:00:00.200Z", renderDetails: { messageTitle: "writer: Datei angelegt" }, content: "Datei angelegt." }));
+		assert.ok(note);
+		assert.equal(note.taskId, undefined);
+		const turn = deriveAgyActivity(steps(lines), [note]).turns[0];
+		assert.deepEqual(turn.triggers, [{ agentId: sub, title: "writer: Datei angelegt" }]);
+		assert.equal(describeTrigger(turn.triggers[0], plainTheme), "✉ Subagent 9a9a9a9a · writer: Datei angelegt");
 	});
 
 	it("ignores reminders and messages that arrive inside a prompted turn", () => {
@@ -290,6 +307,18 @@ describe("background activity display", () => {
 			" ⠋ task-6  Timer 30 s  0:19  noch 11 s",
 			" ⠋ arbeitet selbstständig  0:03  1 Tool-Aufruf",
 		]);
+	});
+
+	it("shows what agy streams on its own, until it goes quiet", () => {
+		const now = Date.parse("2026-11-25T13:55:05Z");
+		const base = { agySessionId: CONV, tasks: [], logTails: new Map<string, string>() };
+		const live = { startedAtMs: now - 4_000, lastAtMs: now - 500, text: "Erste Zeile\nDer Timer ist abgelaufen.", toolCalls: 1, thinking: false };
+		assert.deepEqual(renderActivityLines({ ...base, live }, now, 1, plainTheme), [
+			"Antigravity",
+			" ⠙ arbeitet selbstständig  0:04  1 Tool-Aufruf  Der Timer ist abgelaufen.",
+		]);
+		assert.match(renderActivityLines({ ...base, live: { ...live, tool: "Run manage_task" } }, now, 1, plainTheme)[1], /→ Run manage_task$/);
+		assert.deepEqual(renderActivityLines({ ...base, live: { ...live, lastAtMs: now - LIVE_STALE_MS - 1 } }, now, 1, plainTheme), []);
 	});
 
 	it("renders an autonomous card with trigger, answer and collapsed tool calls", () => {

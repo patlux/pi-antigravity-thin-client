@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AcpSessionUpdatePayload } from "../acp/protocol.ts";
 import { resolveAgyAppDataDir } from "../config.ts";
 import type { TurnCoordinator } from "../session/turn-coordinator.ts";
 import type { EmptyResultContext } from "../tools/agy-mirror-tools.ts";
@@ -7,9 +8,12 @@ import {
 	AUTONOMOUS_ENTRY_TYPE,
 	BackgroundActivityView,
 	isAutonomousEntryData,
+	isLiveFresh,
+	LIVE_STALE_MS,
+	type LiveActivity,
 	toAutonomousEntryData,
 } from "../ui/background-activity.ts";
-import { AgyActivityWatcher } from "./activity-watcher.ts";
+import { type ActivitySnapshot, AgyActivityWatcher } from "./activity-watcher.ts";
 import type { AutonomousTurn } from "./agy-activity.ts";
 
 function recordedStartSteps(ctx: ExtensionContext | undefined, agySessionId: string): Set<number> {
@@ -38,10 +42,55 @@ export class BackgroundActivityController {
 	private readonly coordinator: TurnCoordinator;
 	private readonly view = new BackgroundActivityView();
 	private watcher: AgyActivityWatcher | undefined;
+	private snapshot: ActivitySnapshot | undefined;
+	private live: LiveActivity | undefined;
+	private liveExpiry: NodeJS.Timeout | undefined;
 
 	constructor(pi: ExtensionAPI, coordinator: TurnCoordinator) {
 		this.pi = pi;
 		this.coordinator = coordinator;
+	}
+
+	/**
+	 * agy's updates while no Pi turn runs (agy >= 1.5.10 sends them right away when
+	 * a task, timer or subagent wakes it up): shown live in the widget. The card
+	 * with the finished turn still comes from agy's transcript, which marks exactly
+	 * where the turn ends.
+	 */
+	onOutOfTurnUpdate(agySessionId: string, update: AcpSessionUpdatePayload): void {
+		this.sync();
+		if (this.watcher?.agySessionId !== agySessionId) return;
+		const now = Date.now();
+		const live: LiveActivity = isLiveFresh(this.live, now)
+			? this.live
+			: { startedAtMs: now, lastAtMs: now, text: "", toolCalls: 0, thinking: false };
+		live.lastAtMs = now;
+		switch (update.sessionUpdate) {
+			case "agent_message_chunk":
+				if (update.content.type === "text") {
+					live.text = (live.text + update.content.text).slice(-600);
+					live.tool = undefined;
+					live.thinking = false;
+				}
+				break;
+			case "agent_thought_chunk":
+				live.thinking = true;
+				break;
+			case "tool_call":
+				live.toolCalls++;
+				live.tool = update.title?.trim() || update.kind || "Tool";
+				break;
+			case "tool_call_update":
+				if (update.status === "completed" || update.status === "failed") live.tool = undefined;
+				break;
+			default:
+				break;
+		}
+		this.live = live;
+		if (this.liveExpiry) clearTimeout(this.liveExpiry);
+		this.liveExpiry = setTimeout(() => this.render(), LIVE_STALE_MS + 100);
+		this.liveExpiry.unref?.();
+		this.render();
 	}
 
 	/** Follows the agy conversation behind the current Pi session. */
@@ -66,7 +115,10 @@ export class BackgroundActivityController {
 				".system_generated",
 			),
 			isAlive: () => this.coordinator.isAgySessionAlive(agySessionId),
-			onSnapshot: (snapshot) => this.view.show(this.coordinator.getActiveContext(), snapshot),
+			onSnapshot: (snapshot) => {
+				this.snapshot = snapshot;
+				this.render();
+			},
 			onTurnFinished: (turn) => this.record(agySessionId, turn),
 			alreadyRecorded: (startStep) => recorded.has(startStep),
 		});
@@ -96,10 +148,30 @@ export class BackgroundActivityController {
 	stop(): void {
 		this.watcher?.stop();
 		this.watcher = undefined;
+		this.snapshot = undefined;
+		this.live = undefined;
+		if (this.liveExpiry) clearTimeout(this.liveExpiry);
+		this.liveExpiry = undefined;
 		this.view.clear();
 	}
 
+	private render(): void {
+		const watcher = this.watcher;
+		if (!watcher) return;
+		const base: ActivitySnapshot = this.snapshot ?? {
+			agySessionId: watcher.agySessionId,
+			tasks: [],
+			logTails: new Map(),
+		};
+		this.view.show(this.coordinator.getActiveContext(), { ...base, live: this.live });
+	}
+
 	private record(agySessionId: string, turn: AutonomousTurn): void {
+		// The finished turn replaces the live line.
+		if (this.live && (turn.endedAtMs ?? Date.now()) >= this.live.startedAtMs - 5_000) {
+			this.live = undefined;
+			this.render();
+		}
 		this.pi.appendEntry(AUTONOMOUS_ENTRY_TYPE, toAutonomousEntryData(agySessionId, turn));
 		const ctx = this.coordinator.getActiveContext();
 		if (ctx?.hasUI) {

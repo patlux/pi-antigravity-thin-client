@@ -267,6 +267,22 @@ rl.on("line", async (line) => {
       return;
     }
 
+    if (lastBlockText === "WAKE_LATER") {
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Timer set." } } }
+      });
+      send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+      // agy >= 1.5.10: the turn it takes on its own after a wake-up streams right away.
+      setTimeout(() => {
+        send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "tool_call", toolCallId: "auto_1", title: "Run manage_task", kind: "other", status: "pending" } } });
+        send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "tool_call_update", toolCallId: "auto_1", status: "completed" } } });
+        send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "The timer expired." } } } });
+      }, 30);
+      return;
+    }
+
     if (lastBlockText === "QUOTA_EXHAUSTED_429") {
       send({
         jsonrpc: "2.0",
@@ -1567,6 +1583,41 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 				["Update src/app.ts", "STEER_REPLY"],
 			);
 			assert.equal(notes.length, 1);
+		} finally {
+			await coord.dispose();
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("thin client: hands agy's updates outside a Pi turn to the display without registering mirror calls", async () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-wake-"));
+		const binPath = writeMockAgyExecutable(tmpRoot);
+		const cfg: BridgeConfig = {
+			...DEFAULT_BRIDGE_CONFIG,
+			toolMode: "agy-tools",
+			agyBin: binPath,
+			geminiDir: path.join(tmpRoot, ".gemini"),
+		};
+		const pm = new AcpProcessManager();
+		const broker = new AgyTurnMirrorBroker();
+		const coord = new TurnCoordinator(createStubPiApi(), pm, broker, cfg);
+		coord.setActiveContext(interactiveContext(tmpRoot));
+		const tools = createAgyMirrorToolDefinitions(broker).map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
+		const seen: string[] = [];
+		coord.setOutOfTurnListener((_agySessionId, update) => {
+			seen.push(update.sessionUpdate);
+		});
+
+		try {
+			const prompt: UserMessage = { role: "user", content: "WAKE_LATER", timestamp: 1 };
+			typedByHuman(coord.humanPromptGate, prompt);
+			const msg = await coord.streamSimple(TEST_MODEL, normalizeContext({ messages: [prompt], tools }), { sessionId: "pi-sess-wake" }).result();
+			assert.equal(msg.stopReason, "stop");
+			for (let i = 0; i < 50 && seen.length < 3; i++) {
+				await new Promise((r) => setTimeout(r, 10));
+			}
+			assert.deepEqual(seen, ["tool_call", "tool_call_update", "agent_message_chunk"]);
+			assert.equal(broker.isTracking("auto_1"), false);
 		} finally {
 			await coord.dispose();
 			fs.rmSync(tmpRoot, { recursive: true, force: true });

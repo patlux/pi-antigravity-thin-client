@@ -389,6 +389,7 @@ export class TurnCoordinator {
 	readonly humanPromptGate = new HumanPromptGate();
 	/** Local `session/update` trace, enabled with `PI_AGY_TRACE`. */
 	readonly updateTrace = new AcpUpdateTrace();
+	private outOfTurnListener?: (agySessionId: string, update: AcpSessionUpdatePayload) => void;
 
 	constructor(
 		pi: ExtensionAPI,
@@ -445,6 +446,13 @@ export class TurnCoordinator {
 			windowSize: ledger?.windowSize,
 			backendCompactedRecently: ledger?.backendCompactedRecently,
 		};
+	}
+
+	/** Receives agy's updates that arrive while no Pi turn runs. */
+	setOutOfTurnListener(
+		listener: ((agySessionId: string, update: AcpSessionUpdatePayload) => void) | undefined,
+	): void {
+		this.outOfTurnListener = listener;
 	}
 
 	private notifySteerDeferred(): void {
@@ -771,6 +779,24 @@ export class TurnCoordinator {
 
 		const ledger = this.ledgersByAgyId.get(sessionId);
 		if (!ledger) return;
+
+		// agy >= 1.5.10 streams the turns it takes on its own (a background task,
+		// timer or subagent woke it up) right away. No Pi turn consumes them; hand
+		// them to the display instead of dropping them.
+		if (
+			!ledger.activePump &&
+			this.outOfTurnListener &&
+			(update.sessionUpdate === "agent_message_chunk" ||
+				update.sessionUpdate === "agent_thought_chunk" ||
+				update.sessionUpdate === "tool_call" ||
+				update.sessionUpdate === "tool_call_update")
+		) {
+			try {
+				this.outOfTurnListener(sessionId, update);
+			} catch {
+				// Display problems must not disturb the session.
+			}
+		}
 
 		if (update.sessionUpdate === "usage_update") {
 			if (typeof update.used === "number") {

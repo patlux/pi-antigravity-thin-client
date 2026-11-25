@@ -16,6 +16,30 @@ const STATUS_KEY = "antigravity-background";
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS = 120;
 
+/** After this long without an update, live activity is no longer shown. */
+export const LIVE_STALE_MS = 20_000;
+
+/** What agy streams over ACP while it works on its own (no Pi turn running). */
+export interface LiveActivity {
+	startedAtMs: number;
+	lastAtMs: number;
+	/** Tail of the answer agy is writing. */
+	text: string;
+	/** Title of the last tool call agy started. */
+	tool?: string;
+	toolCalls: number;
+	thinking: boolean;
+}
+
+/** Everything the widget shows. */
+export interface ActivityDisplay extends ActivitySnapshot {
+	live?: LiveActivity;
+}
+
+export function isLiveFresh(live: LiveActivity | undefined, now: number): live is LiveActivity {
+	return live !== undefined && now - live.lastAtMs < LIVE_STALE_MS;
+}
+
 /** The theme methods these renderers use; Pi's `Theme` satisfies it. */
 export interface ThemeLike {
 	fg(color: "accent" | "muted" | "dim" | "success" | "error" | "warning" | "toolTitle" | "toolOutput" | "customMessageLabel" | "customMessageText", text: string): string;
@@ -103,6 +127,10 @@ function outcomeMark(outcome: TriggerOutcome | undefined, theme: ThemeLike): str
 
 /** One line per trigger, e.g. "✓ task-2 · Background sleep task finished (Exit 0)". */
 export function describeTrigger(trigger: AutonomousTrigger, theme: ThemeLike): string {
+	if (trigger.agentId) {
+		const who = theme.fg("muted", `Subagent ${trigger.agentId.slice(0, 8)}`);
+		return `${theme.fg("accent", "✉")} ${who} · ${trigger.title ?? "Nachricht"}`;
+	}
 	const fallback =
 		trigger.outcome === "running"
 			? "läuft noch"
@@ -172,16 +200,18 @@ function taskLabel(task: BackgroundTask): string {
 
 /** Widget lines for running background tasks and an autonomous turn in progress. */
 export function renderActivityLines(
-	snapshot: ActivitySnapshot,
+	snapshot: ActivityDisplay,
 	now: number,
 	frame: number,
 	theme: ThemeLike,
 ): string[] {
 	const running = snapshot.tasks.filter((task) => !task.finished);
-	if (snapshot.tasks.length === 0 && !snapshot.runningTurn) return [];
+	const live = isLiveFresh(snapshot.live, now) ? snapshot.live : undefined;
+	if (snapshot.tasks.length === 0 && !snapshot.runningTurn && !live) return [];
 	const spinner = theme.fg("accent", SPINNER[frame % SPINNER.length]);
-	const header = running.length === 1 ? "1 Hintergrund-Task" : `${running.length} Hintergrund-Tasks`;
-	const lines = [`${theme.fg("customMessageLabel", theme.bold("Antigravity"))} ${theme.fg("muted", `· ${header}`)}`];
+	const header =
+		running.length === 0 ? "" : running.length === 1 ? " · 1 Hintergrund-Task" : ` · ${running.length} Hintergrund-Tasks`;
+	const lines = [`${theme.fg("customMessageLabel", theme.bold("Antigravity"))}${theme.fg("muted", header)}`];
 	for (const task of snapshot.tasks) {
 		const mark = task.finished ? outcomeMark(task.finished.outcome, theme) : spinner;
 		const elapsed = task.startedAtMs !== undefined ? formatElapsed((task.finished?.atMs ?? now) - task.startedAtMs) : "";
@@ -199,7 +229,21 @@ export function renderActivityLines(
 		);
 	}
 	const turn = snapshot.runningTurn;
-	if (turn) {
+	if (live) {
+		const elapsed = formatElapsed(now - live.startedAtMs);
+		const lastLine = live.text.split("\n").filter((line) => line.trim()).at(-1)?.trim();
+		const detail = live.tool
+			? `→ ${live.tool}`
+			: lastLine
+				? lastLine
+				: live.thinking
+					? "denkt nach …"
+					: "";
+		const actions = live.toolCalls === 1 ? "1 Tool-Aufruf" : `${live.toolCalls} Tool-Aufrufe`;
+		lines.push(
+			` ${spinner} ${theme.fg("toolTitle", "arbeitet selbstständig")}  ${theme.fg("dim", elapsed)}  ${theme.fg("muted", actions)}  ${theme.fg("toolOutput", detail)}`,
+		);
+	} else if (turn) {
 		const elapsed = turn.startedAtMs !== undefined ? formatElapsed(now - turn.startedAtMs) : "";
 		const actions = turn.actions.length === 1 ? "1 Tool-Aufruf" : `${turn.actions.length} Tool-Aufrufe`;
 		lines.push(` ${spinner} ${theme.fg("toolTitle", "arbeitet selbstständig")}  ${theme.fg("dim", elapsed)}  ${theme.fg("muted", actions)}`);
@@ -208,13 +252,13 @@ export function renderActivityLines(
 }
 
 class ActivityWidgetComponent implements Component {
-	private snapshot: ActivitySnapshot;
+	private snapshot: ActivityDisplay;
 	private readonly theme: ThemeLike;
 	private readonly requestRender: () => void;
 	private readonly timer: NodeJS.Timeout;
 	private frame = 0;
 
-	constructor(snapshot: ActivitySnapshot, theme: ThemeLike, requestRender: () => void) {
+	constructor(snapshot: ActivityDisplay, theme: ThemeLike, requestRender: () => void) {
 		this.snapshot = snapshot;
 		this.theme = theme;
 		this.requestRender = requestRender;
@@ -225,7 +269,7 @@ class ActivityWidgetComponent implements Component {
 		this.timer.unref?.();
 	}
 
-	update(snapshot: ActivitySnapshot): void {
+	update(snapshot: ActivityDisplay): void {
 		this.snapshot = snapshot;
 		this.requestRender();
 	}
@@ -247,19 +291,20 @@ class ActivityWidgetComponent implements Component {
 export class BackgroundActivityView {
 	private component: ActivityWidgetComponent | undefined;
 	private shownIn: ExtensionContext | undefined;
-	private latest: ActivitySnapshot | undefined;
+	private latest: ActivityDisplay | undefined;
 
-	show(ctx: ExtensionContext | undefined, snapshot: ActivitySnapshot): void {
+	show(ctx: ExtensionContext | undefined, snapshot: ActivityDisplay): void {
 		this.latest = snapshot;
 		if (!ctx?.hasUI) return;
 		const running = snapshot.tasks.filter((task) => !task.finished).length;
-		const visible = snapshot.tasks.length > 0 || Boolean(snapshot.runningTurn);
+		const working = Boolean(snapshot.runningTurn) || isLiveFresh(snapshot.live, Date.now());
+		const visible = snapshot.tasks.length > 0 || working;
 		if (!visible) {
 			this.clear();
 			return;
 		}
-		const badge = snapshot.runningTurn ? "agy ⚙ selbstständig" : `agy ⏳ ${running}`;
-		ctx.ui.setStatus(STATUS_KEY, running > 0 || snapshot.runningTurn ? badge : undefined);
+		const badge = working ? "agy ⚙ selbstständig" : `agy ⏳ ${running}`;
+		ctx.ui.setStatus(STATUS_KEY, running > 0 || working ? badge : undefined);
 		if (this.component && this.shownIn === ctx) {
 			this.component.update(snapshot);
 			return;

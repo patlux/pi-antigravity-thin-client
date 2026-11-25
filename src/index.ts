@@ -230,6 +230,7 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 	// a live widget and session cards. Display only; nothing goes to agy or the model.
 	const background = new BackgroundActivityController(pi, coordinator);
 	mirrorBroker.setEmptyResultNote((context) => background.emptyResultNote(context));
+	coordinator.setOutOfTurnListener((agySessionId, update) => background.onOutOfTurnUpdate(agySessionId, update));
 	pi.registerEntryRenderer(AUTONOMOUS_ENTRY_TYPE, (entry, options, theme) => {
 		if (!isAutonomousEntryData(entry.data)) return undefined;
 		return renderAutonomousEntry(

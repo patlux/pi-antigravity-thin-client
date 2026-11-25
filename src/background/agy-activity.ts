@@ -30,7 +30,10 @@ export interface TranscriptStep {
 
 export interface TaskMessage {
 	id: string;
-	taskId: string;
+	/** Full sender: `<conversation>/task-N` for a task, a conversation id for an agent. */
+	senderId: string;
+	/** `task-N` when a background task sent it; undefined for subagents and other agents. */
+	taskId?: string;
 	title?: string;
 	content: string;
 	timestampMs?: number;
@@ -64,6 +67,8 @@ export interface BackgroundTask {
 
 export interface AutonomousTrigger {
 	taskId?: string;
+	/** Conversation id of the agent (e.g. a subagent) whose message woke agy up. */
+	agentId?: string;
 	title?: string;
 	outcome?: TriggerOutcome;
 	exitCode?: number;
@@ -185,14 +190,15 @@ export function parseTaskMessage(json: string): TaskMessage | undefined {
 	}
 	const obj = asRecord(parsed);
 	const id = asString(obj?.id);
-	const sender = asString(obj?.sender);
-	const taskId = sender ? shortTaskId(sender) : undefined;
-	if (!obj || !id || !taskId) return undefined;
+	const sender = asString(obj?.sender)?.trim();
+	if (!obj || !id || !sender) return undefined;
+	const taskId = shortTaskId(sender);
 	const toolCall = asRecord(asRecord(asRecord(obj.sourceMetadata)?.tool)?.toolCall);
 	const title = asString(asRecord(obj.renderDetails)?.messageTitle);
 	const content = asString(obj.content) ?? "";
 	return {
 		id,
+		senderId: sender,
 		taskId,
 		title,
 		content,
@@ -266,21 +272,26 @@ export function deriveAgyActivity(
 	const ordered = [...steps].sort((a, b) => a.index - b.index);
 	// Notes per task in time order; the first terminal one ends the task.
 	const notesByTask = new Map<string, TaskMessage[]>();
-	for (const message of messages) {
-		const notes = notesByTask.get(message.taskId) ?? [];
+	const notesBySender = new Map<string, TaskMessage[]>();
+	const addNote = (map: Map<string, TaskMessage[]>, key: string, message: TaskMessage) => {
+		const notes = map.get(key) ?? [];
 		notes.push(message);
-		notesByTask.set(message.taskId, notes);
+		map.set(key, notes);
+	};
+	for (const message of messages) {
+		if (message.taskId) addNote(notesByTask, message.taskId, message);
+		addNote(notesBySender, message.senderId, message);
 	}
-	for (const notes of notesByTask.values()) {
+	for (const notes of [...notesByTask.values(), ...notesBySender.values()]) {
 		notes.sort((a, b) => (a.timestampMs ?? 0) - (b.timestampMs ?? 0));
 	}
 	const endOf = (taskId: string) => notesByTask.get(taskId)?.find((note) => note.terminal);
-	/** The note delivered in a transcript step: same task, same second. */
-	const noteAt = (taskId: string, atMs: number | undefined) =>
+	/** The note delivered in a transcript step: same sender, same second. */
+	const noteAt = (senderId: string, atMs: number | undefined) =>
 		atMs === undefined
 			? undefined
-			: notesByTask
-					.get(taskId)
+			: notesBySender
+					.get(senderId)
 					?.find((note) => note.timestampMs !== undefined && Math.abs(note.timestampMs - atMs) < 1_000);
 
 	const tasks: BackgroundTask[] = [];
@@ -347,18 +358,24 @@ export function deriveAgyActivity(
 			const taskId = sender ? shortTaskId(sender) : undefined;
 			const kind = taskId ? taskKinds.get(taskId) : undefined;
 			const deliveredContent = (header?.[3] ?? "").trim();
-			const note = taskId ? noteAt(taskId, parseTimeMs(header?.[1])) : undefined;
+			const note = sender ? noteAt(sender, parseTimeMs(header?.[1])) : undefined;
 			const title = note?.title;
-			const content = note?.content ?? deliveredContent;
-			const terminal = note ? note.terminal : isTerminalNote(undefined, content) || kind === "timer";
-			const result = terminal ? outcomeOf(title, content, kind) : undefined;
-			const trigger: AutonomousTrigger = {
-				taskId,
-				title,
-				outcome: terminal ? result?.outcome : "running",
-				exitCode: result?.exitCode,
-				kind,
-			};
+			let trigger: AutonomousTrigger;
+			if (taskId) {
+				const content = note?.content ?? deliveredContent;
+				const terminal = note ? note.terminal : isTerminalNote(undefined, content) || kind === "timer";
+				const result = terminal ? outcomeOf(title, content, kind) : undefined;
+				trigger = {
+					taskId,
+					title,
+					outcome: terminal ? result?.outcome : "running",
+					exitCode: result?.exitCode,
+					kind,
+				};
+			} else {
+				// A subagent (or another agent) sent agy a message.
+				trigger = { agentId: sender, title };
+			}
 			if (current) {
 				current.triggers.push(trigger);
 			} else if (!inTurn) {
