@@ -5,7 +5,40 @@ Use Google Antigravity in [Pi](https://pi.dev) as a thin client. Antigravity (`a
 This is a fork of [onprs/Pi-Antigravity-Bridge](https://github.com/onprs/Pi-Antigravity-Bridge) (`pi-antigravity-bridge` on npm). The fork removes everything that sends Antigravity content you did not type, and adds a display for Antigravity's background tasks, its own turns and its subagents.
 
 > [!WARNING]
-> This package is not made, endorsed or supported by Google or by the upstream author. Google's terms for the Antigravity subscription prohibit third-party software for access. The thin-client limits in this package follow statements from Google staff in the Antigravity forum, not an official policy. Using it with a subscription account can still get that account suspended. You use it at your own risk. Without risk: use an official client, or an Antigravity account that signs in with a Gemini API key.
+> This package is not made, endorsed or supported by Google or by the upstream author. It aims to stay within what Google allows for a subscription sign-in (see [Staying within what Google allows](#staying-within-what-google-allows)), but Google has not confirmed that boundary in its terms or docs. Using it with a subscription account can still get that account suspended. You use it at your own risk.
+
+## Staying within what Google allows
+
+The goal of this package is to use an Antigravity subscription sign-in (`oauth-personal`, Google AI Pro or Ultra) only the way Google allows, and to give up any feature that does not fit.
+
+### The boundary it follows
+
+Replies in Google's AI Developers Forum describe when a third-party client may run `agy acp` with a subscription sign-in ([2 November](https://discuss.ai.google.dev/t/conflicting-guidance-on-using-t3-code-with-personal-google-ai-subscriptions/197131/3), [19 November](https://discuss.ai.google.dev/t/a-question-regarding-the-usage-limitations-of-antigravity-acp/202556/2) and [20 November 2026](https://discuss.ai.google.dev/t/tos-clarification-is-opencode-antigravity-acp-official-agy-acp-in-opencode-permitted-under-the-antigravity-terms-of-service/202970/2)). The reply of 20 November:
+
+> Launching unmodified `agy acp` interactively is permitted only in a thin client where Antigravity is the agent—meaning the human sends raw prompts directly to `agy acp` and Antigravity owns its sign-in, system prompt, tools, and session history. Wrapping `agy acp` inside an outer third-party coding agent harness (such as OpenCode) that injects system instructions, serialized tool definitions, replayed cross-model context, or automated loops is not permitted on `oauth-personal`—even without extracting OAuth tokens—and risks automated enforcement or suspension.
+
+### How the package keeps to it
+
+| Condition | What the package does |
+| --- | --- |
+| Unmodified `agy acp` with Antigravity's own sign-in | Starts the installed `agy acp`. Sign-in runs in `agy` itself (`/agy login` starts `agy acp --login`); the package never reads, stores or forwards OAuth tokens. |
+| Antigravity owns the system prompt | Sends no system prompt, no workspace context, no `AGENTS.md` and no skills from Pi. A prompt is the text (and images) you typed. |
+| Antigravity owns the tools | The `agy-tools` mode is pinned: Antigravity works with its own tools, and Pi shows the calls and asks you for approvals. Pi's tools and MCP servers are never passed to it; Antigravity loads its own MCP servers. There is no `/agy mode` or `/agy bridge`, and the matching settings are ignored. |
+| Antigravity owns the session history | Never replays earlier conversation, compaction summaries or another model's history, and never writes Antigravity's conversation databases. After a model switch, compaction or branch navigation, start a new Pi session. |
+| The human sends the prompts; no automated loops | Only prompts typed in the interactive Pi session reach Antigravity, each one once. Refused before any session work: Pi's automatic retries, `/goal` continuations and the context pi-goal adds, messages from extensions (`pi.sendMessage`, `pi.sendUserMessage`), RPC input, `!` shell output, compaction summaries, titles, recaps, subagents, workflows and `pi -p`. The package never makes up a prompt of its own, such as "Continue.". An empty quota fails as `Antigravity quota exceeded (429)`, which Pi does not retry. |
+
+Turns that Antigravity takes on its own (after a background task, a timer or a subagent) are Antigravity's own feature. The package only shows them; the display reads Antigravity's local files and sends nothing.
+
+The rules live in `src/thin-client-policy.ts` and `src/human-prompt-gate.ts`. `test/thin-client-policy.test.ts`, `test/human-prompt-gate.test.ts` and the thin-client cases in `test/turn-coordinator-e2e.test.ts` check them in CI on every change.
+
+### What it cannot promise
+
+- **The boundary is not in Google's terms or docs.** Section 6 of the [Antigravity Terms](https://antigravity.google/terms) says: "Using third party software, tools, or services to access the Service (e.g. using OpenClaw with Antigravity OAuth) is a breach of this Agreement." The [FAQ](https://antigravity.google/docs/faq#why-cant-i-use-third-party-software-such-as-claude-code-openclaw-or-opencode-with-my-antigravity-login) calls third-party software with the Antigravity login a violation and recommends an API key for third-party coding agents. The [ACP docs](https://antigravity.google/docs/ide/extensions/acp) say: "Any ACP client can launch Antigravity CLI." The forum replies above are the most specific description there is, but their author is not marked as Google staff, and a [question of 23 November 2026](https://discuss.ai.google.dev/t/tos-clarification-is-opencode-antigravity-acp-official-agy-acp-in-opencode-permitted-under-the-antigravity-terms-of-service/202970/5) about where the boundary is written down has no answer yet.
+- **Google decides.** Google can read its terms differently or change them, and may suspend Antigravity and Gemini CLI access for a breach.
+- **The package cannot tell a person from a program.** A program that types into the terminal looks like you. Never drive an Antigravity session with tmux scripts, orchestrators, watchdogs or other agents.
+- **Without this risk:** use Antigravity itself or an ACP client Google names, such as Zed, JetBrains IDEs, Android Studio or Xcode. For agent harnesses, Google points to a Gemini API key or Google Cloud sign-in ([ACP authentication](https://antigravity.google/docs/ide/extensions/acp#authentication)).
+
+If Google publishes a different boundary, the package will follow it. Please open an issue with the source.
 
 ## Requirements
 
@@ -30,19 +63,6 @@ Do not install it together with `pi-antigravity-bridge`. Both register the same 
 `/agy status` shows the backend state; `/agy login` and `/agy logout` manage the Antigravity sign-in. `/agy agent-mode` switches Antigravity's own execution mode (`default`, `accept-edits`, `plan`).
 
 There is no way to use anything but Antigravity's own tools: upstream's `/agy mode` and `/agy bridge` do not exist here, and its tool-mode and bridge settings (`toolMode`, `bridgePiMcp`, `bridgePiSkills`, `bridgePiAgentsMd` in `antigravity.json`, `PI_AGY_TOOL_MODE`, `PI_AGY_BRIDGE_*`) are ignored.
-
-## What the thin client refuses
-
-The rules live in `src/thin-client-policy.ts` and `src/human-prompt-gate.ts`. A refusal stops the request before any session work, so the Antigravity session stays usable.
-
-- **Prompts you did not type.** Only prompts typed in the interactive Pi session reach Antigravity, each one once. Refused: Pi's automatic retries, `/goal` continuations and the context pi-goal adds, messages from extensions (`pi.sendMessage`, `pi.sendUserMessage`), RPC input and `!` shell output. The package never makes up a prompt of its own, such as "Continue.".
-- **Replayed history.** Earlier conversation, compaction summaries and the history of another model are never sent to Antigravity. After a model switch, compaction or branch navigation, start a new Pi session.
-- **Auxiliary and headless requests.** Compaction summaries, titles, recaps, subagents, workflows and `pi -p` are refused.
-- **Pi's own resources.** Pi's MCP servers, skills and `AGENTS.md` are never passed to Antigravity, and the package never writes Antigravity's conversation databases. The `agy-tools` mode is pinned; Antigravity loads its own MCP servers, skills and rules.
-
-An empty quota fails as `Antigravity quota exceeded (429)`, which Pi does not retry.
-
-The package cannot tell a person from a program that types into the terminal. Never drive an Antigravity session with tmux scripts, orchestrators, watchdogs or other agents.
 
 ## What it shows
 

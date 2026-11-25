@@ -7,6 +7,7 @@ import { normalizeContext, type Model, type UserMessage } from "@earendil-works/
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { AcpProcessManager } from "../src/acp/process-manager.ts";
 import { DEFAULT_BRIDGE_CONFIG, loadBridgeConfig, resolveEffectiveFlags } from "../src/config.ts";
+import { filterToolsForHostMcpBridge } from "../src/mcp/pi-mcp-forwarder.ts";
 import { buildFreshReplayPlan } from "../src/session/reconcile.ts";
 import { TurnCoordinator } from "../src/session/turn-coordinator.ts";
 import { AgyTurnMirrorBroker, createAgyMirrorToolDefinitions } from "../src/tools/agy-mirror-tools.ts";
@@ -126,6 +127,27 @@ async function runTurn(params: {
 }
 
 describe("thin-client policy", () => {
+	it("passes none of Pi's tools or MCP tools to Antigravity, even with every bridge switched on", () => {
+		const mirror = createAgyMirrorToolDefinitions(new AgyTurnMirrorBroker()).map((t) => ({
+			name: t.name,
+			description: t.description,
+			parameters: t.parameters,
+		}));
+		const parameters = mirror[0].parameters;
+		const declared = [
+			...mirror,
+			{ name: "read", description: "Pi read", parameters },
+			{ name: "codemode", description: "Pi codemode", parameters },
+			{ name: "mcp__github__search_code", description: "Pi MCP tool", parameters },
+		];
+		for (const toolMode of ["pi-tools", "agy-tools", "hybrid"] as const) {
+			for (const piMcpBridgeStrategy of ["via-host", "direct-config"] as const) {
+				const config = { ...DEFAULT_BRIDGE_CONFIG, toolMode, piMcpBridgeStrategy, bridgePiMcp: true, bridgePiSkills: true, bridgePiAgentsMd: true };
+				assert.deepEqual(filterToolsForHostMcpBridge(declared, config), [], `${toolMode} / ${piMcpBridgeStrategy}`);
+			}
+		}
+	});
+
 	it("pins agy-tools without Pi bridges or SQLite writes, whatever the config says", () => {
 		withTempAgentDir((dir) => {
 			fs.writeFileSync(

@@ -1730,6 +1730,41 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 		}
 	});
 
+	it("thin client: sends agy exactly the typed text, without Pi's system prompt, rules or tools", async () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-wire-"));
+		const cfg: BridgeConfig = {
+			...DEFAULT_BRIDGE_CONFIG,
+			agyBin: writeMockAgyExecutable(tmpRoot),
+			geminiDir: path.join(tmpRoot, ".gemini"),
+		};
+		const broker = new AgyTurnMirrorBroker();
+		const coord = new TurnCoordinator(createStubPiApi(), new AcpProcessManager(), broker, cfg);
+		coord.setActiveContext(interactiveContext(tmpRoot));
+		const mirror = createAgyMirrorToolDefinitions(broker).map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
+		const tools = [...mirror, { name: "mcp__github__search_code", description: "PI_TOOL_MARKER", parameters: mirror[0].parameters }];
+		const sent: unknown[] = [];
+		try {
+			const typed: UserMessage = { role: "user", content: "FOLLOWUP_MSG:hello agy", timestamp: 1 };
+			typedByHuman(coord.humanPromptGate, typed);
+			const result = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({ systemPrompt: "PI_SYSTEM_PROMPT_MARKER\nAGENTS.md: PI_RULES_MARKER", messages: [typed], tools }),
+					{ sessionId: "pi-sess-wire", onPayload: (payload) => { sent.push(payload); return undefined; } },
+				)
+				.result();
+			assert.equal(result.stopReason, "stop");
+			assert.equal(sent.length, 1);
+			const payload = sent[0];
+			assert.ok(payload && typeof payload === "object" && "prompt" in payload);
+			assert.deepEqual(payload.prompt, [{ type: "text", text: "FOLLOWUP_MSG:hello agy" }]);
+			assert.doesNotMatch(JSON.stringify(payload), /PI_SYSTEM_PROMPT_MARKER|PI_RULES_MARKER|PI_TOOL_MARKER|workspace_context/);
+		} finally {
+			await coord.dispose();
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
 	it("thin client: sends a typed prompt once and refuses Pi's automatic retry and automated prompts", async () => {
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-gate-"));
 		const binPath = writeMockAgyExecutable(tmpRoot);
