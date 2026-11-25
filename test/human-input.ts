@@ -1,5 +1,5 @@
 import type { UserMessage } from "@earendil-works/pi-ai";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import type { HumanPromptGate } from "../src/human-prompt-gate.ts";
 
 function textOf(message: UserMessage): string {
@@ -26,6 +26,19 @@ function isStubContext(value: object): value is ExtensionContext {
 export function interactiveContext(cwd: string): ExtensionContext {
 	const stub = { hasUI: true, cwd, ui: { setStatus() {} } };
 	if (!isStubContext(stub)) {
+		throw new Error("stub context lacks hasUI/cwd");
+	}
+	return stub;
+}
+
+function isStubToolContext(value: object): value is ExtensionToolContext {
+	return "hasUI" in value && "cwd" in value;
+}
+
+/** Same stub for mirror tool `execute()`, which takes a tool context. */
+export function interactiveToolContext(cwd: string): ExtensionToolContext {
+	const stub = { hasUI: true, cwd, ui: { setStatus() {} } };
+	if (!isStubToolContext(stub)) {
 		throw new Error("stub context lacks hasUI/cwd");
 	}
 	return stub;

@@ -330,6 +330,12 @@ interface ManagedSessionLedger {
 	activePump?: ActiveTurnPump;
 	/** 当前会话在后端仍在途的 `session/prompt` RPC Promise（严禁在它结算前重叠发送下一条 `session/prompt`） */
 	inFlightPrompt?: Promise<void>;
+	/**
+	 * Messages typed while agy works (Pi steering), sent as the next prompt once the
+	 * running agy turn ends. Cancelling the turn instead would also stop agy's
+	 * background tasks and subagents.
+	 */
+	deferredSteerBlocks?: AcpPromptBlock[];
 }
 
 const DEFAULT_SESSION_KEY = "__default_pi_session__";
@@ -439,6 +445,26 @@ export class TurnCoordinator {
 			windowSize: ledger?.windowSize,
 			backendCompactedRecently: ledger?.backendCompactedRecently,
 		};
+	}
+
+	private notifySteerDeferred(): void {
+		const ctx = this.activeContext;
+		if (ctx?.hasUI) {
+			ctx.ui.notify(
+				"Antigravity arbeitet noch. Deine Nachricht geht raus, sobald der laufende Schritt fertig ist (ohne Abbruch).",
+				"info",
+			);
+		}
+	}
+
+	/** A cancelled or failed turn never sends the waiting messages; say so. */
+	private dropDeferredSteer(ledger: ManagedSessionLedger): void {
+		if (!ledger.deferredSteerBlocks || ledger.deferredSteerBlocks.length === 0) return;
+		ledger.deferredSteerBlocks = undefined;
+		const ctx = this.activeContext;
+		if (ctx?.hasUI) {
+			ctx.ui.notify("Antigravity: deine Zwischennachricht wurde nicht gesendet, weil der Schritt abgebrochen wurde.", "warning");
+		}
 	}
 
 	/** Whether the agy process serving this conversation is still running. */
@@ -583,6 +609,7 @@ export class TurnCoordinator {
 	}
 
 	private abortLedgerTurnNonBlocking(ledger: ManagedSessionLedger): void {
+		this.dropDeferredSteer(ledger);
 		this.httpMcpBridge.markSessionTurnCancelled(ledger.agySessionId);
 		this.mirrorBroker.abortSessionCalls(ledger.agySessionId, "Aborted");
 		for (const [, parked] of ledger.parkedCalls) {
@@ -978,7 +1005,17 @@ export class TurnCoordinator {
 			// 立即在当前工具边界无损收口后台循环并以真实用户身份切入同一会话；否则无缝续接后台同一活跃 ACP Turn 队列。
 			if (existing.activePump) {
 				const { trailingUsers } = this.collectRecentToolResultsAndSteeringUsers(visibleMessages);
-				if (trailingUsers.length > 0) {
+				if (trailingUsers.length > 0 && existing.toolMode === "agy-tools") {
+					// Thin client: agy owns the running turn. Cancelling it to cut in would
+					// also stop its background tasks and subagents, so the typed message
+					// waits and goes out as the next prompt when this agy turn ends.
+					existing.deferredSteerBlocks = [
+						...(existing.deferredSteerBlocks ?? []),
+						...convertUserMessagesToPromptBlocks(trailingUsers),
+					];
+					this.notifySteerDeferred();
+				}
+				if (trailingUsers.length > 0 && existing.toolMode !== "agy-tools") {
 					this.abortLedgerTurnNonBlocking(existing);
 					const idleOk = await this.waitForInFlightPrompt(existing, 2_500, options?.signal);
 					if (!idleOk) {
@@ -3037,6 +3074,7 @@ export class TurnCoordinator {
 				}
 
 				if (item.response.stopReason === "cancelled" && signal?.aborted) {
+					this.dropDeferredSteer(ledger);
 					ledger.activePump = undefined;
 					writer.fail("aborted", "Request aborted");
 					return;
@@ -3045,6 +3083,7 @@ export class TurnCoordinator {
 					await this.emitUpstreamTelemetryForStep(ledger, pump, model, options, {
 						status: 400,
 					});
+					this.dropDeferredSteer(ledger);
 					ledger.activePump = undefined;
 					writer.fail("error", "Model refused the request");
 					return;
@@ -3064,6 +3103,21 @@ export class TurnCoordinator {
 					this.startTrackedSessionPrompt(ledger, pump, {
 						sessionId: ledger.agySessionId,
 						prompt: [{ type: "text", text: "Continue from where you left off." }],
+					});
+					continue;
+				}
+
+				// Messages typed during the agy turn go out now, as the next prompt, and
+				// agy's answer continues this Pi step.
+				const deferredSteer = ledger.deferredSteerBlocks;
+				if (deferredSteer && deferredSteer.length > 0 && !signal?.aborted) {
+					ledger.deferredSteerBlocks = undefined;
+					if (writer.message.content.some((b) => b.type === "text" && b.text.trim().length > 0)) {
+						writer.appendTextDelta("\n\n");
+					}
+					this.startTrackedSessionPrompt(ledger, pump, {
+						sessionId: ledger.agySessionId,
+						prompt: deferredSteer,
 					});
 					continue;
 				}
@@ -3108,6 +3162,7 @@ export class TurnCoordinator {
 					});
 				}
 				this.mirrorBroker.abortSessionCalls(ledger.agySessionId, "ACP prompt error");
+				this.dropDeferredSteer(ledger);
 				ledger.activePump = undefined;
 				writer.fail(signal?.aborted ? "aborted" : "error", errMsg);
 				return;

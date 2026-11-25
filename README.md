@@ -24,6 +24,10 @@
 > context) for every turn agy took by itself. Tool cards say when a command went to the
 > background or a timer was set. This only reads local files; nothing is sent to agy.
 > `PI_AGY_TRACE=1` (or a file path) logs every `session/update` agy sends to a local JSONL file.
+>
+> Steering: a message typed while agy works no longer cancels the agy turn (cancelling stops
+> agy's background tasks and subagents). It waits and goes out as the next prompt when the
+> running agy turn ends; agy's answer continues the same Pi step. Esc still cancels.
 
 将 Google Antigravity CLI（`agy`）作为原生模型与 Agent 后端接入 [Pi](https://github.com/earendil-works/pi)（`@earendil-works/pi-coding-agent`），在完整的 Pi TUI 交互界面中直接使用 Antigravity 提供的模型、思考档位与工具生态。
 

@@ -21,7 +21,7 @@ import {
 	AgyTurnMirrorBroker,
 	createAgyMirrorToolDefinitions,
 } from "../src/tools/agy-mirror-tools.ts";
-import { interactiveContext, typedByHuman } from "./human-input.ts";
+import { interactiveContext, interactiveToolContext, typedByHuman } from "./human-input.ts";
 import { THIN_CLIENT_DISABLED } from "./thin-client-skip.ts";
 
 /**
@@ -69,6 +69,10 @@ const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", async (line) => {
   if (!line.trim()) return;
   const msg = JSON.parse(line);
+  if (msg.method) {
+    const lastText = msg.params?.prompt?.[msg.params.prompt.length - 1]?.text;
+    fs.appendFileSync(path.join(mockRootDir, "mock-calls.log"), JSON.stringify({ method: msg.method, text: lastText }) + "\\n");
+  }
 
   if (msg.id !== undefined && !msg.method && serverPending.has(msg.id)) {
     const fn = serverPending.get(msg.id);
@@ -250,6 +254,16 @@ rl.on("line", async (line) => {
 
     if (lastBlockText === "AUX_STOP_CANCELLED") {
       send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "cancelled" } });
+      return;
+    }
+
+    if (lastBlockText === "STEER_REPLY") {
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Steer handled." } } }
+      });
+      send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
       return;
     }
 
@@ -1479,6 +1493,80 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 			assert.match(auto.errorMessage ?? "", /refusing a message you did not type/);
 			assert.equal(isRetryableAssistantError(auto), false);
 			assert.equal(sentPrompts.length, 1, "an automated prompt must not reach agy");
+		} finally {
+			await coord.dispose();
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("thin client: a message typed during an agy turn waits for the turn instead of cancelling it", async () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-steer-a-"));
+		const binPath = writeMockAgyExecutable(tmpRoot);
+		const cfg: BridgeConfig = {
+			...DEFAULT_BRIDGE_CONFIG,
+			toolMode: "agy-tools",
+			agyBin: binPath,
+			geminiDir: path.join(tmpRoot, ".gemini"),
+		};
+		const pm = new AcpProcessManager();
+		const broker = new AgyTurnMirrorBroker();
+		const coord = new TurnCoordinator(createStubPiApi(), pm, broker, cfg);
+		const notes: string[] = [];
+		const ctx = interactiveToolContext(tmpRoot);
+		ctx.ui.select = async (_title: string, options: string[]) => options[0];
+		ctx.ui.notify = (message: string) => {
+			notes.push(message);
+		};
+		coord.setActiveContext(ctx);
+		const mirrorTools = createAgyMirrorToolDefinitions(broker);
+		const tools = mirrorTools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
+
+		try {
+			const first: UserMessage = { role: "user", content: "Update src/app.ts", timestamp: 1 };
+			typedByHuman(coord.humanPromptGate, first);
+			const msg1 = await coord.streamSimple(TEST_MODEL, normalizeContext({ messages: [first], tools }), { sessionId: "pi-sess-steer-a" }).result();
+			assert.equal(msg1.stopReason, "toolUse");
+			const call = msg1.content.find((c): c is ToolCall => c.type === "toolCall");
+			assert.ok(call);
+			const editTool = mirrorTools.find((t) => t.name === "agy_edit");
+			assert.ok(editTool);
+			const toolResult = await editTool.execute(call.id, call.arguments, undefined, undefined, ctx);
+
+			// Pi delivers the steering message after the tool result.
+			const steer: UserMessage = { role: "user", content: "STEER_REPLY", timestamp: 3 };
+			typedByHuman(coord.humanPromptGate, steer);
+			const msg2 = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({
+						messages: [
+							first,
+							msg1,
+							{ role: "toolResult", toolCallId: call.id, toolName: "agy_edit", content: toolResult.content, isError: false, timestamp: 2 },
+							steer,
+						],
+						tools,
+					}),
+					{ sessionId: "pi-sess-steer-a" },
+				)
+				.result();
+
+			assert.equal(msg2.stopReason, "stop");
+			const text = msg2.content.filter((c) => c.type === "text").map((c) => c.text).join("");
+			assert.equal(text, "Native edit done!\n\nSteer handled.");
+			const calls = fs
+				.readFileSync(path.join(tmpRoot, "mock-calls.log"), "utf8")
+				.trim()
+				.split("\n")
+				.map((line): unknown => JSON.parse(line));
+			const methods = calls.map((c) => (c && typeof c === "object" && "method" in c ? c.method : undefined));
+			assert.equal(methods.includes("session/cancel"), false, "steering must not cancel agy's turn");
+			const prompts = calls.filter((c) => c && typeof c === "object" && "method" in c && c.method === "session/prompt");
+			assert.deepEqual(
+				prompts.map((c) => (c && typeof c === "object" && "text" in c ? c.text : undefined)),
+				["Update src/app.ts", "STEER_REPLY"],
+			);
+			assert.equal(notes.length, 1);
 		} finally {
 			await coord.dispose();
 			fs.rmSync(tmpRoot, { recursive: true, force: true });
