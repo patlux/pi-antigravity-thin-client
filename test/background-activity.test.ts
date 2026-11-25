@@ -14,13 +14,16 @@ import {
 	parseSubagentRecord,
 	parseTaskMessage,
 	parseTranscriptLine,
+	splitAgyModel,
 	type TranscriptStep,
 } from "../src/background/agy-activity.ts";
 import { AgyTurnMirrorBroker, classifyAgyToolCall } from "../src/tools/agy-mirror-tools.ts";
 import {
 	describeTrigger,
 	LIVE_STALE_MS,
+	formatAgyModel,
 	senderRole,
+	setAgyModelNames,
 	subagentStartNote,
 	renderActivityLines,
 	renderAutonomousEntry,
@@ -351,7 +354,10 @@ describe("agy subagents", () => {
 
 		assert.equal(deriveSubagentStatus(record, steps(subagentLines().slice(0, 3)), parent).activity, "→ write_file /tmp/agy-test/hallo.txt");
 		assert.equal(deriveSubagentStatus(record, steps(subagentLines().slice(0, 6)), parent).activity, "denkt nach …");
-		assert.equal(deriveSubagentStatus(record, [], parent).activity, "startet …");
+		const starting = deriveSubagentStatus(record, [], parent);
+		assert.equal(starting.activity, "startet …");
+		// A `self` subagent runs on the parent's model and reasoning level until it answers.
+		assert.deepEqual([starting.model, starting.modelFromParent], ["gemini-4-neon-high", true]);
 
 		const done = deriveSubagentStatus(record, steps(subagentLines()), parent);
 		assert.equal(done.state, "idle");
@@ -389,7 +395,8 @@ describe("agy subagents", () => {
 		const record = parseSubagentRecord(SUB_RECORD);
 		assert.ok(record);
 		const started = deriveSubagentStatus(record, steps(subagentLines().slice(0, 2)), steps(parentSpawnLines()));
-		assert.match(subagentStartNote(args, started), /^🤖 Subagent „File Creator Subagent“ gestartet · 0db6b1dc · gemini-4-neon-high\n/);
+		assert.match(subagentStartNote(args, started), /^🤖 Subagent „File Creator Subagent“ gestartet · 0db6b1dc · Gemini 4 Neon · Reasoning high\n/);
+		assert.match(subagentStartNote({ agentRole: "x", model: "flash" }, undefined), /^🤖 Subagent „x“ gestartet · flash \(angefordert\)\n/);
 		assert.match(subagentStartNote({ agentRole: "a, b", agentCount: 2 }, undefined), /^🤖 2 Subagenten \(a, b\) gestartet\n/);
 	});
 
@@ -425,7 +432,7 @@ describe("agy subagents", () => {
 			const lines = renderActivityLines(snapshot, Date.parse("2026-11-25T14:46:30Z"), 0, plainTheme);
 			assert.deepEqual(lines, [
 				"Antigravity · 1 Subagent",
-				" ⠋ 0db6b1dc  File Creator Subagent  0:02  gemini-4-neon-high  → write_file /tmp/agy-test/hallo.txt",
+				" ⠋ 0db6b1dc  File Creator Subagent  0:02  Gemini 4 Neon · Reasoning high  → write_file /tmp/agy-test/hallo.txt",
 			]);
 
 			fs.appendFileSync(path.join(childDir, "logs", "transcript.jsonl"), subagentLines().slice(2).map((l) => `${l}\n`).join(""));
@@ -434,7 +441,7 @@ describe("agy subagents", () => {
 			assert.equal(idle?.state, "idle");
 			assert.match(
 				renderActivityLines({ ...snapshot, subagents: idle ? [idle] : [] }, Date.parse("2026-11-25T14:46:43Z"), 0, plainTheme)[1],
-				/✓ 0db6b1dc {2}File Creator Subagent {2}0:13 {2}gemini-4-neon-high {2}fertig: Die Datei wurde angelegt/,
+				/✓ 0db6b1dc {2}File Creator Subagent {2}0:13 {2}Gemini 4 Neon · Reasoning high {2}fertig: Die Datei wurde angelegt/,
 			);
 		} finally {
 			fs.rmSync(brain, { recursive: true, force: true });
@@ -477,14 +484,28 @@ describe("background activity display", () => {
 		assert.deepEqual(renderActivityLines({ ...base, live: { ...live, lastAtMs: now - LIVE_STALE_MS - 1 } }, now, 1, plainTheme), []);
 	});
 
+	it("names model and reasoning level", () => {
+		assert.deepEqual(splitAgyModel("gemini-4-neon-xhigh"), { baseId: "gemini-4-neon", reasoning: "xhigh" });
+		assert.deepEqual(splitAgyModel("gemini-3.8-flash-low"), { baseId: "gemini-3.8-flash", reasoning: "low" });
+		assert.deepEqual(splitAgyModel("gemini-pro-orchestrator"), { baseId: "gemini-pro-orchestrator" });
+		assert.equal(formatAgyModel("gemini-3.8-flash-low"), "Gemini 3.8 Flash · Reasoning low");
+		setAgyModelNames((baseId) => (baseId === "gemini-pro-orchestrator-neon" ? "Orchestrator (Neon)" : undefined));
+		try {
+			assert.equal(formatAgyModel("gemini-pro-orchestrator-neon"), "Orchestrator (Neon)");
+		} finally {
+			setAgyModelNames(() => undefined);
+		}
+		assert.equal(formatAgyModel(undefined), undefined);
+	});
+
 	it("renders an autonomous card with trigger, answer and collapsed tool calls", () => {
 		const messages = Object.values(messageFiles())
 			.map(parseTaskMessage)
 			.filter((message) => message !== undefined);
 		const turn = deriveAgyActivity(steps(transcriptLines()), messages).turns[1];
-		const data = toAutonomousEntryData(CONV, { ...turn, actions: [{ name: "run_command", summary: "echo hi" }] });
-		const collapsed = renderAutonomousEntry(data, false, plainTheme, (text) => new Text(text, 0, 0)).render(80).join("\n");
-		assert.match(collapsed, /Antigravity · selbstständig/);
+		const data = toAutonomousEntryData(CONV, { ...turn, model: "gemini-4-neon-xhigh", actions: [{ name: "run_command", summary: "echo hi" }] });
+		const collapsed = renderAutonomousEntry(data, false, plainTheme, (text) => new Text(text, 0, 0)).render(120).join("\n");
+		assert.match(collapsed, /Antigravity · selbstständig · \d\d:\d\d:\d\d · Gemini 4 Neon · Reasoning xhigh/);
 		assert.match(collapsed, /✓ task-2 · Background sleep task finished \(Exit 0\)/);
 		assert.match(collapsed, /Ausgabe: fertig/);
 		assert.match(collapsed, /1 Tool-Aufruf/);

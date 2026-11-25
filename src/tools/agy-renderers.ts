@@ -12,6 +12,7 @@ import {
 	type ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
 import { type Component, Text } from "@earendil-works/pi-tui";
+import { formatAgyModel } from "../ui/background-activity.ts";
 
 export const AGY_MIRROR_TOOL_NAMES = [
 	"agy_read",
@@ -159,7 +160,8 @@ export function getMirrorToolRenderers(toolName: AgyMirrorToolName): ToolRendere
 					const count =
 						typeof args?.agentCount === "number" && args.agentCount > 1 ? `${args.agentCount}× ` : "";
 					const model =
-						(typeof args?.model === "string" && args.model) ||
+						(typeof args?.model === "string" && `${args.model} (angefordert)`) ||
+						(typeof args?.parentModel === "string" && formatAgyModel(args.parentModel)) ||
 						(args?.agentType === "self" ? "Modell wie Hauptagent" : typeof args?.agentType === "string" ? args.agentType : "");
 					return new Text(
 						`${theme.fg("toolTitle", theme.bold("subagent"))} ${count}${theme.fg("accent", role)}${model ? theme.fg("muted", ` · ${model}`) : ""}${duration}`,

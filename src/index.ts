@@ -42,6 +42,7 @@ import {
 	AUTONOMOUS_ENTRY_TYPE,
 	isAutonomousEntryData,
 	renderAutonomousEntry,
+	setAgyModelNames,
 } from "./ui/background-activity.ts";
 import { updateAntigravityStatusBar } from "./ui/status-bar.ts";
 
@@ -107,6 +108,8 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 		coordinator.setLatestTier(cachedCatalog.tier);
 	}
 	let currentModels: ChatModelConfig[] = cachedCatalog?.models ?? getSeedModels();
+	// Display names for models agy reports in its transcripts (subagents, own turns).
+	setAgyModelNames((baseId) => currentModels.find((model) => model.id === baseId)?.name);
 
 	const buildProviderConfig = (models: ChatModelConfig[]): ProviderConfig => ({
 		name: "Google Antigravity (ACP)",

@@ -87,6 +87,8 @@ export interface AutonomousAction {
 export interface AutonomousTurn {
 	/** Transcript step of the message that woke agy up. */
 	startStep: number;
+	/** Model agy answered with in this turn, e.g. `gemini-4-neon-high`. */
+	model?: string;
 	endStep?: number;
 	startedAtMs?: number;
 	endedAtMs?: number;
@@ -415,6 +417,7 @@ export function deriveAgyActivity(
 		if (step.type !== "PLANNER_RESPONSE") continue;
 		const text = step.content.trim();
 		if (current) {
+			if (step.model) current.model = step.model;
 			if (text) current.texts.push(text);
 			current.actions.push(...step.toolCalls.map(summarizeAction));
 		}
@@ -444,6 +447,14 @@ export function lastLogLine(logText: string): string | undefined {
 		})
 		.filter((line) => line.length > 0);
 	return lines.at(-1);
+}
+
+const REASONING_SUFFIX = /^(.+)-(minimal|low|medium|high|xhigh|max)$/;
+
+/** `gemini-4-neon-high` → base model `gemini-4-neon`, reasoning level `high`. */
+export function splitAgyModel(id: string): { baseId: string; reasoning?: string } {
+	const match = REASONING_SUFFIX.exec(id.trim());
+	return match ? { baseId: match[1], reasoning: match[2] } : { baseId: id.trim() };
 }
 
 /** One entry of `<parent>/.system_generated/subagents/<id>.json`. */
@@ -481,8 +492,13 @@ export interface SubagentStatus {
 	conversationId: string;
 	role?: string;
 	typeName?: string;
-	/** Model the subagent actually runs on, from its own transcript. */
+	/**
+	 * Model and reasoning level it runs on (`gemini-4-neon-high`): from its own
+	 * transcript, before its first answer from the parent when it runs as `self`.
+	 */
 	model?: string;
+	/** True while `model` is the parent's (a `self` subagent before its first answer). */
+	modelFromParent?: boolean;
 	/** Model the parent asked for (`invoke_subagent` `Model`), if any. */
 	requestedModel?: string;
 	/** Task the parent gave it (`invoke_subagent` `Prompt`). */
@@ -548,11 +564,20 @@ export function deriveSubagentStatus(
 	}
 
 	const spawn = spawnArguments(record, parentSteps);
+	const typeName = record.typeName ?? spawn?.TypeName;
+	const ownModel = [...planners].reverse().find((step) => step.model)?.model;
+	const parentModel =
+		!ownModel && typeName === "self" && !spawn?.Model
+			? [...parentSteps]
+					.filter((step) => step.type === "PLANNER_RESPONSE" && step.model)
+					.sort((a, b) => b.index - a.index)[0]?.model
+			: undefined;
 	return {
 		conversationId: record.conversationId,
 		role: record.role ?? spawn?.Role,
-		typeName: record.typeName ?? spawn?.TypeName,
-		model: [...planners].reverse().find((step) => step.model)?.model,
+		typeName,
+		model: ownModel ?? parentModel,
+		...(parentModel ? { modelFromParent: true } : {}),
 		requestedModel: spawn?.Model,
 		prompt: spawn?.Prompt,
 		state,

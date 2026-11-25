@@ -20,7 +20,7 @@ First release under the new name, as a thin client for consumer Antigravity acco
 
 ### Background activity
 
-- A widget above the editor shows Antigravity's background tasks and timers, the turns it takes on its own, and its subagents with their model and current activity.
+- A widget above the editor shows Antigravity's background tasks and timers, the turns it takes on its own, and its subagents with their model, reasoning level and current activity.
 - A session card shows each turn Antigravity took on its own; it is never sent to a model.
 - Tool cards say when a command went to the background, when a timer was set and which subagent was started.
 - `PI_AGY_TRACE` logs every `session/update` from Antigravity to a local JSONL file.

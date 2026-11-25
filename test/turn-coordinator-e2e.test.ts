@@ -308,6 +308,19 @@ rl.on("line", async (line) => {
       return;
     }
 
+    if (lastBlockText === "SPAWN_SELF_SUBAGENT") {
+      sess.inFlightPromptId = msg.id;
+      const rawInput = { Prompt: "Lege die Datei an.", Role: "File Creator Subagent", TypeName: "self" };
+      send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "tool_call", toolCallId: "spawn_1", name: "invoke_subagent", title: "Run invoke_subagent", kind: "other", status: "in_progress", rawInput } } });
+      setTimeout(() => {
+        send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "tool_call_update", toolCallId: "spawn_1", status: "completed", kind: "other", title: "Run invoke_subagent", rawInput } } });
+        send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Subagent gestartet." } } } });
+        sess.inFlightPromptId = undefined;
+        send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+      }, 20);
+      return;
+    }
+
     if (lastBlockText === "STEER_REPLY") {
       send({
         jsonrpc: "2.0",
@@ -1847,6 +1860,40 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 				["Update src/app.ts", "STEER_REPLY"],
 			);
 			assert.equal(notes.length, 1);
+		} finally {
+			await coord.dispose();
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("names the parent's model and reasoning level on a self subagent's tool card", async () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-spawn-"));
+		const binPath = writeMockAgyExecutable(tmpRoot);
+		const cfg: BridgeConfig = {
+			...DEFAULT_BRIDGE_CONFIG,
+			toolMode: "agy-tools",
+			agyBin: binPath,
+			geminiDir: path.join(tmpRoot, ".gemini"),
+		};
+		const pm = new AcpProcessManager();
+		const broker = new AgyTurnMirrorBroker();
+		const coord = new TurnCoordinator(createStubPiApi(), pm, broker, cfg);
+		coord.setActiveContext(interactiveContext(tmpRoot));
+		const tools = createAgyMirrorToolDefinitions(broker).map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
+		try {
+			const prompt: UserMessage = { role: "user", content: "SPAWN_SELF_SUBAGENT", timestamp: 1 };
+			typedByHuman(coord.humanPromptGate, prompt);
+			const msg = await coord
+				.streamSimple(TEST_MODEL, normalizeContext({ messages: [prompt], tools }), { sessionId: "pi-sess-spawn", reasoning: "high" })
+				.result();
+			assert.equal(msg.stopReason, "toolUse");
+			const call = msg.content.find((c): c is ToolCall => c.type === "toolCall");
+			assert.ok(call);
+			assert.equal(call.name, "agy_subagent");
+			assert.equal(call.arguments.agentRole, "File Creator Subagent");
+			assert.equal(call.arguments.agentType, "self");
+			assert.equal(typeof call.arguments.parentModel, "string");
+			assert.match(String(call.arguments.parentModel), /^gemini-4-neon(-[a-z]+)?$/);
 		} finally {
 			await coord.dispose();
 			fs.rmSync(tmpRoot, { recursive: true, force: true });

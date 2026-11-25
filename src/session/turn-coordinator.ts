@@ -3,6 +3,7 @@ import {
 	getCurrentSystemPrompt,
 	getCurrentTools,
 	type Api,
+	type JsonObject,
 	type AssistantMessage,
 	type AssistantMessageEventStream,
 	type ImageContent,
@@ -451,6 +452,20 @@ export class TurnCoordinator {
 			windowSize: ledger?.windowSize,
 			backendCompactedRecently: ledger?.backendCompactedRecently,
 		};
+	}
+
+	/**
+	 * A subagent started as `self` without its own `Model` runs on the parent's
+	 * model and reasoning level; name them on its tool card.
+	 */
+	private withParentModel(ledger: ManagedSessionLedger, args: JsonObject): JsonObject {
+		if (args.tool !== "invoke_subagent" || args.model !== undefined || args.agentType !== "self") {
+			return args;
+		}
+		const modelId = ledger.lastSelectedModelId;
+		if (!modelId) return args;
+		const level = ledger.appliedThoughtLevel;
+		return { ...args, parentModel: level ? `${modelId}-${level}` : modelId };
 	}
 
 	/** Receives agy's updates that arrive while no Pi turn runs. */
@@ -3023,7 +3038,7 @@ export class TurnCoordinator {
 						{
 							id: update.toolCallId,
 							name: classified.mirrorToolName,
-							arguments: classified.arguments,
+							arguments: this.withParentModel(ledger, classified.arguments),
 						},
 						writer.hasEmittedAnyDelta ? 0 : 2,
 					);
@@ -3047,7 +3062,7 @@ export class TurnCoordinator {
 							writer.appendToolCall({
 								id: extra.update.toolCallId,
 								name: extraClassified.mirrorToolName,
-								arguments: extraClassified.arguments,
+								arguments: this.withParentModel(ledger, extraClassified.arguments),
 							});
 						} else {
 							break;

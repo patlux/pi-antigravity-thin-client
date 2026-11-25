@@ -1,14 +1,38 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, type Component, Spacer, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import type { ActivitySnapshot } from "../background/activity-watcher.ts";
-import type {
-	AutonomousAction,
-	AutonomousTrigger,
-	AutonomousTurn,
-	BackgroundTask,
-	SubagentStatus,
-	TriggerOutcome,
+import {
+	type AutonomousAction,
+	type AutonomousTrigger,
+	type AutonomousTurn,
+	type BackgroundTask,
+	type SubagentStatus,
+	splitAgyModel,
+	type TriggerOutcome,
 } from "../background/agy-activity.ts";
+
+let modelNames: (baseId: string) => string | undefined = () => undefined;
+
+/** Display names of agy models (from the bridge's model catalog). */
+export function setAgyModelNames(lookup: (baseId: string) => string | undefined): void {
+	modelNames = lookup;
+}
+
+function titleCase(id: string): string {
+	return id
+		.split("-")
+		.filter((part) => part.length > 0)
+		.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+		.join(" ");
+}
+
+/** `gemini-4-neon-high` → "Gemini 4 Neon · Reasoning high". */
+export function formatAgyModel(id: string | undefined): string | undefined {
+	if (!id?.trim()) return undefined;
+	const { baseId, reasoning } = splitAgyModel(id);
+	const name = modelNames(baseId) ?? titleCase(baseId);
+	return reasoning ? `${name} · Reasoning ${reasoning}` : name;
+}
 
 /** Session entry for a turn agy took on its own (TUI only, never in the model context). */
 export const AUTONOMOUS_ENTRY_TYPE = "antigravity-autonomous";
@@ -51,6 +75,8 @@ export interface ThemeLike {
 export interface AutonomousEntryData {
 	version: 1;
 	agySessionId: string;
+	/** Model and reasoning level agy answered with (`gemini-4-neon-high`). */
+	model?: string;
 	startStep: number;
 	endStep?: number;
 	startedAtMs?: number;
@@ -81,6 +107,7 @@ export function toAutonomousEntryData(agySessionId: string, turn: AutonomousTurn
 	return {
 		version: 1,
 		agySessionId,
+		...(turn.model ? { model: turn.model } : {}),
 		startStep: turn.startStep,
 		endStep: turn.endStep,
 		startedAtMs: turn.startedAtMs,
@@ -170,9 +197,10 @@ export function renderAutonomousEntry(
 ): Component {
 	const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
 	const clock = formatClock(data.endedAtMs ?? data.startedAtMs);
+	const model = formatAgyModel(data.model);
 	box.addChild(
 		new Text(
-			`${theme.fg("customMessageLabel", theme.bold("Antigravity · selbstständig"))}${clock ? theme.fg("dim", ` · ${clock}`) : ""}`,
+			`${theme.fg("customMessageLabel", theme.bold("Antigravity · selbstständig"))}${clock ? theme.fg("dim", ` · ${clock}`) : ""}${model ? theme.fg("muted", ` · ${model}`) : ""}`,
 			0,
 			0,
 		),
@@ -211,10 +239,11 @@ function taskLabel(task: BackgroundTask): string {
 
 const MAX_SUBAGENT_LINES = 6;
 
-/** Model label: what the subagent runs on, else what was asked for, else its type. */
+/** Model and reasoning level the subagent runs on, else what was asked for. */
 export function subagentModelLabel(status: SubagentStatus): string {
-	if (status.model) return status.model;
-	if (status.requestedModel) return status.requestedModel;
+	const model = formatAgyModel(status.model);
+	if (model) return model;
+	if (status.requestedModel) return `${status.requestedModel} (angefordert)`;
 	if (status.typeName === "self") return "Modell wie Hauptagent";
 	return status.typeName ?? "";
 }
@@ -229,10 +258,11 @@ export function subagentStartNote(
 ): string {
 	const role = typeof args.agentRole === "string" ? args.agentRole : undefined;
 	const count = typeof args.agentCount === "number" ? args.agentCount : 1;
+	const startedModel = started ? subagentModelLabel(started) : "";
 	const model =
-		started?.model ??
-		(typeof args.model === "string" ? args.model : undefined) ??
-		(args.agentType === "self" || started?.typeName === "self" ? "Modell wie Hauptagent" : undefined);
+		startedModel ||
+		(typeof args.model === "string" ? `${args.model} (angefordert)` : undefined) ||
+		(args.agentType === "self" ? "Modell wie Hauptagent" : undefined);
 	const who = count > 1 ? `${count} Subagenten (${role ?? "ohne Rolle"})` : `Subagent „${role ?? "ohne Rolle"}“`;
 	const details = [started?.conversationId.slice(0, 8), model].filter((part) => part !== undefined).join(" · ");
 	const lines = [

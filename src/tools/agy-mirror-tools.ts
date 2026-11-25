@@ -40,6 +40,7 @@ const MirrorToolParamsSchema = Type.Object(
 		prompt: Type.Optional(Type.String()),
 		agentType: Type.Optional(Type.String()),
 		model: Type.Optional(Type.String()),
+		parentModel: Type.Optional(Type.String()),
 		agentCount: Type.Optional(Type.Number()),
 	},
 	{ additionalProperties: true },
