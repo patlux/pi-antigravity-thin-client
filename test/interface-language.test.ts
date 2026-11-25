@@ -11,7 +11,8 @@ import ts from "typescript";
  */
 const SRC = path.join(import.meta.dirname, "..", "src");
 const CHINESE = /[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uff00-\uffef]/;
-const GERMAN = /[äöüÄÖÜß„“]/;
+// Umlauts and German quotes, plus German function words that English text does not use.
+const GERMAN = /[äöüÄÖÜß„“]|\b(?:zum|zur|und|oder|nicht|kein|keine|noch|der|das|dem|den|des|ist|wird|wurde|mit|für|eine|einen|bitte)\b/;
 
 function sourceFiles(dir: string): string[] {
 	return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {

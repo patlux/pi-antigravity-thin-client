@@ -241,7 +241,7 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 			options.expanded,
 			theme,
 			(text) => new Markdown(text, 0, 0, getMarkdownTheme()),
-			options.keyHint("app.tools.expand", "zum Aufklappen"),
+			options.keyHint("app.tools.expand", "to expand"),
 		);
 	});
 
