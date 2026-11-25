@@ -4,6 +4,10 @@ Fork releases of pi-antigravity-thin-client. The upstream changelog of pi-antigr
 
 ## Unreleased
 
+## 0.2.0 - 2026-11-25
+
+Upstream base: pi-antigravity-bridge 0.1.16.
+
 ### Added
 
 - README screenshots of the background widget, timers, the cards for turns Antigravity takes on its own, subagents and messages typed during a turn, plus a gallery preview image (`pi.image`). `scripts/screenshots/capture.mjs` takes them again against a scripted stand-in for `agy`.
