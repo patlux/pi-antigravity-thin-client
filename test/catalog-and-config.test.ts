@@ -302,6 +302,18 @@ rl.on("line", (line) => {
 			geminiDir: path.join(tmpRoot, ".gemini"),
 		};
 		const pm = new AcpProcessManager();
+		// The mock rewrites its state file in place (truncate, then write), so a read can
+		// land on an empty or half-written file; read again until the JSON is complete.
+		const readProbeState = (): unknown => {
+			for (let attempt = 0; ; attempt++) {
+				try {
+					return JSON.parse(fs.readFileSync(statePath, "utf8"));
+				} catch (error) {
+					if (!(error instanceof SyntaxError) || attempt >= 50) throw error;
+					Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+				}
+			}
+		};
 
 		try {
 			// 1. 并发 acquire：调用者 1 在 initialize 途中 abort，调用者 2 必须正常拿到同一健康连接
@@ -321,13 +333,13 @@ rl.on("line", (line) => {
 
 			const deadline = Date.now() + 3_000;
 			while (Date.now() < deadline) {
-				const st = JSON.parse(fs.readFileSync(statePath, "utf8")) as { closedIds: string[] };
+				const st = readProbeState() as { closedIds: string[] };
 				if (st.closedIds.includes("probe-sess-1") && !fs.existsSync(path.join(convDir, "probe-sess-1.db"))) {
 					break;
 				}
 				await new Promise((r) => setTimeout(r, 15));
 			}
-			const afterOrphan = JSON.parse(fs.readFileSync(statePath, "utf8")) as { closedIds: string[] };
+			const afterOrphan = readProbeState() as { closedIds: string[] };
 			assert.ok(afterOrphan.closedIds.includes("probe-sess-1"));
 			assert.equal(fs.existsSync(path.join(convDir, "probe-sess-1.db")), false);
 
@@ -346,7 +358,7 @@ rl.on("line", (line) => {
 				fs.existsSync(path.join(isolatedAgentDir, "cache", "antigravity-models.json")),
 				true,
 			);
-			const finalState = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
+			const finalState = readProbeState() as {
 				initCount: number;
 				newCount: number;
 				closedIds: string[];
