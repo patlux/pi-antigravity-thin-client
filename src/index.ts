@@ -274,7 +274,6 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 		pi,
 		processManager,
 		coordinator,
-		toolActivation,
 		onRefreshProviderModels: refreshAndReRegisterModels,
 	});
 

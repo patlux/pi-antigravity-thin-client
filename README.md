@@ -27,7 +27,9 @@ Do not install it together with `pi-antigravity-bridge`. Both register the same 
 2. Select an `antigravity/…` model before the first message (`/model` or Ctrl+P).
 3. Type your prompts.
 
-`/agy status` shows the backend state; `/agy login` and `/agy logout` manage the Antigravity sign-in.
+`/agy status` shows the backend state; `/agy login` and `/agy logout` manage the Antigravity sign-in. `/agy agent-mode` switches Antigravity's own execution mode (`default`, `accept-edits`, `plan`).
+
+There is no way to use anything but Antigravity's own tools: upstream's `/agy mode` and `/agy bridge` do not exist here, and its tool-mode and bridge settings (`toolMode`, `bridgePiMcp`, `bridgePiSkills`, `bridgePiAgentsMd` in `antigravity.json`, `PI_AGY_TOOL_MODE`, `PI_AGY_BRIDGE_*`) are ignored.
 
 ## What the thin client refuses
 

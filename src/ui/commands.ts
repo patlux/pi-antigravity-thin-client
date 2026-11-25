@@ -27,9 +27,7 @@ import {
 } from "../catalog/model-discovery.ts";
 import {
 	type AgyExecutionMode,
-	type AutoBoolean,
 	type BridgeConfig,
-	parseAutoBoolean,
 	resolveEffectiveFlags,
 	saveGlobalBridgeConfigPatch,
 	type ToolMode,
@@ -192,14 +190,15 @@ export interface CommandDependencies {
 	pi: ExtensionAPI;
 	processManager: AcpProcessManager;
 	coordinator: TurnCoordinator;
-	toolActivation: ToolActivationController;
 	onRefreshProviderModels: (ctx: ExtensionContext) => Promise<number>;
 }
 
+/** `/agy mode` and `/agy bridge` of upstream: switching away from agy-tools does not exist here. */
+export const THIN_CLIENT_FIXED_MODE =
+	"There is no /agy mode or /agy bridge in this thin client: Antigravity always works with its own tools, and Pi's MCP servers, skills and AGENTS.md are never passed to it.";
+
 const SUBCOMMANDS: AutocompleteItem[] = [
-	{ value: "status", label: "status", description: "查看 Antigravity 连接、订阅等级与桥接状态" },
-	{ value: "mode", label: "mode", description: "切换工具模式 (pi-tools | agy-tools | hybrid)" },
-	{ value: "bridge", label: "bridge", description: "设置 Pi MCP / Skills / AGENTS.md 桥接开关" },
+	{ value: "status", label: "status", description: "Antigravity CLI, subscription tier, execution mode and session" },
 	{ value: "agent-mode", label: "agent-mode", description: "切换 AGY 原生执行模式 (default | accept-edits | plan)" },
 	{ value: "refresh", label: "refresh", description: "重新探测当前账号可用的模型与思考档位" },
 	{ value: "sessions", label: "sessions", description: "浏览本机 AGY 会话并导入至当前 Pi 会话" },
@@ -220,14 +219,6 @@ function buildCompletions(prefix: string): AutocompleteItem[] | null {
 	const sub = parts[0].toLowerCase();
 	const arg1 = (parts[1] ?? "").toLowerCase();
 
-	if (sub === "mode" && parts.length === 2) {
-		return [
-			{ value: "mode pi-tools", label: "pi-tools", description: "通过 MCP 挂载 Pi 工具集主控模式（默认）" },
-			{ value: "mode agy-tools", label: "agy-tools", description: "AGY 原生工具与 Subagent 模式" },
-			{ value: "mode hybrid", label: "hybrid", description: "AGY 原生工具 + Pi 专属扩展工具混合模式" },
-		].filter((i) => i.label.startsWith(arg1) || i.value.startsWith(`mode ${arg1}`));
-	}
-
 	if (sub === "agent-mode" && parts.length === 2) {
 		return [
 			{ value: "agent-mode default", label: "default", description: "修改与执行命令前按权限规则询问" },
@@ -236,43 +227,15 @@ function buildCompletions(prefix: string): AutocompleteItem[] | null {
 		].filter((i) => i.value.startsWith(`agent-mode ${arg1}`));
 	}
 
-	if (sub === "bridge") {
-		if (parts.length === 2) {
-			return [
-				{ value: "bridge mcp", label: "mcp", description: "控制是否将 Pi MCP 桥接给 AGY" },
-				{ value: "bridge skills", label: "skills", description: "控制是否将 Pi Skills 桥接给 AGY" },
-				{ value: "bridge agents-md", label: "agents-md", description: "控制是否将 Pi AGENTS.md 桥接给 AGY" },
-			].filter((i) => i.value.startsWith(`bridge ${arg1}`));
-		}
-		if (parts.length === 3) {
-			const target = parts[1].toLowerCase();
-			const valPrefix = parts[2].toLowerCase();
-			return ["on", "off", "auto"]
-				.filter((v) => v.startsWith(valPrefix))
-				.map((v) => ({
-					value: `bridge ${target} ${v}`,
-					label: v,
-					description: v === "auto" ? "跟随当前工具模式默认行为" : v === "on" ? "强制开启" : "强制关闭",
-				}));
-		}
-	}
-
 	return null;
-}
-
-function formatAutoBoolLabel(raw: AutoBoolean, effective: boolean): string {
-	if (raw === "auto") {
-		return `auto (${effective ? "开启" : "关闭"})`;
-	}
-	return raw ? "开启 (on)" : "关闭 (off)";
 }
 
 /** 注册统一的 `/agy` 斜杠命令入口 */
 export function registerAntigravityCommands(deps: CommandDependencies): void {
-	const { pi, processManager, coordinator, toolActivation, onRefreshProviderModels } = deps;
+	const { pi, processManager, coordinator, onRefreshProviderModels } = deps;
 
 	pi.registerCommand("agy", {
-		description: "管理 Antigravity 模型后端、工具模式、生态桥接与历史会话",
+		description: "Antigravity: status, agy execution mode, model refresh, sessions, login",
 		getArgumentCompletions: (prefix) => buildCompletions(prefix),
 		handler: async (rawArgs: string, ctx: ExtensionCommandContext) => {
 			coordinator.setActiveContext(ctx);
@@ -287,12 +250,10 @@ export function registerAntigravityCommands(deps: CommandDependencies): void {
 					await handleStatusSubcommand(ctx, coordinator);
 					return;
 				}
-				case "mode": {
-					await handleModeSubcommand(tokens.slice(1), ctx, coordinator, toolActivation);
-					return;
-				}
+				case "mode":
 				case "bridge": {
-					await handleBridgeSubcommand(tokens.slice(1), ctx, coordinator, toolActivation);
+					// Thin client: there is no way to run anything but Antigravity's own tools.
+					ctx.ui.notify(THIN_CLIENT_FIXED_MODE, "warning");
 					return;
 				}
 				case "agent-mode": {
@@ -327,7 +288,7 @@ export function registerAntigravityCommands(deps: CommandDependencies): void {
 				}
 				default: {
 					ctx.ui.notify(
-						`未知子命令 "${sub}"。可用子命令：status, mode, bridge, agent-mode, refresh, sessions, login, logout`,
+						`未知子命令 "${sub}"。可用子命令：status, agent-mode, refresh, sessions, login, logout`,
 						"warning",
 					);
 				}
@@ -341,7 +302,6 @@ async function handleStatusSubcommand(
 	coordinator: TurnCoordinator,
 ): Promise<void> {
 	const cfg = coordinator.config;
-	const flags = resolveEffectiveFlags(cfg);
 	const telemetry = coordinator.getTelemetrySnapshot();
 	const bin = resolveAgyBinary({ configuredBin: cfg.agyBin, geminiDir: cfg.geminiDir });
 	const ver = bin ? probeAgyVersion(bin) : undefined;
@@ -349,11 +309,8 @@ async function handleStatusSubcommand(
 	const lines = [
 		`Antigravity CLI：${bin ? `${bin.binPath}${ver ? ` (v${ver})` : ""}` : "未找到可执行文件"}`,
 		`订阅层级：${telemetry.tier ? `${telemetry.tier.name}` : "待首次连接探测"}`,
-		`当前工具模式：${cfg.toolMode}`,
+		"Thin client: Antigravity's own tools; Pi MCP, skills and AGENTS.md are never passed on",
 		`AGY 原生执行策略：${cfg.agyExecutionMode}`,
-		`Pi MCP 桥接：${formatAutoBoolLabel(cfg.bridgePiMcp, flags.bridgePiMcp)}`,
-		`Pi Skills 桥接：${formatAutoBoolLabel(cfg.bridgePiSkills, flags.bridgePiSkills)}`,
-		`Pi AGENTS.md 桥接：${formatAutoBoolLabel(cfg.bridgePiAgentsMd, flags.bridgePiAgentsMd)}`,
 		`活跃会话：${telemetry.agySessionId ?? "无（将在下次提问时按需创建）"}`,
 	];
 
@@ -367,124 +324,6 @@ async function handleStatusSubcommand(
 	} else {
 		ctx.ui.notify(lines.join("\n"), "info");
 	}
-}
-
-async function handleModeSubcommand(
-	args: string[],
-	ctx: ExtensionCommandContext,
-	coordinator: TurnCoordinator,
-	toolActivation: ToolActivationController,
-): Promise<void> {
-	let targetMode = args[0]?.toLowerCase() as ToolMode | undefined;
-	const validModes: ToolMode[] = ["pi-tools", "agy-tools", "hybrid"];
-
-	if (!targetMode || !validModes.includes(targetMode)) {
-		if (!ctx.hasUI) {
-			ctx.ui.notify("请指定模式：/agy mode <pi-tools | agy-tools | hybrid>", "warning");
-			return;
-		}
-		const options = [
-			"pi-tools — 通过 MCP 挂载并使用 Pi 工具集与审批流（默认）",
-			"agy-tools — 使用 AGY 原生工具、Subagents 与沙箱能力",
-			"hybrid — AGY 原生工具 + Pi 专属第三方扩展工具",
-		];
-		const picked = await ctx.ui.select(
-			`切换工具模式（当前：${coordinator.config.toolMode}）`,
-			options,
-		);
-		if (!picked) return;
-		targetMode = picked.split(" ")[0] as ToolMode;
-	}
-
-	if (targetMode === coordinator.config.toolMode) {
-		ctx.ui.notify(`当前已处于 ${targetMode} 模式。`, "info");
-		return;
-	}
-
-	const nextConfig: BridgeConfig = {
-		...coordinator.config,
-		toolMode: targetMode,
-	};
-	coordinator.setConfig(nextConfig);
-	saveGlobalBridgeConfigPatch({ toolMode: targetMode });
-	toolActivation.syncForContext(ctx, nextConfig);
-	updateAntigravityStatusBar(ctx, nextConfig, coordinator.getTelemetrySnapshot());
-
-	ctx.ui.notify(`已切换至 ${targetMode} 模式。`, "info");
-}
-
-async function handleBridgeSubcommand(
-	args: string[],
-	ctx: ExtensionCommandContext,
-	coordinator: TurnCoordinator,
-	toolActivation: ToolActivationController,
-): Promise<void> {
-	const keyMap: Record<string, keyof Pick<BridgeConfig, "bridgePiMcp" | "bridgePiSkills" | "bridgePiAgentsMd">> = {
-		mcp: "bridgePiMcp",
-		skills: "bridgePiSkills",
-		"agents-md": "bridgePiAgentsMd",
-		agentsmd: "bridgePiAgentsMd",
-	};
-
-	let targetFieldKey = args[0] ? keyMap[args[0].toLowerCase()] : undefined;
-	let rawValStr = args[1]?.toLowerCase();
-
-	if (!targetFieldKey) {
-		if (!ctx.hasUI) {
-			ctx.ui.notify(
-				"用法：/agy bridge <mcp | skills | agents-md> <on | off | auto>",
-				"warning",
-			);
-			return;
-		}
-		const flags = resolveEffectiveFlags(coordinator.config);
-		const targetLabels = [
-			`mcp — 桥接 Pi MCP（当前：${formatAutoBoolLabel(coordinator.config.bridgePiMcp, flags.bridgePiMcp)}）`,
-			`skills — 桥接 Pi Skills（当前：${formatAutoBoolLabel(coordinator.config.bridgePiSkills, flags.bridgePiSkills)}）`,
-			`agents-md — 桥接 Pi AGENTS.md（当前：${formatAutoBoolLabel(coordinator.config.bridgePiAgentsMd, flags.bridgePiAgentsMd)}）`,
-		];
-		const pickedTarget = await ctx.ui.select("选择要调整的桥接项", targetLabels);
-		if (!pickedTarget) return;
-		const prefix = pickedTarget.split(" ")[0];
-		targetFieldKey = keyMap[prefix];
-	}
-
-	if (!rawValStr || !["on", "off", "auto", "true", "false"].includes(rawValStr)) {
-		if (!ctx.hasUI) {
-			ctx.ui.notify("请指定开关状态：on, off 或 auto", "warning");
-			return;
-		}
-		const pickedVal = await ctx.ui.select("选择桥接策略", [
-			"auto — 跟随当前工具模式默认策略",
-			"on — 始终开启桥接",
-			"off — 始终关闭桥接",
-		]);
-		if (!pickedVal) return;
-		rawValStr = pickedVal.split(" ")[0];
-	}
-
-	const parsedVal = parseAutoBoolean(rawValStr, "auto");
-	const nextConfig: BridgeConfig = {
-		...coordinator.config,
-		[targetFieldKey]: parsedVal,
-	};
-	coordinator.setConfig(nextConfig);
-	saveGlobalBridgeConfigPatch({ [targetFieldKey]: parsedVal });
-	toolActivation.syncForContext(ctx, nextConfig);
-	updateAntigravityStatusBar(ctx, nextConfig, coordinator.getTelemetrySnapshot());
-
-	const updatedFlags = resolveEffectiveFlags(nextConfig);
-	const effectiveNow =
-		targetFieldKey === "bridgePiMcp"
-			? updatedFlags.bridgePiMcp
-			: targetFieldKey === "bridgePiSkills"
-				? updatedFlags.bridgePiSkills
-				: updatedFlags.bridgePiAgentsMd;
-
-	ctx.ui.notify(
-		`已更新 ${targetFieldKey} 为 ${formatAutoBoolLabel(parsedVal, effectiveNow)}。`,
-		"info",
-	);
 }
 
 async function handleAgentModeSubcommand(
