@@ -528,6 +528,14 @@ export function deriveSubagentStatus(
 	const last = ordered.at(-1);
 	let state: SubagentStatus["state"];
 	let activity: string | undefined;
+	// A timer or command it moved to the background wakes it up again later.
+	const pending = deriveAgyActivity(ordered, ownMessages).tasks.filter((task) => !task.finished);
+	const waitingFor = pending.at(-1);
+	const waitingText = waitingFor
+		? waitingFor.kind === "timer"
+			? `wartet auf Timer ${waitingFor.timerSeconds ?? "?"} s`
+			: `wartet auf ${waitingFor.summary ?? waitingFor.description}`
+		: undefined;
 	if (record.state === "SUBAGENT_STATE_KILLED") {
 		state = "killed";
 		activity = "beendet";
@@ -536,31 +544,29 @@ export function deriveSubagentStatus(
 		activity = "startet …";
 	} else if (lastPlanner.toolCalls.length > 0) {
 		state = "working";
-		const action = summarizeAction(lastPlanner.toolCalls[0]);
-		const more = lastPlanner.toolCalls.length > 1 ? ` (+${lastPlanner.toolCalls.length - 1})` : "";
-		activity = `→ ${action.name}${action.summary ? ` ${action.summary}` : ""}${more}`;
-		if (last && last.index > lastPlanner.index && last.type !== "GENERIC") {
+		if (waitingFor && waitingText && waitingFor.stepIndex > lastPlanner.index) {
+			// Its last tool call went to the background (agy writes the answer that
+			// ends the turn a little later).
+			activity = waitingText;
+		} else if (last && last.index > lastPlanner.index && last.type !== "GENERIC") {
 			activity = "denkt nach …";
+		} else {
+			const action = summarizeAction(lastPlanner.toolCalls[0]);
+			const more = lastPlanner.toolCalls.length > 1 ? ` (+${lastPlanner.toolCalls.length - 1})` : "";
+			activity = `→ ${action.name}${action.summary ? ` ${action.summary}` : ""}${more}`;
 		}
 	} else if (last && last.index > lastPlanner.index) {
 		// A message arrived after its last answer: it works again.
 		state = "working";
 		activity = "denkt nach …";
+	} else if (waitingText) {
+		// An answer without tool calls ends its turn, but it still waits for a timer
+		// or background command: it is not done.
+		state = "working";
+		activity = waitingText;
 	} else {
-		// An answer without tool calls ends its turn, but a timer or background
-		// command it started still wakes it up again: then it waits, it is not done.
-		const pending = deriveAgyActivity(ordered, ownMessages).tasks.filter((task) => !task.finished);
-		const waitingFor = pending.at(-1);
-		if (waitingFor) {
-			state = "working";
-			activity =
-				waitingFor.kind === "timer"
-					? `wartet auf Timer ${waitingFor.timerSeconds ?? "?"} s`
-					: `wartet auf ${waitingFor.summary ?? waitingFor.description}`;
-		} else {
-			state = "idle";
-			activity = firstLine(lastPlanner.content);
-		}
+		state = "idle";
+		activity = firstLine(lastPlanner.content);
 	}
 
 	const spawn = spawnArguments(record, parentSteps);

@@ -381,6 +381,9 @@ describe("agy subagents", () => {
 		];
 		const waiting = deriveSubagentStatus(record, steps(own), []);
 		assert.deepEqual([waiting.state, waiting.activity], ["working", "wartet auf Timer 10 s"]);
+		// agy writes the answer that ends the turn later; the timer already counts.
+		const lagging = [...own.slice(0, 5), line({ step_index: 6, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", created_at: "2026-11-25T15:01:48Z", content: "<SYSTEM_MESSAGE> Reminder </SYSTEM_MESSAGE>" })];
+		assert.equal(deriveSubagentStatus(record, steps(lagging), []).activity, "wartet auf Timer 10 s");
 		const expired = parseTaskMessage(JSON.stringify({ id: "t", sender: `${SUB}/task-4`, timestamp: "2026-11-25T15:01:58Z", renderDetails: { messageTitle: "10s timer: Timer has expired" }, content: "weiter" }));
 		assert.ok(expired);
 		assert.equal(deriveSubagentStatus(record, steps(own), [], [expired]).state, "idle");
