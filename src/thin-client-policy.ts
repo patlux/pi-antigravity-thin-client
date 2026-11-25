@@ -35,6 +35,9 @@ export class ThinClientPolicyError extends Error {
 export const REPLAY_REFUSED =
 	"refusing to replay earlier conversation into Antigravity (model switch, compaction, branch navigation or a lost agy session). Start a new Pi session (/new) and select the Antigravity model before the first message.";
 
+export const RESUME_DIVERGED_REFUSED =
+	"refusing to continue from this point. The Antigravity conversation got further prompts after it (from a later message on another branch, a forked Pi session or another client), and Antigravity cannot go back without rewriting its history. Continue from the latest message of this conversation, or start a new Pi session (/new).";
+
 export const AUXILIARY_REFUSED =
 	"refusing auxiliary request (compaction summary, title, recap or similar). Antigravity serves only prompts typed by the user.";
 

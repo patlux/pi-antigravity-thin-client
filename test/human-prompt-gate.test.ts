@@ -5,6 +5,8 @@ import { HumanPromptGate, trailingUserMessages } from "../src/human-prompt-gate.
 import {
 	AUTOMATED_PROMPT_REFUSED,
 	NO_NEW_PROMPT_REFUSED,
+	REPLAY_REFUSED,
+	RESUME_DIVERGED_REFUSED,
 	RETRY_REFUSED,
 	ThinClientPolicyError,
 } from "../src/thin-client-policy.ts";
@@ -119,7 +121,13 @@ describe("HumanPromptGate", () => {
 	});
 
 	it("words every refusal so that Pi does not retry it", () => {
-		for (const reason of [RETRY_REFUSED, AUTOMATED_PROMPT_REFUSED, NO_NEW_PROMPT_REFUSED]) {
+		for (const reason of [
+			RETRY_REFUSED,
+			AUTOMATED_PROMPT_REFUSED,
+			NO_NEW_PROMPT_REFUSED,
+			REPLAY_REFUSED,
+			RESUME_DIVERGED_REFUSED,
+		]) {
 			const failed = assistant("error", 1);
 			failed.errorMessage = new ThinClientPolicyError(reason).message;
 			assert.equal(isRetryableAssistantError(failed), false, reason);

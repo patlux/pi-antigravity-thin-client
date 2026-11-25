@@ -26,6 +26,7 @@ import {
 	enforceThinClientPolicy,
 	HEADLESS_REFUSED,
 	NO_NEW_PROMPT_REFUSED,
+	RESUME_DIVERGED_REFUSED,
 	ThinClientPolicyError,
 } from "../thin-client-policy.ts";
 import type {
@@ -93,6 +94,7 @@ import {
 	readSqliteGenerationUsagesSinceWithRetry,
 	waitForSqliteToolStepsSettled,
 } from "./checkpoint-sync.ts";
+import { checkAgyConversationSinceAnchor } from "./agy-resume.ts";
 import { prepareCustomizationMount } from "./customization-mounter.ts";
 import {
 	buildDetachedToolResultBlocks,
@@ -2394,22 +2396,22 @@ export class TurnCoordinator {
 				const saved = anchor.dbCheckpoint;
 				if (saved) {
 					const current = await captureSqliteCheckpoint(this.currentConfig, anchor.agySessionId);
-					if (
-						!current ||
-						current.steps < saved.steps ||
-						current.generations < saved.generations ||
-						current.executions < saved.executions
-					) {
+					// Thin client: steps agy added on its own (background tasks, timers, subagents)
+					// belong to its history, so Pi reattaches. Prompts after the anchor mean Pi
+					// points at an earlier point of the conversation.
+					const since = await checkAgyConversationSinceAnchor(
+						this.currentConfig,
+						anchor.agySessionId,
+						saved,
+						current,
+					);
+					if (since === "lost") {
 						anchorMatch = { kind: "none" };
-					} else if (
-						current.steps > saved.steps ||
-						current.generations > saved.generations ||
-						current.executions > saved.executions
-					) {
-						// Pi 仍指向历史节点时，已有新写入的轨迹只能从旧检查点分叉。
-						anchorMatch = this.currentConfig.enableSqliteFork ? { kind: "forkable", anchor } : { kind: "none" };
-					} else if (current.fingerprint !== saved.fingerprint) {
-						anchorMatch = { kind: "none" };
+					} else if (since === "prompted") {
+						if (!this.currentConfig.enableSqliteFork) {
+							throw new ThinClientPolicyError(RESUME_DIVERGED_REFUSED);
+						}
+						anchorMatch = { kind: "forkable", anchor };
 					}
 				} else if (!anchor.importedRaw || (await readCurrentMaxSqliteStepIdx(this.currentConfig, anchor.agySessionId)) < 0) {
 					// 无检查点的旧桥接锚点无法校验轨迹位置。原生导入仍读取非空源会话。

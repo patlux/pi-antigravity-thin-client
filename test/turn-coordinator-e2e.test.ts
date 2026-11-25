@@ -7,6 +7,7 @@ import { describe, it } from "node:test";
 import {
 	isRetryableAssistantError,
 	normalizeContext,
+	type AssistantMessage,
 	type AssistantMessageEvent,
 	type Message,
 	type Model,
@@ -16,6 +17,8 @@ import {
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { AcpProcessManager } from "../src/acp/process-manager.ts";
 import { DEFAULT_BRIDGE_CONFIG, type BridgeConfig } from "../src/config.ts";
+import { AGY_SESSION_ANCHOR_CUSTOM_TYPE } from "../src/session/checkpoint-sync.ts";
+import { computeTranscriptDigest } from "../src/session/reconcile.ts";
 import { TurnCoordinator } from "../src/session/turn-coordinator.ts";
 import {
 	AgyTurnMirrorBroker,
@@ -3968,4 +3971,181 @@ it("双仓联调：真实 Pi 对迟建轨迹库逐代计量，无快照时完整
 			fs.rmSync(tmpRoot, { recursive: true, force: true });
 		}
 	}
+});
+
+describe("thin client: continuing an existing Antigravity conversation", () => {
+	type AnchorEntry = { type: "custom"; customType: string; data: unknown };
+
+	function promptOf(payload: unknown): unknown {
+		return payload !== null && typeof payload === "object" && "prompt" in payload ? payload.prompt : undefined;
+	}
+
+	function methodOf(line: string): string {
+		const parsed: unknown = JSON.parse(line);
+		return parsed !== null && typeof parsed === "object" && "method" in parsed ? String(parsed.method) : "";
+	}
+
+	/**
+	 * Runs one typed turn in a first Pi process, lets the mock agy persist its steps, stores
+	 * the anchor and closes everything, as when Pi quits. `afterQuit` then changes agy's
+	 * conversation the way agy would. A second Pi process (new coordinator and agy process)
+	 * gets the next typed prompt on the same Pi branch.
+	 */
+	async function resumeAfterRestart(
+		label: string,
+		afterQuit: (db: DatabaseSync) => void,
+		replaceAnchors?: (entries: AnchorEntry[], messages: readonly [UserMessage, AssistantMessage]) => void,
+	): Promise<{
+		first: Awaited<ReturnType<ReturnType<TurnCoordinator["streamSimple"]>["result"]>>;
+		next: Awaited<ReturnType<ReturnType<TurnCoordinator["streamSimple"]>["result"]>>;
+		sent: unknown[];
+		methodsAfterRestart: string[];
+	}> {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), `pi-agy-thin-${label}-`));
+		const config = {
+			...DEFAULT_BRIDGE_CONFIG,
+			agyBin: writeMockAgyExecutable(root, { seedTemplateDbOnNew: true }),
+			geminiDir: path.join(root, ".gemini"),
+		};
+		const entries: AnchorEntry[] = [];
+		const piSessionId = `thin-${label}`;
+		const start = () => {
+			const pi = createStubPiApi();
+			pi.appendEntry = (customType, data) => entries.push({ type: "custom", customType, data });
+			const broker = new AgyTurnMirrorBroker();
+			const coordinator = new TurnCoordinator(pi, new AcpProcessManager(), broker, config);
+			coordinator.setActiveContext(interactiveContext(root, {
+				sessionManager: { getSessionId: () => piSessionId, getBranch: () => entries },
+			}));
+			const tools = createAgyMirrorToolDefinitions(broker).map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
+			return { coordinator, tools };
+		};
+		const openConversation = (id: string) =>
+			new DatabaseSync(path.join(config.geminiDir, config.appDataDirName, "conversations", `${id}.db`));
+		const callsLog = path.join(root, "mock-calls.log");
+
+		try {
+			const firstProcess = start();
+			const firstUser: UserMessage = { role: "user", content: "FOLLOWUP_MSG:earlier question", timestamp: 1 };
+			let first;
+			try {
+				typedByHuman(firstProcess.coordinator.humanPromptGate, firstUser);
+				first = await firstProcess.coordinator.streamSimple(TEST_MODEL, normalizeContext({
+					messages: [firstUser], tools: firstProcess.tools,
+				}), { sessionId: piSessionId }).result();
+				assert.equal(first.stopReason, "stop");
+				assert.ok(first.responseId, "agy session id");
+				// agy persists the prompt and its answer; a command is still running in the background.
+				const db = openConversation(first.responseId ?? "");
+				try {
+					db.exec("INSERT INTO steps (idx, step_type, status) VALUES (0, 14, 3), (1, 15, 3), (2, 132, 2)");
+				} finally { db.close(); }
+				await firstProcess.coordinator.persistTurnAnchor([firstUser, first], piSessionId);
+				assert.equal(entries.length, 1);
+			} finally {
+				await firstProcess.coordinator.dispose();
+			}
+
+			const db = openConversation(first.responseId ?? "");
+			try { afterQuit(db); } finally { db.close(); }
+			replaceAnchors?.(entries, [firstUser, first]);
+			fs.rmSync(callsLog, { force: true });
+
+			const secondProcess = start();
+			const sent: unknown[] = [];
+			try {
+				const nextUser: UserMessage = { role: "user", content: "FOLLOWUP_MSG:next question", timestamp: 2 };
+				typedByHuman(secondProcess.coordinator.humanPromptGate, nextUser);
+				const next = await secondProcess.coordinator.streamSimple(TEST_MODEL, normalizeContext({
+					messages: [firstUser, first, nextUser], tools: secondProcess.tools,
+				}), { sessionId: piSessionId, onPayload: (payload) => { sent.push(payload); } }).result();
+				const methodsAfterRestart = fs.existsSync(callsLog)
+					? fs.readFileSync(callsLog, "utf8").trim().split("\n").filter(Boolean).map(methodOf)
+					: [];
+				return { first, next, sent, methodsAfterRestart };
+			} finally {
+				await secondProcess.coordinator.dispose();
+			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	}
+
+	it("reattaches with session/resume and sends only the typed prompt", async () => {
+		const { first, next, sent, methodsAfterRestart } = await resumeAfterRestart("unchanged", () => {});
+		assert.equal(next.stopReason, "stop", next.errorMessage);
+		assert.equal(next.responseId, first.responseId);
+		assert.ok(methodsAfterRestart.includes("session/resume"), methodsAfterRestart.join(","));
+		assert.ok(!methodsAfterRestart.includes("session/new"), methodsAfterRestart.join(","));
+		assert.ok(!methodsAfterRestart.includes("session/load"), methodsAfterRestart.join(","));
+		assert.equal(sent.length, 1);
+		assert.deepEqual(promptOf(sent[0]), [{ type: "text", text: "FOLLOWUP_MSG:next question" }]);
+	});
+
+	it("reattaches after turns Antigravity took on its own and after its background step finished", async () => {
+		const { first, next, sent, methodsAfterRestart } = await resumeAfterRestart("own-turn", (db) => {
+			// The background command ends (status and output change), its message wakes agy,
+			// and agy answers on its own: SYSTEM_MESSAGE (101), then PLANNER_RESPONSE (15).
+			db.exec("UPDATE steps SET status = 3, step_payload = X'0102' WHERE idx = 2");
+			db.exec("INSERT INTO steps (idx, step_type, status) VALUES (3, 101, 3), (4, 15, 3)");
+			db.exec("INSERT INTO gen_metadata (idx, data, size) VALUES (0, X'00', 1)");
+		});
+		assert.equal(next.stopReason, "stop", next.errorMessage);
+		assert.equal(next.responseId, first.responseId);
+		assert.ok(methodsAfterRestart.includes("session/resume"), methodsAfterRestart.join(","));
+		assert.ok(!methodsAfterRestart.includes("session/new"), methodsAfterRestart.join(","));
+		assert.equal(sent.length, 1);
+		assert.deepEqual(promptOf(sent[0]), [{ type: "text", text: "FOLLOWUP_MSG:next question" }]);
+	});
+
+	it("refuses to continue from a point the Antigravity conversation has moved past with further prompts", async () => {
+		const { next, sent, methodsAfterRestart } = await resumeAfterRestart("prompted", (db) => {
+			// Another Pi branch, a forked Pi session or another client prompted agy.
+			db.exec("INSERT INTO steps (idx, step_type, status) VALUES (3, 14, 3), (4, 15, 3)");
+		});
+		assert.equal(next.stopReason, "error");
+		assert.match(next.errorMessage ?? "", /refusing to continue from this point/);
+		assert.equal(isRetryableAssistantError(next), false);
+		assert.equal(sent.length, 0, "no prompt may reach agy");
+		for (const method of ["session/prompt", "session/new", "session/resume"]) {
+			assert.ok(!methodsAfterRestart.includes(method), `${method} must not run: ${methodsAfterRestart.join(",")}`);
+		}
+	});
+
+	it("continues a conversation imported with /agy sessions", async () => {
+		const { first, next, sent, methodsAfterRestart } = await resumeAfterRestart("imported", () => {}, (entries, messages) => {
+			// `/agy sessions` writes an anchor without a checkpoint for the messages agy replayed.
+			const agySessionId = messages[1].responseId ?? "";
+			entries.splice(0, entries.length, {
+				type: "custom",
+				customType: AGY_SESSION_ANCHOR_CUSTOM_TYPE,
+				data: {
+					version: 1,
+					agySessionId,
+					toolMode: "agy-tools",
+					transcriptDigest: computeTranscriptDigest(messages),
+					messageCount: messages.length,
+					mountDigest: "",
+					toolsDigest: "",
+					importedRaw: true,
+				},
+			});
+		});
+		assert.equal(next.stopReason, "stop", next.errorMessage);
+		assert.equal(next.responseId, first.responseId);
+		assert.ok(methodsAfterRestart.includes("session/resume"), methodsAfterRestart.join(","));
+		assert.ok(!methodsAfterRestart.includes("session/new"), methodsAfterRestart.join(","));
+		assert.equal(sent.length, 1);
+		assert.deepEqual(promptOf(sent[0]), [{ type: "text", text: "FOLLOWUP_MSG:next question" }]);
+	});
+
+	it("refuses to replay Pi's history when agy's conversation is shorter than at the anchor", async () => {
+		const { next, sent, methodsAfterRestart } = await resumeAfterRestart("lost", (db) => {
+			db.exec("DELETE FROM steps WHERE idx >= 1");
+		});
+		assert.equal(next.stopReason, "error");
+		assert.match(next.errorMessage ?? "", /refusing to replay earlier conversation/);
+		assert.equal(sent.length, 0, "no prompt may reach agy");
+		assert.ok(!methodsAfterRestart.includes("session/prompt"), methodsAfterRestart.join(","));
+	});
 });

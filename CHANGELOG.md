@@ -4,6 +4,14 @@ Fork releases of pi-antigravity-thin-client. The upstream changelog of pi-antigr
 
 ## Unreleased
 
+### Fixed
+
+- A Pi session with an Antigravity conversation could not be continued after Pi restarted (`/resume`, `pi --continue`) once Antigravity had worked on its own after the last prompt: a background task, a timer or a subagent added steps, or a background command changed its status when it ended. The package took that for a branch and refused the next prompt. It now reopens the conversation with `session/resume` and sends only the typed prompt.
+
+### Changed
+
+- When the Antigravity conversation got further prompts after the point Pi continues from (`/tree` to an earlier message, a forked Pi session, another client), the refusal now says so instead of the generic replay refusal.
+
 ## 0.2.1 - 2026-11-25
 
 Upstream base: pi-antigravity-bridge 0.1.16.
