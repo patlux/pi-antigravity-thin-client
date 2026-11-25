@@ -4,6 +4,10 @@ Fork releases of pi-antigravity-thin-client. The upstream changelog of pi-antigr
 
 ## Unreleased
 
+## 0.2.1 - 2026-11-25
+
+Upstream base: pi-antigravity-bridge 0.1.16.
+
 ### Changed
 
 - The README names the goal of the package: to use an Antigravity subscription sign-in only the way Google allows. It quotes the boundary from Google's AI Developers Forum with its sources, shows how the package keeps each condition, and says what it cannot promise: the boundary is not in Google's terms or docs, and the earlier note called the forum replies statements of Google staff, but their author is not marked as staff.
