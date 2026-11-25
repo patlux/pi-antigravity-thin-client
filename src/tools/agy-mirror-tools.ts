@@ -267,6 +267,11 @@ export class AgyTurnMirrorBroker {
 		this.fallbackUiContext = ctx;
 	}
 
+	/** Whether a mirror call with this id is registered and not yet collected. */
+	isTracking(toolCallId: string): boolean {
+		return this.calls.has(toolCallId);
+	}
+
 	registerOrUpdateCall(
 		agySessionId: string,
 		payload: {

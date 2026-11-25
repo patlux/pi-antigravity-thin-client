@@ -18,6 +18,7 @@ import {
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { BRIDGE_AGENT_NAME, type AcpClientConnection, type AcpProcessManager } from "../acp/process-manager.ts";
+import { AcpUpdateTrace } from "../acp/update-trace.ts";
 import { HumanPromptGate, trailingUserMessages } from "../human-prompt-gate.ts";
 import {
 	AUXILIARY_REFUSED,
@@ -380,6 +381,8 @@ export class TurnCoordinator {
 	private latestTier?: AcpTierInfo;
 	/** Fed by Pi's `input` and `message_start` events; see `HumanPromptGate`. */
 	readonly humanPromptGate = new HumanPromptGate();
+	/** Local `session/update` trace, enabled with `PI_AGY_TRACE`. */
+	readonly updateTrace = new AcpUpdateTrace();
 
 	constructor(
 		pi: ExtensionAPI,
@@ -726,6 +729,7 @@ export class TurnCoordinator {
 
 	private handleSessionUpdate(notification: AcpSessionUpdateNotification): void {
 		const { sessionId, update } = notification;
+		this.updateTrace.record(notification, Boolean(this.ledgersByAgyId.get(sessionId)?.activePump));
 
 		const auxListener = this.auxUpdateListeners.get(sessionId);
 		if (auxListener) {
@@ -830,7 +834,10 @@ export class TurnCoordinator {
 			const isHostMcp =
 				ledger.hostMcpAnnouncementIds.has(update.toolCallId) ||
 				this.isHostMcpToolEvent(ledger, update.title, update.name);
-			if (!isHostMcp && ledger.toolMode !== "pi-tools") {
+			// Outside a Pi turn (agy woke up on its own) no mirror tool waits for the
+			// update; registering it would only leave an orphaned entry behind.
+			const awaited = Boolean(ledger.activePump) || this.mirrorBroker.isTracking(update.toolCallId);
+			if (!isHostMcp && ledger.toolMode !== "pi-tools" && awaited) {
 				this.mirrorBroker.registerOrUpdateCall(sessionId, update);
 			}
 			return;
