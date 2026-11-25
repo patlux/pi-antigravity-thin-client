@@ -353,9 +353,9 @@ describe("agy subagents", () => {
 		assert.equal(working.typeName, "self");
 
 		assert.equal(deriveSubagentStatus(record, steps(subagentLines().slice(0, 3)), parent).activity, "→ write_file /tmp/agy-test/hallo.txt");
-		assert.equal(deriveSubagentStatus(record, steps(subagentLines().slice(0, 6)), parent).activity, "denkt nach …");
+		assert.equal(deriveSubagentStatus(record, steps(subagentLines().slice(0, 6)), parent).activity, "thinking …");
 		const starting = deriveSubagentStatus(record, [], parent);
-		assert.equal(starting.activity, "startet …");
+		assert.equal(starting.activity, "starting …");
 		// A `self` subagent runs on the parent's model and reasoning level until it answers.
 		assert.deepEqual([starting.model, starting.modelFromParent], ["gemini-4-neon-high", true]);
 
@@ -380,10 +380,10 @@ describe("agy subagents", () => {
 			line({ step_index: 5, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-25T15:01:48Z", content: "Warte auf den 10-Sekunden-Timer." }),
 		];
 		const waiting = deriveSubagentStatus(record, steps(own), []);
-		assert.deepEqual([waiting.state, waiting.activity], ["working", "wartet auf Timer 10 s"]);
+		assert.deepEqual([waiting.state, waiting.activity], ["working", "waiting for timer 10 s"]);
 		// agy writes the answer that ends the turn later; the timer already counts.
 		const lagging = [...own.slice(0, 5), line({ step_index: 6, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", created_at: "2026-11-25T15:01:48Z", content: "<SYSTEM_MESSAGE> Reminder </SYSTEM_MESSAGE>" })];
-		assert.equal(deriveSubagentStatus(record, steps(lagging), []).activity, "wartet auf Timer 10 s");
+		assert.equal(deriveSubagentStatus(record, steps(lagging), []).activity, "waiting for timer 10 s");
 		const expired = parseTaskMessage(JSON.stringify({ id: "t", sender: `${SUB}/task-4`, timestamp: "2026-11-25T15:01:58Z", renderDetails: { messageTitle: "10s timer: Timer has expired" }, content: "weiter" }));
 		assert.ok(expired);
 		assert.equal(deriveSubagentStatus(record, steps(own), [], [expired]).state, "idle");
@@ -393,14 +393,14 @@ describe("agy subagents", () => {
 		const args = { agentRole: "File Creator Subagent", agentType: "self", prompt: "Lege die Datei an.\nDanach melden." };
 		assert.equal(
 			subagentStartNote(args, undefined),
-			"🤖 Subagent „File Creator Subagent“ gestartet · Modell wie Hauptagent\nWas er gerade tut, zeigt die Antigravity-Anzeige über dem Eingabefeld.\n\nAuftrag:\nLege die Datei an.\nDanach melden.",
+			"🤖 Subagent \"File Creator Subagent\" started · same model as the main agent\nThe Antigravity panel above the editor shows what it is doing.\n\nTask:\nLege die Datei an.\nDanach melden.",
 		);
 		const record = parseSubagentRecord(SUB_RECORD);
 		assert.ok(record);
 		const started = deriveSubagentStatus(record, steps(subagentLines().slice(0, 2)), steps(parentSpawnLines()));
-		assert.match(subagentStartNote(args, started), /^🤖 Subagent „File Creator Subagent“ gestartet · 0db6b1dc · Gemini 4 Neon · Reasoning high\n/);
-		assert.match(subagentStartNote({ agentRole: "x", model: "flash" }, undefined), /^🤖 Subagent „x“ gestartet · flash \(angefordert\)\n/);
-		assert.match(subagentStartNote({ agentRole: "a, b", agentCount: 2 }, undefined), /^🤖 2 Subagenten \(a, b\) gestartet\n/);
+		assert.match(subagentStartNote(args, started), /^🤖 Subagent "File Creator Subagent" started · 0db6b1dc · Gemini 4 Neon · Reasoning high\n/);
+		assert.match(subagentStartNote({ agentRole: "x", model: "flash" }, undefined), /^🤖 Subagent "x" started · flash \(requested\)\n/);
+		assert.match(subagentStartNote({ agentRole: "a, b", agentCount: 2 }, undefined), /^🤖 2 subagents \(a, b\) started\n/);
 	});
 
 	it("follows the subagents of the watched conversation and shows them in the widget", () => {
@@ -434,7 +434,7 @@ describe("agy subagents", () => {
 
 			const lines = renderActivityLines(snapshot, Date.parse("2026-11-25T14:46:30Z"), 0, plainTheme);
 			assert.deepEqual(lines, [
-				"Antigravity · 1 Subagent",
+				"Antigravity · 1 subagent",
 				" ⠋ 0db6b1dc  File Creator Subagent  0:02  Gemini 4 Neon · Reasoning high  → write_file /tmp/agy-test/hallo.txt",
 			]);
 
@@ -444,7 +444,7 @@ describe("agy subagents", () => {
 			assert.equal(idle?.state, "idle");
 			assert.match(
 				renderActivityLines({ ...snapshot, subagents: idle ? [idle] : [] }, Date.parse("2026-11-25T14:46:43Z"), 0, plainTheme)[1],
-				/✓ 0db6b1dc {2}File Creator Subagent {2}0:13 {2}Gemini 4 Neon · Reasoning high {2}fertig: Die Datei wurde angelegt/,
+				/✓ 0db6b1dc {2}File Creator Subagent {2}0:13 {2}Gemini 4 Neon · Reasoning high {2}done: Die Datei wurde angelegt/,
 			);
 		} finally {
 			fs.rmSync(brain, { recursive: true, force: true });
@@ -468,10 +468,10 @@ describe("background activity display", () => {
 			plainTheme,
 		);
 		assert.deepEqual(lines, [
-			"Antigravity · 2 Hintergrund-Tasks",
+			"Antigravity · 2 background tasks",
 			" ⠋ task-2  Background sleep task  0:40  step 2",
-			" ⠋ task-6  Timer 30 s  0:19  noch 11 s",
-			" ⠋ arbeitet selbstständig  0:03  1 Tool-Aufruf",
+			" ⠋ task-6  Timer 30 s  0:19  11 s left",
+			" ⠋ working on its own  0:03  1 tool call",
 		]);
 	});
 
@@ -481,7 +481,7 @@ describe("background activity display", () => {
 		const live = { startedAtMs: now - 4_000, lastAtMs: now - 500, text: "Erste Zeile\nDer Timer ist abgelaufen.", toolCalls: 1, thinking: false };
 		assert.deepEqual(renderActivityLines({ ...base, live }, now, 1, plainTheme), [
 			"Antigravity",
-			" ⠙ arbeitet selbstständig  0:04  1 Tool-Aufruf  Der Timer ist abgelaufen.",
+			" ⠙ working on its own  0:04  1 tool call  Der Timer ist abgelaufen.",
 		]);
 		assert.match(renderActivityLines({ ...base, live: { ...live, tool: "Run manage_task" } }, now, 1, plainTheme)[1], /→ Run manage_task$/);
 		assert.deepEqual(renderActivityLines({ ...base, live: { ...live, lastAtMs: now - LIVE_STALE_MS - 1 } }, now, 1, plainTheme), []);
@@ -508,10 +508,10 @@ describe("background activity display", () => {
 		const turn = deriveAgyActivity(steps(transcriptLines()), messages).turns[1];
 		const data = toAutonomousEntryData(CONV, { ...turn, model: "gemini-4-neon-xhigh", actions: [{ name: "run_command", summary: "echo hi" }] });
 		const collapsed = renderAutonomousEntry(data, false, plainTheme, (text) => new Text(text, 0, 0)).render(120).join("\n");
-		assert.match(collapsed, /Antigravity · selbstständig · \d\d:\d\d:\d\d · Gemini 4 Neon · Reasoning xhigh/);
+		assert.match(collapsed, /Antigravity · on its own · \d\d:\d\d:\d\d · Gemini 4 Neon · Reasoning xhigh/);
 		assert.match(collapsed, /✓ task-2 · Background sleep task finished \(Exit 0\)/);
 		assert.match(collapsed, /Ausgabe: fertig/);
-		assert.match(collapsed, /1 Tool-Aufruf/);
+		assert.match(collapsed, /1 tool call/);
 		assert.doesNotMatch(collapsed, /echo hi/);
 		const expanded = renderAutonomousEntry(data, true, plainTheme, (text) => new Text(text, 0, 0)).render(80).join("\n");
 		assert.match(expanded, /→ run_command echo hi/);

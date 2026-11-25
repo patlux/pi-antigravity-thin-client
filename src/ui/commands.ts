@@ -199,11 +199,11 @@ export const THIN_CLIENT_FIXED_MODE =
 
 const SUBCOMMANDS: AutocompleteItem[] = [
 	{ value: "status", label: "status", description: "Antigravity CLI, subscription tier, execution mode and session" },
-	{ value: "agent-mode", label: "agent-mode", description: "切换 AGY 原生执行模式 (default | accept-edits | plan)" },
-	{ value: "refresh", label: "refresh", description: "重新探测当前账号可用的模型与思考档位" },
-	{ value: "sessions", label: "sessions", description: "浏览本机 AGY 会话并导入至当前 Pi 会话" },
-	{ value: "login", label: "login", description: "执行官方 agy 终端登录授权" },
-	{ value: "logout", label: "logout", description: "登出当前 AGY 账号凭据" },
+	{ value: "agent-mode", label: "agent-mode", description: "Switch agy's own execution mode (default | accept-edits | plan)" },
+	{ value: "refresh", label: "refresh", description: "Reload the models and thinking levels of this account" },
+	{ value: "sessions", label: "sessions", description: "Browse local agy sessions and import one into Pi" },
+	{ value: "login", label: "login", description: "Sign in with the official agy CLI" },
+	{ value: "logout", label: "logout", description: "Sign out of the agy account" },
 ];
 
 function buildCompletions(prefix: string): AutocompleteItem[] | null {
@@ -221,9 +221,9 @@ function buildCompletions(prefix: string): AutocompleteItem[] | null {
 
 	if (sub === "agent-mode" && parts.length === 2) {
 		return [
-			{ value: "agent-mode default", label: "default", description: "修改与执行命令前按权限规则询问" },
-			{ value: "agent-mode accept-edits", label: "accept-edits", description: "自动批准工作区内文件编辑" },
-			{ value: "agent-mode plan", label: "plan", description: "先规划方案再执行操作" },
+			{ value: "agent-mode default", label: "default", description: "Ask before edits and commands, as the permission rules say" },
+			{ value: "agent-mode accept-edits", label: "accept-edits", description: "Approve file edits in the workspace automatically" },
+			{ value: "agent-mode plan", label: "plan", description: "Plan first, then act" },
 		].filter((i) => i.value.startsWith(`agent-mode ${arg1}`));
 	}
 
@@ -261,13 +261,13 @@ export function registerAntigravityCommands(deps: CommandDependencies): void {
 					return;
 				}
 				case "refresh": {
-					ctx.ui.notify("正在探测 Antigravity 可用模型目录...", "info");
+					ctx.ui.notify("Loading the Antigravity model catalog …", "info");
 					try {
 						const count = await onRefreshProviderModels(ctx);
-						ctx.ui.notify(`已刷新 Antigravity 模型目录（共 ${count} 个可用模型）。`, "info");
+						ctx.ui.notify(`Antigravity model catalog reloaded (${count} models).`, "info");
 					} catch (error) {
 						ctx.ui.notify(
-							`模型刷新失败：${error instanceof Error ? error.message : String(error)}`,
+							`Model reload failed: ${error instanceof Error ? error.message : String(error)}`,
 							"error",
 						);
 					}
@@ -288,7 +288,7 @@ export function registerAntigravityCommands(deps: CommandDependencies): void {
 				}
 				default: {
 					ctx.ui.notify(
-						`未知子命令 "${sub}"。可用子命令：status, agent-mode, refresh, sessions, login, logout`,
+						`Unknown subcommand "${sub}". Available: status, agent-mode, refresh, sessions, login, logout`,
 						"warning",
 					);
 				}
@@ -307,20 +307,20 @@ async function handleStatusSubcommand(
 	const ver = bin ? probeAgyVersion(bin) : undefined;
 
 	const lines = [
-		`Antigravity CLI：${bin ? `${bin.binPath}${ver ? ` (v${ver})` : ""}` : "未找到可执行文件"}`,
-		`订阅层级：${telemetry.tier ? `${telemetry.tier.name}` : "待首次连接探测"}`,
+		`Antigravity CLI: ${bin ? `${bin.binPath}${ver ? ` (v${ver})` : ""}` : "not found"}`,
+		`Subscription: ${telemetry.tier ? `${telemetry.tier.name}` : "known after the first connection"}`,
 		"Thin client: Antigravity's own tools; Pi MCP, skills and AGENTS.md are never passed on",
-		`AGY 原生执行策略：${cfg.agyExecutionMode}`,
-		`活跃会话：${telemetry.agySessionId ?? "无（将在下次提问时按需创建）"}`,
+		`agy execution mode: ${cfg.agyExecutionMode}`,
+		`Active session: ${telemetry.agySessionId ?? "none (created with the next prompt)"}`,
 	];
 
 	if (typeof telemetry.usedTokens === "number") {
 		const winText = telemetry.windowSize ? ` / ${telemetry.windowSize.toLocaleString()}` : "";
-		lines.push(`实时后端上下文占用：${telemetry.usedTokens.toLocaleString()}${winText} tokens`);
+		lines.push(`Context used in agy: ${telemetry.usedTokens.toLocaleString()}${winText} tokens`);
 	}
 
 	if (ctx.hasUI) {
-		await ctx.ui.select("Antigravity 状态总览（按 Esc 关闭）", lines);
+		await ctx.ui.select("Antigravity status (Esc closes)", lines);
 	} else {
 		ctx.ui.notify(lines.join("\n"), "info");
 	}
@@ -336,15 +336,15 @@ async function handleAgentModeSubcommand(
 
 	if (!chosen || !valid.includes(chosen)) {
 		if (!ctx.hasUI) {
-			ctx.ui.notify("用法：/agy agent-mode <default | accept-edits | plan>", "warning");
+			ctx.ui.notify("Usage: /agy agent-mode <default | accept-edits | plan>", "warning");
 			return;
 		}
 		const picked = await ctx.ui.select(
-			`选择 AGY 原生执行模式（当前：${coordinator.config.agyExecutionMode}）`,
+			`agy execution mode (current: ${coordinator.config.agyExecutionMode})`,
 			[
-				"default — 修改文件与执行命令前按权限设置询问",
-				"accept-edits — 自动批准工作区内文件修改",
-				"plan — 先输出规划方案再执行",
+				"default — ask before edits and commands, as the permission settings say",
+				"accept-edits — approve file edits in the workspace automatically",
+				"plan — write a plan first, then act",
 			],
 		);
 		if (!picked) return;
@@ -360,7 +360,7 @@ async function handleAgentModeSubcommand(
 	await coordinator.applyExecutionModeLive(chosen);
 	updateAntigravityStatusBar(ctx, nextConfig, coordinator.getTelemetrySnapshot());
 
-	ctx.ui.notify(`已将 AGY 原生执行模式设为 ${chosen}。`, "info");
+	ctx.ui.notify(`agy execution mode set to ${chosen}.`, "info");
 }
 
 async function handleLoginSubcommand(
@@ -373,14 +373,14 @@ async function handleLoginSubcommand(
 		geminiDir: coordinator.config.geminiDir,
 	});
 	if (!bin) {
-		ctx.ui.notify("未找到本机 agy 可执行文件，请先安装 Antigravity CLI。", "error");
+		ctx.ui.notify("agy not found on this machine. Install the Antigravity CLI first.", "error");
 		return;
 	}
 
 	if (ctx.mode === "tui") {
 		const confirmed = await ctx.ui.confirm(
-			"Antigravity 登录说明",
-			"认证凭据由官方 agy CLI 本地管理，本扩展不读取或保存任何令牌。\n是否在当前终端启动官方 `agy acp --login` 完成授权？",
+			"Antigravity sign-in",
+			"The official agy CLI keeps the credentials locally; this extension never reads or stores tokens.\nStart `agy acp --login` in this terminal now?",
 		);
 		if (!confirmed) return;
 
@@ -411,14 +411,14 @@ async function handleLoginSubcommand(
 
 		if (exitStatus === 0) {
 			const count = await onRefreshProviderModels(ctx);
-			ctx.ui.notify(`登录完成，已加载 ${count} 个可用模型。`, "info");
+			ctx.ui.notify(`Signed in; ${count} models loaded.`, "info");
 		} else {
-			ctx.ui.notify("登录流程未完成，也可在独立终端执行 `agy acp --login` 后运行 `/agy refresh`。", "warning");
+			ctx.ui.notify("The sign-in did not complete. You can also run `agy acp --login` in a separate terminal and then `/agy refresh`.", "warning");
 		}
 		return;
 	}
 
-	ctx.ui.notify("请在终端执行 `agy acp --login` 完成登录，随后运行 `/agy refresh` 刷新模型。", "info");
+	ctx.ui.notify("Run `agy acp --login` in a terminal to sign in, then `/agy refresh` to load the models.", "info");
 }
 
 async function handleLogoutSubcommand(
@@ -430,10 +430,10 @@ async function handleLogoutSubcommand(
 		const conn = await processManager.acquire(coordinator.config);
 		await conn.request("auth/logout", {}, { timeoutMs: 10_000 });
 		await coordinator.dispose();
-		ctx.ui.notify("已登出 Antigravity 账号。", "info");
+		ctx.ui.notify("Signed out of Antigravity.", "info");
 	} catch (error) {
 		ctx.ui.notify(
-			`登出失败：${error instanceof Error ? error.message : String(error)}`,
+			`Sign-out failed: ${error instanceof Error ? error.message : String(error)}`,
 			"error",
 		);
 	}
@@ -445,7 +445,7 @@ async function handleSessionsImportSubcommand(
 	coordinator: TurnCoordinator,
 ): Promise<void> {
 	if (!ctx.hasUI) {
-		ctx.ui.notify("浏览并导入历史会话需要交互式界面支持。", "warning");
+		ctx.ui.notify("Browsing and importing sessions needs the interactive UI.", "warning");
 		return;
 	}
 
@@ -458,18 +458,18 @@ async function handleSessionsImportSubcommand(
 
 	const sessions: AcpSessionSummary[] = listRes.sessions ?? [];
 	if (sessions.length === 0) {
-		ctx.ui.notify("未找到可导入的本机 Antigravity 历史会话。", "info");
+		ctx.ui.notify("No local Antigravity sessions to import.", "info");
 		return;
 	}
 
 	const topSessions = sessions.slice(0, 30);
 	const labels = topSessions.map((s) => {
-		const title = s.title?.trim() || "(无标题会话)";
+		const title = s.title?.trim() || "(untitled session)";
 		const time = s.updatedAt ? ` · ${s.updatedAt}` : "";
 		return `${title}${time} [${s.sessionId.slice(0, 8)}]`;
 	});
 
-	const pickedLabel = await ctx.ui.select("选择要导入到新 Pi 会话的 AGY 会话", labels);
+	const pickedLabel = await ctx.ui.select("agy session to import into a new Pi session", labels);
 	if (!pickedLabel) return;
 
 	const idx = labels.indexOf(pickedLabel);
@@ -668,10 +668,10 @@ async function handleSessionsImportSubcommand(
 		withSession: async (replacedCtx) => {
 			const modelHint =
 				replacedCtx.model?.provider !== ANTIGRAVITY_PROVIDER_ID
-					? " 当前模型非 Antigravity，请先使用 `/model` 切换至 `antigravity` 分组模型以无缝续接该会话。"
+					? " The current model is not an Antigravity model; select an `antigravity/…` model with `/model` to continue this conversation."
 					: "";
 			replacedCtx.ui.notify(
-				`已导入会话 "${target.title || target.sessionId.slice(0, 8)}"（共 ${replayedMessages.length} 条消息）。${modelHint}`,
+				`Imported session "${target.title || target.sessionId.slice(0, 8)}" (${replayedMessages.length} messages).${modelHint}`,
 				"info",
 			);
 		},

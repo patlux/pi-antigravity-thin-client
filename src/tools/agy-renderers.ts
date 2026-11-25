@@ -160,9 +160,9 @@ export function getMirrorToolRenderers(toolName: AgyMirrorToolName): ToolRendere
 					const count =
 						typeof args?.agentCount === "number" && args.agentCount > 1 ? `${args.agentCount}× ` : "";
 					const model =
-						(typeof args?.model === "string" && `${args.model} (angefordert)`) ||
+						(typeof args?.model === "string" && `${args.model} (requested)`) ||
 						(typeof args?.parentModel === "string" && formatAgyModel(args.parentModel)) ||
-						(args?.agentType === "self" ? "Modell wie Hauptagent" : typeof args?.agentType === "string" ? args.agentType : "");
+						(args?.agentType === "self" ? "same model as the main agent" : typeof args?.agentType === "string" ? args.agentType : "");
 					return new Text(
 						`${theme.fg("toolTitle", theme.bold("subagent"))} ${count}${theme.fg("accent", role)}${model ? theme.fg("muted", ` · ${model}`) : ""}${duration}`,
 						0,
@@ -175,7 +175,7 @@ export function getMirrorToolRenderers(toolName: AgyMirrorToolName): ToolRendere
 						return new Text(`${theme.fg("toolTitle", theme.bold("⏰ timer"))}${duration}`, 0, 0);
 					}
 					if (internalTool === "manage_task") {
-						return new Text(`${theme.fg("toolTitle", theme.bold("task"))} ${theme.fg("muted", "Hintergrund-Task abfragen/steuern")}${duration}`, 0, 0);
+						return new Text(`${theme.fg("toolTitle", theme.bold("task"))} ${theme.fg("muted", "query or control a background task")}${duration}`, 0, 0);
 					}
 					if (internalTool) {
 						return new Text(`${theme.fg("toolTitle", theme.bold(internalTool))}${duration}`, 0, 0);

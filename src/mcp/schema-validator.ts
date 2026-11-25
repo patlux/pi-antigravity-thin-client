@@ -138,7 +138,7 @@ function validateNode(
 	if ("const" in schema && !deepEqualPrimitiveOrJson(value, schema.const)) {
 		issues.push({
 			path: currentPath,
-			message: `期望固定值 ${JSON.stringify(schema.const)}，实际收到 ${JSON.stringify(value)}`,
+			message: `expected the constant ${JSON.stringify(schema.const)}, got ${JSON.stringify(value)}`,
 		});
 		return;
 	}
@@ -148,7 +148,7 @@ function validateNode(
 		if (!matched) {
 			issues.push({
 				path: currentPath,
-				message: `值必须属于枚举集合 ${JSON.stringify(schema.enum)}，实际收到 ${JSON.stringify(value)}`,
+				message: `value must be one of ${JSON.stringify(schema.enum)}, got ${JSON.stringify(value)}`,
 			});
 			return;
 		}
@@ -186,7 +186,7 @@ function validateNode(
 		if (!branchValid) {
 			issues.push({
 				path: currentPath,
-				message: `参数未匹配 anyOf 中的任一候选结构（实际类型：${getJsonType(value)}）`,
+				message: `value matches none of the anyOf schemas (actual type: ${getJsonType(value)})`,
 			});
 			return;
 		}
@@ -209,7 +209,7 @@ function validateNode(
 		if (okCount === 0) {
 			issues.push({
 				path: currentPath,
-				message: `参数未匹配 oneOf 中的任一候选结构（实际类型：${getJsonType(value)}）`,
+				message: `value matches none of the oneOf schemas (actual type: ${getJsonType(value)})`,
 			});
 			return;
 		}
@@ -225,7 +225,7 @@ function validateNode(
 		if (allowedTypes.length > 0 && !allowedTypes.some((t) => matchesSingleType(value, t))) {
 			issues.push({
 				path: currentPath,
-				message: `期望类型 ${allowedTypes.join(" | ")}，实际收到 ${getJsonType(value)}`,
+				message: `expected type ${allowedTypes.join(" | ")}, got ${getJsonType(value)}`,
 			});
 			return;
 		}
@@ -235,13 +235,13 @@ function validateNode(
 		if (typeof schema.minLength === "number" && value.length < schema.minLength) {
 			issues.push({
 				path: currentPath,
-				message: `字符串长度至少为 ${schema.minLength}，实际为 ${value.length}`,
+				message: `string must have at least ${schema.minLength} characters, got ${value.length}`,
 			});
 		}
 		if (typeof schema.maxLength === "number" && value.length > schema.maxLength) {
 			issues.push({
 				path: currentPath,
-				message: `字符串长度上限为 ${schema.maxLength}，实际为 ${value.length}`,
+				message: `string must have at most ${schema.maxLength} characters, got ${value.length}`,
 			});
 		}
 	}
@@ -250,13 +250,13 @@ function validateNode(
 		if (typeof schema.minimum === "number" && value < schema.minimum) {
 			issues.push({
 				path: currentPath,
-				message: `数值不能小于 ${schema.minimum}，实际为 ${value}`,
+				message: `number must be at least ${schema.minimum}, got ${value}`,
 			});
 		}
 		if (typeof schema.maximum === "number" && value > schema.maximum) {
 			issues.push({
 				path: currentPath,
-				message: `数值不能大于 ${schema.maximum}，实际为 ${value}`,
+				message: `number must be at most ${schema.maximum}, got ${value}`,
 			});
 		}
 	}
@@ -265,7 +265,7 @@ function validateNode(
 		if (typeof schema.minItems === "number" && value.length < schema.minItems) {
 			issues.push({
 				path: currentPath,
-				message: `数组元素数量至少为 ${schema.minItems}，实际为 ${value.length}`,
+				message: `array must have at least ${schema.minItems} items, got ${value.length}`,
 			});
 		}
 		if (schema.items && typeof schema.items === "object" && !Array.isArray(schema.items)) {
@@ -293,7 +293,7 @@ function validateNode(
 				if (typeof reqKey === "string" && !(reqKey in record)) {
 					issues.push({
 						path: currentPath === "$" ? `$.${reqKey}` : `${currentPath}.${reqKey}`,
-						message: `缺少必填字段 "${reqKey}"`,
+						message: `missing required field "${reqKey}"`,
 					});
 				}
 			}
@@ -315,7 +315,7 @@ function validateNode(
 				} else if (schema.additionalProperties === false && !compositeKeys?.has(key)) {
 					issues.push({
 						path: currentPath === "$" ? `$.${key}` : `${currentPath}.${key}`,
-						message: `包含未声明的多余字段 "${key}"`,
+						message: `unexpected field "${key}"`,
 					});
 				}
 			}

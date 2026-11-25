@@ -47,7 +47,7 @@ The package cannot tell a person from a program that types into the terminal. Ne
 ## What it shows
 
 - **Background tasks.** Antigravity moves long commands and `schedule` timers into background tasks. A widget above the editor lists each running task with its run time, the last line of its log or the timer countdown. The footer shows `agy ⏳ <count>`.
-- **Turns Antigravity takes on its own.** When a background task, a timer or a subagent finishes, Antigravity wakes up and continues without a prompt from Pi. The widget shows such a turn live (current tool, last line of the answer). When it ends, a card "Antigravity · selbstständig" shows what woke Antigravity and its answer. The card is stored in the Pi session but is never sent to a model.
+- **Turns Antigravity takes on its own.** When a background task, a timer or a subagent finishes, Antigravity wakes up and continues without a prompt from Pi. The widget shows such a turn live (current tool, last line of the answer). When it ends, a card "Antigravity · on its own" shows what woke Antigravity and its answer. The card is stored in the Pi session but is never sent to a model.
 - **Subagents.** The `invoke_subagent` tool card names the subagent's role, model with reasoning level, and task. The widget lists each running subagent with the model and reasoning level it runs on and what it does right now. Cards for turns Antigravity took on its own name the model of that turn.
 - **Messages typed while Antigravity works.** They do not cancel the running Antigravity turn, because a cancel would also stop its background tasks and subagents. The message waits and goes out as the next prompt when the turn ends. Esc still cancels.
 
@@ -55,7 +55,7 @@ The display reads Antigravity's local conversation files (`~/.gemini/antigravity
 
 `PI_AGY_TRACE=1` (or a file path) writes every `session/update` from Antigravity to a local JSONL file, for debugging.
 
-Most interface texts come from upstream and are in Chinese; texts added by this fork are in English or German.
+All interface texts are in English. Upstream's texts were Chinese and are translated here; source comments from upstream stay Chinese.
 
 ## Upstream
 

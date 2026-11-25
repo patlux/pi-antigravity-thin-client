@@ -9,6 +9,10 @@ Fork releases of pi-antigravity-thin-client. The upstream changelog of pi-antigr
 - `/agy mode` and `/agy bridge`. The thin client always uses Antigravity's own tools and never passes Pi's MCP servers, skills or `AGENTS.md`; both subcommands now only say so.
 - The `AGY:native(default)` footer badge. It showed the tool mode, which nobody can change here.
 
+### Changed
+
+- All interface texts are English: upstream's Chinese notifications, errors and `/agy` help, and the fork's German widget, card and tool texts. The autonomous-turn card is now "Antigravity · on its own".
+
 ### Fixed
 
 - `/agy mode pi-tools` reported a switch, saved `toolMode` to `antigravity.json` and took Antigravity's mirror tools out of Pi's active tools, while the bridge kept running agy-tools.

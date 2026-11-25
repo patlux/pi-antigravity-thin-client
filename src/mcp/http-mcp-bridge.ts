@@ -452,7 +452,7 @@ export class LocalHttpMcpBridge {
 					this.server = srv;
 					resolve();
 				} else {
-					reject(new Error("无法获取本地 HTTP MCP 服务监听端口"));
+					reject(new Error("Could not get the port of the local HTTP MCP server"));
 				}
 			});
 		});

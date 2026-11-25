@@ -479,7 +479,7 @@ export class TurnCoordinator {
 		const ctx = this.activeContext;
 		if (ctx?.hasUI) {
 			ctx.ui.notify(
-				"Antigravity arbeitet noch. Deine Nachricht geht raus, sobald der laufende Schritt fertig ist (ohne Abbruch).",
+				"Antigravity is still working. Your message goes out when the current step ends; nothing is cancelled.",
 				"info",
 			);
 		}
@@ -491,7 +491,7 @@ export class TurnCoordinator {
 		ledger.deferredSteerBlocks = undefined;
 		const ctx = this.activeContext;
 		if (ctx?.hasUI) {
-			ctx.ui.notify("Antigravity: deine Zwischennachricht wurde nicht gesendet, weil der Schritt abgebrochen wurde.", "warning");
+			ctx.ui.notify("Antigravity: your waiting message was not sent because the step was cancelled.", "warning");
 		}
 	}
 
@@ -2928,10 +2928,10 @@ export class TurnCoordinator {
 				(option.kind === "reject_once" || option.kind === "reject_always"),
 		);
 		if (pump && rejected) {
-			const title = params.toolCall?.title ?? "Antigravity 工具";
+			const title = params.toolCall?.title ?? "Antigravity tool";
 			pump.permissionDeclined = canPrompt
-				? `工具未获批准：${title}`
-				: `「${title}」需要批准。请在 Pi 交互模式中重试并确认。`;
+				? `Tool not approved: ${title}`
+				: `"${title}" needs approval. Try again in an interactive Pi session and approve it.`;
 		}
 		return result;
 	}

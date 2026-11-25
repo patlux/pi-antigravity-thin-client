@@ -134,7 +134,7 @@ export class BackgroundActivityController {
 		if (context.kind === "execute" && context.command) {
 			const task = watcher.findCommandTask(context.command);
 			if (task) {
-				return `⏳ Läuft im Hintergrund als ${task.taskId}. Fortschritt und Ergebnis zeigt die Antigravity-Anzeige über dem Eingabefeld.`;
+				return `⏳ Running in the background as ${task.taskId}. The Antigravity panel above the editor shows its progress and result.`;
 			}
 		}
 		if (context.toolName === "invoke_subagent") {
@@ -143,7 +143,7 @@ export class BackgroundActivityController {
 		if (context.toolName === "schedule") {
 			const timer = watcher.latestTimer();
 			if (timer) {
-				return `⏰ Timer ${timer.timerSeconds ?? "?"} s gestellt (${timer.taskId}). Läuft er ab, macht Antigravity von selbst weiter.`;
+				return `⏰ Timer set for ${timer.timerSeconds ?? "?"} s (${timer.taskId}). When it expires, Antigravity continues on its own.`;
 			}
 		}
 		return undefined;
@@ -187,7 +187,7 @@ export class BackgroundActivityController {
 		this.pi.appendEntry(AUTONOMOUS_ENTRY_TYPE, toAutonomousEntryData(agySessionId, turn));
 		const ctx = this.coordinator.getActiveContext();
 		if (ctx?.hasUI) {
-			ctx.ui.notify("Antigravity hat selbstständig weitergearbeitet", "info");
+			ctx.ui.notify("Antigravity continued on its own", "info");
 		}
 	}
 }

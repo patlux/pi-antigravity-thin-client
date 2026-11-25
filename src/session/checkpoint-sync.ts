@@ -1217,7 +1217,7 @@ export async function forkSqliteConversationAtCheckpoint(
 			watermarks.executions < checkpoint.executions ||
 			computeStepsPrefixFingerprint(dstDb, checkpoint.steps) !== checkpoint.fingerprint
 		) {
-			throw new Error("SQLite 会话副本与历史检查点不匹配");
+			throw new Error("SQLite session copy does not match the saved checkpoint");
 		}
 		const origMeta = dstDb
 			.prepare("SELECT trajectory_id FROM trajectory_meta LIMIT 1")

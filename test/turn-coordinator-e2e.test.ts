@@ -1273,7 +1273,7 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 				choice = value;
 				const declined = await run(`declined-${value}`);
 				assert.equal(declined.stopReason, "error");
-				assert.match(declined.errorMessage ?? "", /未获批准/);
+				assert.match(declined.errorMessage ?? "", /Tool not approved/);
 			}
 			choice = "Allow";
 			const approved = await run("approved");

@@ -585,7 +585,7 @@ export class AgyTurnMirrorBroker {
 				params.toolCall?.title || callState?.title || params.toolCall?.kind || "Antigravity Tool";
 			const labels = params.options.map((opt) => opt.name || opt.optionId);
 			const selectedLabel = await uiCtx.ui.select(
-				`授权确认：${toolTitle}`,
+				`Approve: ${toolTitle}`,
 				labels,
 				{ signal },
 			);
@@ -624,8 +624,8 @@ export class AgyTurnMirrorBroker {
 		const signal = uiCtx.signal;
 		if (params.mode === "url" && params.url) {
 			const confirmed = await uiCtx.ui.confirm(
-				params.message || "外部授权确认",
-				`请确认是否已完成访问：${params.url}`,
+				params.message || "Confirm external authorization",
+				`Confirm once you have completed this step: ${params.url}`,
 				{ signal },
 			);
 			return { action: confirmed ? "accept" : "decline" };
@@ -633,7 +633,7 @@ export class AgyTurnMirrorBroker {
 
 		const props = params.requestedSchema?.properties;
 		if (!props || Object.keys(props).length === 0) {
-			const answer = await uiCtx.ui.input(params.message || "请输入回复", undefined, { signal });
+			const answer = await uiCtx.ui.input(params.message || "Your answer", undefined, { signal });
 			if (answer === undefined) {
 				return { action: "cancel" };
 			}
@@ -664,11 +664,11 @@ export class AgyTurnMirrorBroker {
 			}
 
 			if (propSchema.type === "boolean") {
-				const picked = await uiCtx.ui.select(promptTitle, ["是 (Yes)", "否 (No)"], { signal });
+				const picked = await uiCtx.ui.select(promptTitle, ["Yes", "No"], { signal });
 				if (picked === undefined) {
 					return { action: "cancel" };
 				}
-				content[key] = picked.startsWith("是");
+				content[key] = picked === "Yes";
 				continue;
 			}
 

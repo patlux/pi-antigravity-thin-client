@@ -145,6 +145,7 @@ git merge upstream/main
 
 - `README.md` and `CHANGELOG.md` belong to the fork. Take the upstream changes to them into `docs/upstream/README.zh-CN.md` and `docs/upstream/CHANGELOG.md`.
 - Review every upstream change for anything that sends Antigravity content the user did not type, and neutralize it: prompts made up by the bridge ("Continue."), automatic retries or continuations, replayed or preloaded history, auxiliary requests, Pi MCP/skill/`AGENTS.md` bridges, writes to Antigravity's databases, other tool modes than `agy-tools`.
+- Translate new Chinese interface texts from upstream to English; `test/interface-language.test.ts` fails until every string literal in `src/` is English. Comments may stay Chinese.
 - New upstream tests for disabled features get `{ skip: THIN_CLIENT_DISABLED }`; tests for features the fork keeps run with typed input (`test/human-input.ts`).
 - `npm run check` must pass with the thin-client tests unchanged. Add a regression test when an upstream change opens a new path to Antigravity.
 - Release the merge as a new fork version and name the new upstream base in the changelog.

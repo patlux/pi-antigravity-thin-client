@@ -533,15 +533,15 @@ export function deriveSubagentStatus(
 	const waitingFor = pending.at(-1);
 	const waitingText = waitingFor
 		? waitingFor.kind === "timer"
-			? `wartet auf Timer ${waitingFor.timerSeconds ?? "?"} s`
-			: `wartet auf ${waitingFor.summary ?? waitingFor.description}`
+			? `waiting for timer ${waitingFor.timerSeconds ?? "?"} s`
+			: `waiting for ${waitingFor.summary ?? waitingFor.description}`
 		: undefined;
 	if (record.state === "SUBAGENT_STATE_KILLED") {
 		state = "killed";
-		activity = "beendet";
+		activity = "stopped";
 	} else if (!lastPlanner) {
 		state = "working";
-		activity = "startet …";
+		activity = "starting …";
 	} else if (lastPlanner.toolCalls.length > 0) {
 		state = "working";
 		if (waitingFor && waitingText && waitingFor.stepIndex > lastPlanner.index) {
@@ -549,7 +549,7 @@ export function deriveSubagentStatus(
 			// ends the turn a little later).
 			activity = waitingText;
 		} else if (last && last.index > lastPlanner.index && last.type !== "GENERIC") {
-			activity = "denkt nach …";
+			activity = "thinking …";
 		} else {
 			const action = summarizeAction(lastPlanner.toolCalls[0]);
 			const more = lastPlanner.toolCalls.length > 1 ? ` (+${lastPlanner.toolCalls.length - 1})` : "";
@@ -558,7 +558,7 @@ export function deriveSubagentStatus(
 	} else if (last && last.index > lastPlanner.index) {
 		// A message arrived after its last answer: it works again.
 		state = "working";
-		activity = "denkt nach …";
+		activity = "thinking …";
 	} else if (waitingText) {
 		// An answer without tool calls ends its turn, but it still waits for a timer
 		// or background command: it is not done.

@@ -166,17 +166,17 @@ export function describeTrigger(trigger: AutonomousTrigger, theme: ThemeLike): s
 		const who = role
 			? `${theme.fg("toolTitle", role)} ${theme.fg("muted", trigger.agentId.slice(0, 8))}`
 			: theme.fg("muted", `Subagent ${trigger.agentId.slice(0, 8)}`);
-		const what = trigger.preview ?? (role ? "Nachricht" : (trigger.title ?? "Nachricht"));
+		const what = trigger.preview ?? (role ? "message" : (trigger.title ?? "message"));
 		return `${theme.fg("accent", "✉")} ${who}: ${what}`;
 	}
 	const fallback =
 		trigger.outcome === "running"
-			? "läuft noch"
+			? "still running"
 			: trigger.kind === "timer"
-				? "Timer abgelaufen"
+				? "timer expired"
 				: trigger.taskId
-					? "Task beendet"
-					: "Nachricht";
+					? "task finished"
+					: "message";
 	const label = trigger.title ?? fallback;
 	const exit =
 		trigger.exitCode !== undefined && trigger.kind !== "timer" ? ` (Exit ${trigger.exitCode})` : "";
@@ -200,7 +200,7 @@ export function renderAutonomousEntry(
 	const model = formatAgyModel(data.model);
 	box.addChild(
 		new Text(
-			`${theme.fg("customMessageLabel", theme.bold("Antigravity · selbstständig"))}${clock ? theme.fg("dim", ` · ${clock}`) : ""}${model ? theme.fg("muted", ` · ${model}`) : ""}`,
+			`${theme.fg("customMessageLabel", theme.bold("Antigravity · on its own"))}${clock ? theme.fg("dim", ` · ${clock}`) : ""}${model ? theme.fg("muted", ` · ${model}`) : ""}`,
 			0,
 			0,
 		),
@@ -218,14 +218,14 @@ export function renderAutonomousEntry(
 			(action) => `${theme.fg("muted", "→")} ${theme.fg("toolTitle", action.name)} ${theme.fg("dim", action.summary)}`,
 		);
 		if (!expanded) {
-			const count = data.actions.length === 1 ? "1 Tool-Aufruf" : `${data.actions.length} Tool-Aufrufe`;
+			const count = data.actions.length === 1 ? "1 tool call" : `${data.actions.length} tool calls`;
 			lines.push(`${theme.fg("muted", count)}${expandHint ? ` ${expandHint}` : ""}`);
 		}
 		box.addChild(new Spacer(1));
 		box.addChild(new Text(lines.join("\n"), 0, 0));
 	}
 	if (data.state === "interrupted") {
-		box.addChild(new Text(theme.fg("warning", "Unterbrochen durch deine Nachricht; der Rest steht im Verlauf."), 0, 0));
+		box.addChild(new Text(theme.fg("warning", "Interrupted by your message; the rest is in the conversation."), 0, 0));
 	}
 	return box;
 }
@@ -243,8 +243,8 @@ const MAX_SUBAGENT_LINES = 6;
 export function subagentModelLabel(status: SubagentStatus): string {
 	const model = formatAgyModel(status.model);
 	if (model) return model;
-	if (status.requestedModel) return `${status.requestedModel} (angefordert)`;
-	if (status.typeName === "self") return "Modell wie Hauptagent";
+	if (status.requestedModel) return `${status.requestedModel} (requested)`;
+	if (status.typeName === "self") return "same model as the main agent";
 	return status.typeName ?? "";
 }
 
@@ -261,17 +261,17 @@ export function subagentStartNote(
 	const startedModel = started ? subagentModelLabel(started) : "";
 	const model =
 		startedModel ||
-		(typeof args.model === "string" ? `${args.model} (angefordert)` : undefined) ||
-		(args.agentType === "self" ? "Modell wie Hauptagent" : undefined);
-	const who = count > 1 ? `${count} Subagenten (${role ?? "ohne Rolle"})` : `Subagent „${role ?? "ohne Rolle"}“`;
+		(typeof args.model === "string" ? `${args.model} (requested)` : undefined) ||
+		(args.agentType === "self" ? "same model as the main agent" : undefined);
+	const who = count > 1 ? `${count} subagents (${role ?? "no role"})` : `Subagent "${role ?? "no role"}"`;
 	const details = [started?.conversationId.slice(0, 8), model].filter((part) => part !== undefined).join(" · ");
 	const lines = [
-		`🤖 ${who} gestartet${details ? ` · ${details}` : ""}`,
-		"Was er gerade tut, zeigt die Antigravity-Anzeige über dem Eingabefeld.",
+		`🤖 ${who} started${details ? ` · ${details}` : ""}`,
+		"The Antigravity panel above the editor shows what it is doing.",
 	];
 	const prompt = typeof args.prompt === "string" ? args.prompt : started?.prompt;
 	if (prompt) {
-		lines.push("", "Auftrag:", ...prompt.split("\n"));
+		lines.push("", "Task:", ...prompt.split("\n"));
 	}
 	return lines.join("\n");
 }
@@ -287,7 +287,7 @@ function renderSubagentLine(status: SubagentStatus, now: number, spinner: string
 	const elapsed = status.startedAtMs !== undefined ? formatElapsed(end - status.startedAtMs) : "";
 	const role = status.role ?? "Subagent";
 	const activity =
-		status.state === "idle" ? `fertig${status.activity ? `: ${status.activity}` : ""}` : (status.activity ?? "");
+		status.state === "idle" ? `done${status.activity ? `: ${status.activity}` : ""}` : (status.activity ?? "");
 	const model = subagentModelLabel(status);
 	const parts = [
 		theme.fg("muted", status.conversationId.slice(0, 8)),
@@ -313,8 +313,8 @@ export function renderActivityLines(
 	if (snapshot.tasks.length === 0 && subagents.length === 0 && !snapshot.runningTurn && !live) return [];
 	const spinner = theme.fg("accent", SPINNER[frame % SPINNER.length]);
 	const parts: string[] = [];
-	if (running.length > 0) parts.push(running.length === 1 ? "1 Hintergrund-Task" : `${running.length} Hintergrund-Tasks`);
-	if (working.length > 0) parts.push(working.length === 1 ? "1 Subagent" : `${working.length} Subagenten`);
+	if (running.length > 0) parts.push(running.length === 1 ? "1 background task" : `${running.length} background tasks`);
+	if (working.length > 0) parts.push(working.length === 1 ? "1 subagent" : `${working.length} subagents`);
 	const header = parts.length > 0 ? ` · ${parts.join(" · ")}` : "";
 	const lines = [`${theme.fg("customMessageLabel", theme.bold("Antigravity"))}${theme.fg("muted", header)}`];
 	for (const task of snapshot.tasks) {
@@ -322,12 +322,12 @@ export function renderActivityLines(
 		const elapsed = task.startedAtMs !== undefined ? formatElapsed((task.finished?.atMs ?? now) - task.startedAtMs) : "";
 		let detail = "";
 		if (task.finished) {
-			detail = task.finished.exitCode !== undefined && task.kind === "command" ? `Exit ${task.finished.exitCode}` : "fertig";
+			detail = task.finished.exitCode !== undefined && task.kind === "command" ? `Exit ${task.finished.exitCode}` : "done";
 		} else if (task.kind === "timer" && task.startedAtMs !== undefined && task.timerSeconds !== undefined) {
 			const left = task.startedAtMs + task.timerSeconds * 1000 - now;
-			detail = left > 0 ? `noch ${Math.ceil(left / 1000)} s` : "läuft ab";
+			detail = left > 0 ? `${Math.ceil(left / 1000)} s left` : "expiring";
 		} else {
-			detail = snapshot.logTails.get(task.taskId) ?? "noch keine Ausgabe";
+			detail = snapshot.logTails.get(task.taskId) ?? "no output yet";
 		}
 		lines.push(
 			` ${mark} ${theme.fg("muted", task.taskId)}  ${theme.fg("toolTitle", taskLabel(task))}  ${theme.fg("dim", elapsed)}  ${theme.fg("toolOutput", detail)}`,
@@ -337,7 +337,7 @@ export function renderActivityLines(
 		lines.push(renderSubagentLine(status, now, spinner, theme));
 	}
 	if (subagents.length > MAX_SUBAGENT_LINES) {
-		lines.push(theme.fg("muted", `   … ${subagents.length - MAX_SUBAGENT_LINES} weitere Subagenten`));
+		lines.push(theme.fg("muted", `   … ${subagents.length - MAX_SUBAGENT_LINES} more subagents`));
 	}
 	const turn = snapshot.runningTurn;
 	if (live) {
@@ -348,16 +348,16 @@ export function renderActivityLines(
 			: lastLine
 				? lastLine
 				: live.thinking
-					? "denkt nach …"
+					? "thinking …"
 					: "";
-		const actions = live.toolCalls === 1 ? "1 Tool-Aufruf" : `${live.toolCalls} Tool-Aufrufe`;
+		const actions = live.toolCalls === 1 ? "1 tool call" : `${live.toolCalls} tool calls`;
 		lines.push(
-			` ${spinner} ${theme.fg("toolTitle", "arbeitet selbstständig")}  ${theme.fg("dim", elapsed)}  ${theme.fg("muted", actions)}  ${theme.fg("toolOutput", detail)}`,
+			` ${spinner} ${theme.fg("toolTitle", "working on its own")}  ${theme.fg("dim", elapsed)}  ${theme.fg("muted", actions)}  ${theme.fg("toolOutput", detail)}`,
 		);
 	} else if (turn) {
 		const elapsed = turn.startedAtMs !== undefined ? formatElapsed(now - turn.startedAtMs) : "";
-		const actions = turn.actions.length === 1 ? "1 Tool-Aufruf" : `${turn.actions.length} Tool-Aufrufe`;
-		lines.push(` ${spinner} ${theme.fg("toolTitle", "arbeitet selbstständig")}  ${theme.fg("dim", elapsed)}  ${theme.fg("muted", actions)}`);
+		const actions = turn.actions.length === 1 ? "1 tool call" : `${turn.actions.length} tool calls`;
+		lines.push(` ${spinner} ${theme.fg("toolTitle", "working on its own")}  ${theme.fg("dim", elapsed)}  ${theme.fg("muted", actions)}`);
 	}
 	return lines;
 }
@@ -417,7 +417,7 @@ export class BackgroundActivityView {
 			this.clear();
 			return;
 		}
-		const badge = working ? "agy ⚙ selbstständig" : `agy ⏳ ${running}`;
+		const badge = working ? "agy ⚙ on its own" : `agy ⏳ ${running}`;
 		ctx.ui.setStatus(STATUS_KEY, running > 0 || working ? badge : undefined);
 		if (this.component && this.shownIn === ctx) {
 			this.component.update(snapshot);

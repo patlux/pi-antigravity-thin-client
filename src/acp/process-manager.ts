@@ -368,11 +368,11 @@ function appendNoProxyLoopback(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 function racePromiseWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
 	if (!signal) return promise;
 	if (signal.aborted) {
-		return Promise.reject(signal.reason ?? new Error("请求已取消"));
+		return Promise.reject(signal.reason ?? new Error("Request cancelled"));
 	}
 	return new Promise<T>((resolve, reject) => {
 		const onAbort = () => {
-			reject(signal.reason ?? new Error("请求已取消"));
+			reject(signal.reason ?? new Error("Request cancelled"));
 		};
 		signal.addEventListener("abort", onAbort, { once: true });
 		promise.then(
@@ -509,7 +509,7 @@ export class AcpClientConnection {
 			this.closed = true;
 			const tail = this.stderrTail.length > 0 ? `: ${this.stderrTail.slice(-3).join(" | ")}` : "";
 			this.failAllPending(
-				new Error(`Antigravity ACP 进程已退出 (code=${code ?? "null"}, signal=${signal ?? "null"})${tail}`),
+				new Error(`Antigravity ACP process exited (code=${code ?? "null"}, signal=${signal ?? "null"})${tail}`),
 			);
 		});
 	}
@@ -543,7 +543,7 @@ export class AcpClientConnection {
 			return this.initResult;
 		}
 		if (signal?.aborted) {
-			throw signal.reason ?? new Error("请求已取消");
+			throw signal.reason ?? new Error("Request cancelled");
 		}
 		if (!this.initPromise) {
 			this.initPromise = this.request<AcpInitializeResult>(
@@ -578,10 +578,10 @@ export class AcpClientConnection {
 		options: { timeoutMs?: number; signal?: AbortSignal } = {},
 	): Promise<TResult> {
 		if (!this.isAlive) {
-			return Promise.reject(new Error("Antigravity ACP 子进程未处于运行状态"));
+			return Promise.reject(new Error("Antigravity ACP process is not running"));
 		}
 		if (options.signal?.aborted) {
-			return Promise.reject(options.signal.reason ?? new Error("请求已取消"));
+			return Promise.reject(options.signal.reason ?? new Error("Request cancelled"));
 		}
 
 		const id = this.nextRpcId++;
@@ -601,7 +601,7 @@ export class AcpClientConnection {
 						this.orphanedSessionOpenRpcs.set(id, method);
 					}
 					entry.cleanupAbort?.();
-					reject(new Error(`ACP 请求 ${method} 超时 (${options.timeoutMs}ms)`));
+					reject(new Error(`ACP request ${method} timed out (${options.timeoutMs} ms)`));
 				}, options.timeoutMs);
 			}
 
@@ -613,7 +613,7 @@ export class AcpClientConnection {
 						this.orphanedSessionOpenRpcs.set(id, method);
 					}
 					if (entry.timer) clearTimeout(entry.timer);
-					reject(options.signal?.reason ?? new Error(`ACP 请求 ${method} 已中止`));
+					reject(options.signal?.reason ?? new Error(`ACP request ${method} aborted`));
 				};
 				options.signal.addEventListener("abort", onAbort, { once: true });
 				entry.cleanupAbort = () => options.signal?.removeEventListener("abort", onAbort);
@@ -767,7 +767,7 @@ export class AcpClientConnection {
 	private writeJson(payload: unknown): void {
 		try {
 			if (this.closed || this.proc.stdin.destroyed || !this.proc.stdin.writable) {
-				this.failAllPending(new Error("Antigravity ACP stdin 不可写"));
+				this.failAllPending(new Error("Antigravity ACP stdin is not writable"));
 				return;
 			}
 			this.proc.stdin.write(`${JSON.stringify(payload)}\n`);
@@ -950,7 +950,7 @@ export class AcpProcessManager {
 		});
 		if (!binary) {
 			throw new Error(
-				"未找到 Antigravity CLI (agy) 可执行文件。请确认已安装 agy 并加入 PATH，或设置环境变量 PI_AGY_BIN。",
+				"Antigravity CLI (agy) not found. Install agy and put it on PATH, or set PI_AGY_BIN.",
 			);
 		}
 		return binary;
@@ -962,7 +962,7 @@ export class AcpProcessManager {
 		signal?: AbortSignal,
 	): Promise<AcpClientConnection> {
 		if (signal?.aborted) {
-			throw signal.reason ?? new Error("请求已取消");
+			throw signal.reason ?? new Error("Request cancelled");
 		}
 
 		const baseProfile = resolveProcessProfileForConfig(config);
@@ -986,7 +986,7 @@ export class AcpProcessManager {
 					await conn.ensureInitialized();
 					if (this.disposeEpoch !== epochAtStart) {
 						await conn.dispose();
-						throw new Error("Antigravity ACP 进程池已关闭");
+						throw new Error("Antigravity ACP process pool is closed");
 					}
 					this.pool.set(key, conn);
 					return conn;

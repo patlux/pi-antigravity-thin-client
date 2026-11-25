@@ -467,11 +467,11 @@ const liveProbeStateByCachePath = new Map<
 function raceCatalogProbeWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
 	if (!signal) return promise;
 	if (signal.aborted) {
-		return Promise.reject(signal.reason ?? new Error("模型探测已取消"));
+		return Promise.reject(signal.reason ?? new Error("Model discovery cancelled"));
 	}
 	return new Promise<T>((resolve, reject) => {
 		const onAbort = () => {
-			reject(signal.reason ?? new Error("模型探测已取消"));
+			reject(signal.reason ?? new Error("Model discovery cancelled"));
 		};
 		signal.addEventListener("abort", onAbort, { once: true });
 		promise.then(
@@ -543,7 +543,7 @@ export async function probeLiveAntigravityCatalog(
 			: (signalOrOptions ?? {});
 
 	if (opts.signal?.aborted) {
-		throw opts.signal.reason ?? new Error("模型探测已取消");
+		throw opts.signal.reason ?? new Error("Model discovery cancelled");
 	}
 
 	const cacheKey = resolveModelCachePath(opts.env);

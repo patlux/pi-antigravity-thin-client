@@ -146,14 +146,14 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 			isSubscription: true,
 			async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
 				callbacks.onProgress?.(
-					"认证由官方 agy CLI 本地自行管理，本扩展不读取或存储任何 OAuth 令牌。",
+					"The official agy CLI manages the sign-in locally; this extension never reads or stores OAuth tokens.",
 				);
 				const bin = resolveAgyBinary({
 					configuredBin: coordinator.config.agyBin,
 					geminiDir: coordinator.config.geminiDir,
 				});
 				if (!bin) {
-					throw new Error("未找到本机 agy 可执行文件，请先安装 Antigravity CLI。");
+					throw new Error("agy not found on this machine. Install the Antigravity CLI first.");
 				}
 
 				// 先探测当前本机 agy 是否已处于有效登录态
@@ -180,7 +180,7 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 				const activeCtx = coordinator.getActiveContext();
 				if (activeCtx?.mode === "tui") {
 					throw new Error(
-						"当前处于交互式 TUI 面板，请按 Esc 返回后执行 `/agy login`（自动安全释放并恢复终端完成登录），或在独立终端运行 `agy acp --login`。",
+						"Inside the interactive TUI, press Esc and run `/agy login` (it hands the terminal to agy for the sign-in and takes it back), or run `agy acp --login` in a separate terminal.",
 					);
 				}
 
@@ -195,7 +195,7 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 					windowsVerbatimArguments: loginSpec.windowsVerbatimArguments,
 				});
 				if (res.status !== 0) {
-					throw new Error("官方 agy 登录未完成，可在独立终端运行 `agy acp --login` 后重试。");
+					throw new Error("The agy sign-in did not complete. Run `agy acp --login` in a separate terminal and try again.");
 				}
 
 				return {
