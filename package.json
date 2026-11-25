@@ -1,25 +1,31 @@
 {
-  "name": "pi-antigravity-bridge",
-  "version": "0.1.16",
-  "description": "Google Antigravity CLI (agy acp) agent backend bridge for Pi",
+  "name": "pi-antigravity-thin-client",
+  "version": "0.1.0",
+  "description": "Use Google Antigravity (agy acp) in Pi as a thin client: Antigravity stays the agent, Pi shows its work, and only prompts you type reach it",
   "license": "MIT",
+  "author": "Patrick Wozniak",
+  "contributors": [
+    "onprs (original pi-antigravity-bridge)"
+  ],
   "type": "module",
   "engines": {
     "node": ">=22.5.0"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/onprs/Pi-Antigravity-Bridge.git"
+    "url": "git+https://github.com/patlux/pi-antigravity-thin-client.git"
   },
-  "homepage": "https://github.com/onprs/Pi-Antigravity-Bridge#readme",
+  "homepage": "https://github.com/patlux/pi-antigravity-thin-client#readme",
   "bugs": {
-    "url": "https://github.com/onprs/Pi-Antigravity-Bridge/issues"
+    "url": "https://github.com/patlux/pi-antigravity-thin-client/issues"
   },
   "keywords": [
     "pi-package",
     "pi-extension",
     "antigravity",
+    "agy",
     "acp",
+    "thin-client",
     "coding-agent"
   ],
   "pi": {
@@ -30,7 +36,7 @@
   },
   "files": [
     "src",
-    "assets",
+    "assets/agents",
     "CHANGELOG.md",
     "LICENSE",
     "README.md"

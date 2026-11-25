@@ -35,7 +35,8 @@ function readPackageVersion(): string {
 }
 
 export const BRIDGE_AGENT_NAME = "pi-bridge";
-export const CLIENT_INFO_NAME = "pi-antigravity-bridge";
+// Thin-client fork: report this package honestly, not the upstream name.
+export const CLIENT_INFO_NAME = "pi-antigravity-thin-client";
 export const CLIENT_INFO_VERSION = readPackageVersion();
 
 export class AcpRpcError extends Error {
