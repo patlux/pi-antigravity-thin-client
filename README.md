@@ -89,7 +89,7 @@ pi remove npm:pi-antigravity-bridge
 
 1. 确保本机 `agy` 已登录（若尚未登录，可在终端运行 `agy acp --login`，或在启动 `pi` 后执行 `/agy login`）。
 2. 启动 `pi`，输入 `/model` 并选择 `antigravity` 分组下的模型（如 `gemini-4-neon`、`gemini-4-carbon`、`claude-sonnet-5-5`）。
-3. 使用快捷键循环切换 Thinking 档位，直接开始对话。
+3. 使用快捷键循环切换 Thinking 档位，直接开始对话。Antigravity 要求工具审批时，在 Pi 中选择批准或拒绝。非交互模式没有审批界面。
 
 ## 斜杠命令
 

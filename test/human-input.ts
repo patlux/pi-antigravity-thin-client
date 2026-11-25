@@ -22,9 +22,12 @@ function isStubContext(value: object): value is ExtensionContext {
 	return "hasUI" in value && "cwd" in value;
 }
 
-/** Minimal interactive context: the coordinator reads `hasUI`, `cwd` and the status bar. */
-export function interactiveContext(cwd: string): ExtensionContext {
-	const stub = { hasUI: true, cwd, ui: { setStatus() {} } };
+/**
+ * Minimal interactive context: the coordinator reads `hasUI`, `cwd` and the status bar.
+ * `extra` adds stubbed members such as `sessionManager`.
+ */
+export function interactiveContext(cwd: string, extra: object = {}): ExtensionContext {
+	const stub = { ...extra, hasUI: true, cwd, ui: { setStatus() {} } };
 	if (!isStubContext(stub)) {
 		throw new Error("stub context lacks hasUI/cwd");
 	}

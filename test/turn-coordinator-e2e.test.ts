@@ -30,7 +30,7 @@ import { THIN_CLIENT_DISABLED } from "./thin-client-skip.ts";
  */
 function writeMockAgyExecutable(
 	dir: string,
-	options?: { seedTemplateDbOnNew?: boolean },
+	options?: { seedTemplateDbOnNew?: boolean; incompleteFirstDb?: boolean; lazyConversationDb?: boolean },
 ): string {
 	const scriptPath = path.join(dir, "mock-agy.mjs");
 	const seedTemplateDbOnNew = Boolean(options?.seedTemplateDbOnNew);
@@ -44,6 +44,8 @@ import { DatabaseSync } from "node:sqlite";
 
 const mockRootDir = path.dirname(fileURLToPath(import.meta.url));
 const seedTemplateDbOnNew = ${seedTemplateDbOnNew};
+const incompleteFirstDb = ${Boolean(options?.incompleteFirstDb)};
+const lazyConversationDb = ${Boolean(options?.lazyConversationDb)};
 const isModeA = !process.argv.some((arg) => arg.startsWith("pi-bridge"));
 const sessions = new Map();
 
@@ -52,6 +54,28 @@ function send(obj) {
 }
 function mcpHttpUrl(sess) {
   return sess.mcpHttp.url;
+}
+
+function seedConversationDb(sessionId) {
+  const convDir = path.join(mockRootDir, ".gemini", "antigravity-cli", "conversations");
+  fs.mkdirSync(convDir, { recursive: true });
+  const dbPath = path.join(convDir, sessionId + ".db");
+  const db = new DatabaseSync(dbPath);
+  db.exec(\`
+    PRAGMA user_version = 1;
+    CREATE TABLE IF NOT EXISTS trajectory_meta (trajectory_id text PRIMARY KEY, cascade_id text, trajectory_type integer, source integer);
+    CREATE TABLE IF NOT EXISTS steps (idx integer PRIMARY KEY, step_type integer NOT NULL DEFAULT 0, status integer NOT NULL DEFAULT 0, has_subtrajectory numeric NOT NULL DEFAULT false, metadata blob, error_details blob, permissions blob, task_details blob, render_info blob, step_payload blob, step_format integer NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS gen_metadata (idx integer PRIMARY KEY, data blob, size integer NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS executor_metadata (idx integer PRIMARY KEY, data blob);
+    CREATE TABLE IF NOT EXISTS parent_references (idx integer PRIMARY KEY, data blob);
+    CREATE TABLE IF NOT EXISTS trajectory_metadata_blob (id text PRIMARY KEY DEFAULT "main", data blob);
+    CREATE TABLE IF NOT EXISTS battle_mode_infos (idx integer PRIMARY KEY, data blob);
+  \`);
+  db.prepare("INSERT OR REPLACE INTO trajectory_meta VALUES (?, ?, 4, 17)").run(sessionId, sessionId);
+  const agentTag = isModeA ? "default-agy-agent" : "pi-bridge";
+  const blob = Buffer.from("mock-meta:" + agentTag + ":" + sessionId, "utf8");
+  db.prepare("INSERT OR REPLACE INTO trajectory_metadata_blob VALUES ('main', ?)").run(blob);
+  db.close();
 }
 
 let nextServerReqId = 9000;
@@ -105,26 +129,14 @@ rl.on("line", async (line) => {
     const mcpHttp = (msg.params?.mcpServers || []).find((s) => s.type === "http");
     sessions.set(sessionId, { mcpHttp });
 
-    if (seedTemplateDbOnNew) {
+    if (incompleteFirstDb && sessions.size === 1) {
       const convDir = path.join(mockRootDir, ".gemini", "antigravity-cli", "conversations");
       fs.mkdirSync(convDir, { recursive: true });
-      const dbPath = path.join(convDir, sessionId + ".db");
-      const db = new DatabaseSync(dbPath);
-      db.exec(\`
-        PRAGMA user_version = 1;
-        CREATE TABLE IF NOT EXISTS trajectory_meta (trajectory_id text PRIMARY KEY, cascade_id text, trajectory_type integer, source integer);
-        CREATE TABLE IF NOT EXISTS steps (idx integer PRIMARY KEY, step_type integer NOT NULL DEFAULT 0, status integer NOT NULL DEFAULT 0, has_subtrajectory numeric NOT NULL DEFAULT false, metadata blob, error_details blob, permissions blob, task_details blob, render_info blob, step_payload blob, step_format integer NOT NULL DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS gen_metadata (idx integer PRIMARY KEY, data blob, size integer NOT NULL DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS executor_metadata (idx integer PRIMARY KEY, data blob);
-        CREATE TABLE IF NOT EXISTS parent_references (idx integer PRIMARY KEY, data blob);
-        CREATE TABLE IF NOT EXISTS trajectory_metadata_blob (id text PRIMARY KEY DEFAULT "main", data blob);
-        CREATE TABLE IF NOT EXISTS battle_mode_infos (idx integer PRIMARY KEY, data blob);
-      \`);
-      db.prepare("INSERT OR REPLACE INTO trajectory_meta VALUES (?, ?, 4, 17)").run(sessionId, sessionId);
-      const agentTag = isModeA ? "default-agy-agent" : "pi-bridge";
-      const blob = Buffer.from("mock-meta:" + agentTag + ":" + sessionId, "utf8");
-      db.prepare("INSERT OR REPLACE INTO trajectory_metadata_blob VALUES ('main', ?)").run(blob);
+      const db = new DatabaseSync(path.join(convDir, sessionId + ".db"));
       db.close();
+      fs.writeFileSync(path.join(mockRootDir, "incomplete-session-id"), sessionId);
+    } else if (seedTemplateDbOnNew && !lazyConversationDb) {
+      seedConversationDb(sessionId);
     }
 
     if (mcpHttp) {
@@ -247,12 +259,51 @@ rl.on("line", async (line) => {
 
     const lastBlockText = prompt?.[prompt.length - 1]?.text || "";
 
+    const startsUpstreamBatch = lastBlockText === "TRIGGER_UPSTREAM_BATCH" || lastBlockText === "TRIGGER_UPSTREAM_PARTIAL_BATCH";
+    if (seedTemplateDbOnNew && sess && (startsUpstreamBatch ||
+        (sess.continueUpstreamBatch && lastBlockText === "Continue from where you left off."))) {
+      const first = startsUpstreamBatch;
+      if (first) sess.missingFinalSnapshot = lastBlockText === "TRIGGER_UPSTREAM_PARTIAL_BATCH";
+      sess.continueUpstreamBatch = first;
+      if (first && lazyConversationDb) seedConversationDb(sessionId);
+      const db = new DatabaseSync(path.join(mockRootDir, ".gemini", "antigravity-cli", "conversations", sessionId + ".db"));
+      const field = (tag, value) => Buffer.concat([Buffer.from([tag, value.length]), value]);
+      const userMessage = Buffer.concat([Buffer.from([0x10, 1]), field(0x1a, Buffer.from(first ? "first" : "second generation with more context"))]);
+      const data = !first && sess.missingFinalSnapshot ? null : field(0x0a, field(0x12, userMessage));
+      const genIdx = db.prepare("SELECT COALESCE(MAX(idx) + 1, 0) AS idx FROM gen_metadata").get().idx;
+      const stepIdx = db.prepare("SELECT COALESCE(MAX(idx) + 1, 0) AS idx FROM steps").get().idx;
+      db.prepare("INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)").run(genIdx, data, data?.length ?? 0);
+      db.prepare("INSERT INTO steps (idx, step_type, status) VALUES (?, 14, 3)").run(stepIdx);
+      db.close();
+      if (!first) {
+        send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "BATCH_COMPLETE" } } } });
+      }
+      send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: first ? "max_turn_requests" : "end_turn", usage: { inputTokens: 100, outputTokens: 5 } } });
+      return;
+    }
+
+    if (lastBlockText === "TEST_TOOL_APPROVAL") {
+      const permission = await requestClient("session/request_permission", {
+        sessionId,
+        toolCall: { toolCallId: "approval-1", title: "Run mcp_pi_tools_read" },
+        options: [
+          { optionId: "allow", name: "Allow", kind: "allow_once" },
+          { optionId: "deny", name: "Deny", kind: "reject_once" }
+        ]
+      });
+      if (permission?.outcome?.optionId === "allow") {
+        send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "APPROVED" } } } });
+      }
+      send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+      return;
+    }
+
     if (lastBlockText === "AUX_STOP_REFUSAL") {
       send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "refusal" } });
       return;
     }
 
-    if (lastBlockText === "AUX_STOP_CANCELLED") {
+    if (lastBlockText === "AGY_STOP_CANCELLED") {
       send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "cancelled" } });
       return;
     }
@@ -1180,6 +1231,219 @@ function createStubPiApi(): ExtensionAPI {
 }
 
 describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
+	it("无 UI 或审批取消时返回明确错误，有效授权仍按 ACP 下发", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-permission-"));
+		const config = { ...DEFAULT_BRIDGE_CONFIG, agyBin: writeMockAgyExecutable(root), geminiDir: path.join(root, ".gemini") };
+		const broker = new AgyTurnMirrorBroker();
+		const coordinator = new TurnCoordinator(createStubPiApi(), new AcpProcessManager(), broker, config);
+		const tools = createAgyMirrorToolDefinitions(broker).map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
+		let choice: string | undefined;
+		let timestamp = 0;
+		// Thin client: every attempt is a new prompt typed by the human.
+		const run = (id: string) => {
+			const message: UserMessage = { role: "user", content: "TEST_TOOL_APPROVAL", timestamp: ++timestamp };
+			typedByHuman(coordinator.humanPromptGate, message);
+			return coordinator.streamSimple(TEST_MODEL, normalizeContext({ messages: [message], tools }), { sessionId: id }).result();
+		};
+		try {
+			const baseContext = { cwd: root, isProjectTrusted: () => false, sessionManager: { getSessionId: () => "approval" } };
+			coordinator.setActiveContext({ ...baseContext, hasUI: false } as unknown as ExtensionContext);
+			const headless = await run("headless");
+			assert.equal(headless.stopReason, "error");
+			// Thin client: headless use is refused before agy sees the request.
+			assert.match(headless.errorMessage ?? "", /refusing headless use/);
+
+			coordinator.setActiveContext({
+				...baseContext, hasUI: true, ui: { select: async () => choice, setStatus() {} },
+			} as unknown as ExtensionContext);
+			for (const value of ["Deny", "invalid-choice", undefined]) {
+				choice = value;
+				const declined = await run(`declined-${value}`);
+				assert.equal(declined.stopReason, "error");
+				assert.match(declined.errorMessage ?? "", /未获批准/);
+			}
+			choice = "Allow";
+			const approved = await run("approved");
+			assert.equal(approved.stopReason, "stop");
+			assert.equal(approved.content.find(block => block.type === "text")?.text, "APPROVED");
+		} finally {
+			await coordinator.dispose();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("后端确认新会话但 SQLite 建表失败时，先重建再发送一次用户请求", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-incomplete-schema-"));
+		const config = {
+			...DEFAULT_BRIDGE_CONFIG,
+			agyBin: writeMockAgyExecutable(root, { seedTemplateDbOnNew: true, incompleteFirstDb: true }),
+			geminiDir: path.join(root, ".gemini"),
+		};
+		const broker = new AgyTurnMirrorBroker();
+		const coordinator = new TurnCoordinator(createStubPiApi(), new AcpProcessManager(), broker, config);
+		coordinator.setActiveContext(interactiveContext(root));
+		const tools = createAgyMirrorToolDefinitions(broker).map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
+		const prompts: unknown[] = [];
+		try {
+			const user: UserMessage = { role: "user", content: "FOLLOWUP_MSG:首条问题", timestamp: 1 };
+			typedByHuman(coordinator.humanPromptGate, user);
+			const result = await coordinator.streamSimple(TEST_MODEL, normalizeContext({
+				messages: [user], tools,
+			}), { onPayload: payload => { prompts.push(payload); } }).result();
+			const firstId = fs.readFileSync(path.join(root, "incomplete-session-id"), "utf8");
+			assert.equal(result.stopReason, "stop");
+			assert.notEqual(result.responseId, firstId);
+			assert.equal(prompts.length, 1);
+			assert.match(JSON.stringify(prompts[0]), /首条问题/);
+			const convDir = path.join(config.geminiDir, config.appDataDirName, "conversations");
+			assert.equal(fs.readdirSync(convDir).filter(name => name.endsWith(".db")).length, 2);
+		} finally {
+			await coordinator.dispose();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("从旧分支恢复时按锚点截断已继续写入的轨迹，保留原轨迹", { skip: THIN_CLIENT_DISABLED }, async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-advanced-anchor-"));
+		const config = {
+			...DEFAULT_BRIDGE_CONFIG,
+			agyBin: writeMockAgyExecutable(root, { seedTemplateDbOnNew: true }),
+			geminiDir: path.join(root, ".gemini"),
+		};
+		const entries: Array<{ type: "custom"; customType: string; data: unknown }> = [];
+		const pi = createStubPiApi();
+		pi.appendEntry = (customType, data) => entries.push({ type: "custom", customType, data });
+		const coordinator = new TurnCoordinator(pi, new AcpProcessManager(), new AgyTurnMirrorBroker(), config);
+		const sessionId = "advanced-anchor";
+		coordinator.setActiveContext({
+			cwd: root, isProjectTrusted: () => false, hasUI: false,
+			sessionManager: { getSessionId: () => sessionId, getBranch: () => entries },
+		} as unknown as ExtensionContext);
+		try {
+			const user = { role: "user" as const, content: "TRIGGER_UPSTREAM_BATCH", timestamp: 1 };
+			const first = await coordinator.streamSimple(TEST_MODEL, normalizeContext({ messages: [user] }), { sessionId }).result();
+			assert.equal(first.stopReason, "stop");
+			await coordinator.persistTurnAnchor([user, first], sessionId);
+			assert.equal(entries.length, 1);
+			await coordinator.invalidatePiSession(sessionId);
+
+			const openConversation = (id: string, readOnly = true) => new DatabaseSync(
+				path.join(config.geminiDir, config.appDataDirName, "conversations", id + ".db"), { readOnly },
+			);
+			const prior = [user, first];
+			const resume = (prompt: string, onPayload?: (payload: unknown) => void) => coordinator.streamSimple(
+				TEST_MODEL, normalizeContext({ messages: [...prior, { role: "user", content: prompt, timestamp: 2 }] }),
+				{ sessionId, onPayload },
+			).result();
+			const unchanged = await resume("FOLLOWUP_MSG:锚点未变化");
+			assert.equal(unchanged.responseId, first.responseId, "未前进的会话仍应原地恢复");
+			await coordinator.invalidatePiSession(sessionId);
+
+			const original = openConversation(first.responseId!, false);
+			try {
+				original.prepare("INSERT INTO steps (idx, step_type, status, step_payload) VALUES (2, 14, 3, ?)")
+					.run(Buffer.from("OTHER_BRANCH_ONLY"));
+				original.exec("INSERT INTO gen_metadata (idx, data) SELECT 2, data FROM gen_metadata WHERE idx = 1");
+			} finally { original.close(); }
+
+			let prompt: unknown;
+			const branched = await resume("FOLLOWUP_MSG:从旧节点另起分支", payload => { prompt = payload; });
+			assert.equal(branched.stopReason, "stop");
+			assert.notEqual(branched.responseId, first.responseId, "原地恢复会把另一分支的步骤也交给模型");
+			assert.deepEqual((prompt as { prompt: unknown }).prompt, [{ type: "text", text: "FOLLOWUP_MSG:从旧节点另起分支" }]);
+
+			for (const [id, expected] of [[first.responseId!, 2], [branched.responseId!, 1]] as const) {
+				const db = openConversation(id);
+				try {
+					assert.equal(db.prepare("SELECT MAX(idx) AS idx FROM steps").get()?.idx, expected);
+					assert.equal(db.prepare("SELECT MAX(idx) AS idx FROM gen_metadata").get()?.idx, expected);
+				} finally { db.close(); }
+			}
+		} finally {
+			await coordinator.dispose();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("恢复存在元数据但没有持久化步骤的空壳会话时重放 Pi 历史", { skip: THIN_CLIENT_DISABLED }, async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-empty-resume-"));
+		const config = {
+			...DEFAULT_BRIDGE_CONFIG,
+			agyBin: writeMockAgyExecutable(root, { seedTemplateDbOnNew: true }),
+			geminiDir: path.join(root, ".gemini"),
+		};
+		const entries: Array<{ type: "custom"; customType: string; data: unknown }> = [];
+		const pi = createStubPiApi();
+		pi.appendEntry = (customType, data) => entries.push({ type: "custom", customType, data });
+		const coordinator = new TurnCoordinator(pi, new AcpProcessManager(), new AgyTurnMirrorBroker(), config);
+		const sessionId = "empty-resume";
+		coordinator.setActiveContext({
+			cwd: root, isProjectTrusted: () => false, hasUI: false,
+			sessionManager: { getSessionId: () => sessionId, getBranch: () => entries },
+		} as unknown as ExtensionContext);
+		try {
+			const firstUser = { role: "user" as const, content: "FOLLOWUP_MSG:此前的问题", timestamp: 1 };
+			const first = await coordinator.streamSimple(TEST_MODEL, normalizeContext({ messages: [firstUser] }), { sessionId }).result();
+			assert.equal(first.stopReason, "stop");
+			await coordinator.persistTurnAnchor([firstUser, first], sessionId);
+			assert.equal(entries.length, 1);
+			await coordinator.invalidatePiSession(sessionId);
+
+			let replayText = "";
+			const next = await coordinator.streamSimple(TEST_MODEL, normalizeContext({ messages: [
+				firstUser, first, { role: "user", content: "FOLLOWUP_MSG:下一个问题", timestamp: 2 },
+			] }), { sessionId, onPayload: payload => { replayText = JSON.stringify(payload); } }).result();
+			assert.equal(next.stopReason, "stop");
+			assert.notEqual(next.responseId, first.responseId);
+			assert.match(replayText, /此前的问题/);
+			assert.match(replayText, /下一个问题/);
+		} finally {
+			await coordinator.dispose();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("thin client: a restored agy session without persisted steps refuses to replay Pi's history", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-thin-empty-resume-"));
+		const config = {
+			...DEFAULT_BRIDGE_CONFIG,
+			agyBin: writeMockAgyExecutable(root, { seedTemplateDbOnNew: true }),
+			geminiDir: path.join(root, ".gemini"),
+		};
+		const entries: Array<{ type: "custom"; customType: string; data: unknown }> = [];
+		const pi = createStubPiApi();
+		pi.appendEntry = (customType, data) => entries.push({ type: "custom", customType, data });
+		const broker = new AgyTurnMirrorBroker();
+		const coordinator = new TurnCoordinator(pi, new AcpProcessManager(), broker, config);
+		const tools = createAgyMirrorToolDefinitions(broker).map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
+		const sessionId = "thin-empty-resume";
+		coordinator.setActiveContext(interactiveContext(root, {
+			sessionManager: { getSessionId: () => sessionId, getBranch: () => entries },
+		}));
+		try {
+			const firstUser: UserMessage = { role: "user", content: "FOLLOWUP_MSG:earlier question", timestamp: 1 };
+			typedByHuman(coordinator.humanPromptGate, firstUser);
+			const first = await coordinator.streamSimple(TEST_MODEL, normalizeContext({ messages: [firstUser], tools }), { sessionId }).result();
+			assert.equal(first.stopReason, "stop");
+			await coordinator.persistTurnAnchor([firstUser, first], sessionId);
+			assert.equal(entries.length, 1);
+			await coordinator.invalidatePiSession(sessionId);
+
+			const sent: string[] = [];
+			const nextUser: UserMessage = { role: "user", content: "FOLLOWUP_MSG:next question", timestamp: 2 };
+			typedByHuman(coordinator.humanPromptGate, nextUser);
+			const next = await coordinator.streamSimple(TEST_MODEL, normalizeContext({
+				messages: [firstUser, first, nextUser], tools,
+			}), { sessionId, onPayload: (payload) => { sent.push(JSON.stringify(payload)); } }).result();
+			assert.equal(next.stopReason, "error");
+			assert.match(next.errorMessage ?? "", /refusing to replay earlier conversation/);
+			assert.equal(sent.length, 0, "no prompt may reach agy when the history would have to be replayed");
+		} finally {
+			await coordinator.dispose();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("模式 B (pi-tools)：完成 HTTP MCP Park-and-Yield 挂起、宿主工具执行与同轮续接", { skip: THIN_CLIENT_DISABLED }, async () => {
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-b-"));
 		const binPath = writeMockAgyExecutable(tmpRoot);
@@ -1735,6 +1999,81 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 		} finally {
 			await coord.dispose();
 			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("后端主动取消主请求时结束为 aborted，ACP 回退记为 499，随后仍可续聊", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-backend-cancelled-"));
+		const config = { ...DEFAULT_BRIDGE_CONFIG, agyBin: writeMockAgyExecutable(root), geminiDir: path.join(root, ".gemini") };
+		const broker = new AgyTurnMirrorBroker();
+		const coordinator = new TurnCoordinator(createStubPiApi(), new AcpProcessManager(), broker, config);
+		coordinator.setActiveContext(interactiveContext(root));
+		const tools = createAgyMirrorToolDefinitions(broker).map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
+		const sessionId = "backend-cancelled";
+		try {
+			const user: UserMessage = { role: "user", content: "AGY_STOP_CANCELLED", timestamp: 1 };
+			typedByHuman(coordinator.humanPromptGate, user);
+			const responses: number[] = [];
+			const cancelled = await coordinator.streamSimple(TEST_MODEL, normalizeContext({ messages: [user], tools }), {
+				sessionId,
+				onResponse: ({ status }) => { responses.push(status); },
+			}).result();
+			assert.equal(cancelled.stopReason, "aborted");
+			assert.deepEqual(responses, [200, 499]);
+
+			const followUp: UserMessage = { role: "user", content: "FOLLOWUP_MSG:继续", timestamp: 2 };
+			typedByHuman(coordinator.humanPromptGate, followUp);
+			const next = await coordinator.streamSimple(TEST_MODEL, normalizeContext({ messages: [
+				user, cancelled, followUp,
+			], tools }), { sessionId }).result();
+			assert.equal(next.stopReason, "stop");
+			assert.equal(next.responseId, cancelled.responseId);
+			assert.equal(next.content.find(block => block.type === "text")?.text, "Echo -> FOLLOWUP_MSG:继续");
+		} finally {
+			await coordinator.dispose();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("首条重放提示发送前被取消，续聊仍重放历史", { skip: THIN_CLIENT_DISABLED }, async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-cancel-before-replay-"));
+		const config = { ...DEFAULT_BRIDGE_CONFIG, agyBin: writeMockAgyExecutable(root), geminiDir: path.join(root, ".gemini") };
+		const coordinator = new TurnCoordinator(createStubPiApi(), new AcpProcessManager(), new AgyTurnMirrorBroker(), config);
+		const sessionId = "cancel-before-replay";
+		try {
+			const firstUser = { role: "user" as const, content: "FOLLOWUP_MSG:历史中的内容", timestamp: 1 };
+			const first = await coordinator.streamSimple(TEST_MODEL, normalizeContext({ messages: [firstUser] }), { sessionId }).result();
+			assert.equal(first.stopReason, "stop");
+			await coordinator.invalidatePiSession(sessionId);
+
+			const interrupted = { role: "user" as const, content: "FOLLOWUP_MSG:取消这次发送", timestamp: 2 };
+			const cancel = new AbortController();
+			const cancelledContents = [firstUser, first, interrupted];
+			let cancelledPayload: unknown;
+			const accepted: number[] = [];
+			const aborted = await coordinator.streamSimple(TEST_MODEL, normalizeContext({ messages: cancelledContents }), {
+				sessionId,
+				signal: cancel.signal,
+				onPayload: payload => {
+					cancelledPayload = payload;
+					cancel.abort();
+				},
+				onResponse: ({ status }) => { accepted.push(status); },
+			}).result();
+			assert.equal(aborted.stopReason, "aborted");
+			assert.match(JSON.stringify(cancelledPayload), /历史中的内容/);
+			assert.deepEqual(accepted, [], "取消发生在首条 ACP prompt 发送前");
+
+			let replay: unknown;
+			const next = await coordinator.streamSimple(TEST_MODEL, normalizeContext({ messages: [
+				...cancelledContents, aborted, { role: "user", content: "FOLLOWUP_MSG:继续新问题", timestamp: 3 },
+			] }), { sessionId, onPayload: payload => { replay = payload; } }).result();
+			assert.equal(next.stopReason, "stop");
+			assert.match(JSON.stringify(replay), /历史中的内容/);
+			assert.match(JSON.stringify(replay), /继续新问题/);
+		} finally {
+			await coordinator.dispose();
+			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
 
@@ -2831,7 +3170,7 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 					TEST_MODEL,
 					normalizeContext({
 						tools: [],
-						messages: [{ role: "user", content: "AUX_STOP_CANCELLED", timestamp: 3 }],
+						messages: [{ role: "user", content: "AGY_STOP_CANCELLED", timestamp: 3 }],
 					}),
 					{ sessionId: "pi-sess-preload-on", disableContinuation: true },
 				)
@@ -3437,4 +3776,114 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 			fs.rmSync(tmpRoot, { recursive: true, force: true });
 		}
 	});
+});
+
+const trafficRoot = process.env.PI_TRAFFIC_OPT_ROOT;
+it("双仓联调：真实 Pi 对迟建轨迹库逐代计量，无快照时完整回传大结果并按请求回退", {
+	skip: !trafficRoot && "设置 PI_TRAFFIC_OPT_ROOT 指向流量优化源码仓库",
+	timeout: 15_000,
+}, async (t) => {
+	const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-joint-"));
+	const agentDir = path.join(tmpRoot, "agent");
+	const workspace = path.join(tmpRoot, "workspace");
+	const reportDir = path.join(tmpRoot, "report");
+	fs.mkdirSync(agentDir);
+	fs.mkdirSync(workspace);
+	for (const [key, value] of Object.entries({
+		PI_CODING_AGENT_DIR: agentDir,
+		PI_AGY_BIN: writeMockAgyExecutable(tmpRoot, { seedTemplateDbOnNew: true, lazyConversationDb: true }),
+		PI_AGY_GEMINI_DIR: path.join(tmpRoot, ".gemini"),
+		PI_AGY_TOOL_MODE: "pi-tools",
+		PI_AGY_BRIDGE_MCP: "false",
+		PI_AGY_BRIDGE_SKILLS: "false",
+		PI_AGY_BRIDGE_AGENTS_MD: "false",
+		PI_TRAFFIC_OPT_CONFIG_PATH: path.join(tmpRoot, "traffic.json"),
+		PI_TRAFFIC_OPT_ARCHIVE_DIR: path.join(tmpRoot, "archive"),
+		PI_TRAFFIC_OPT_CACHE_DIR: path.join(tmpRoot, "cache"),
+		PI_TRAFFIC_OPT_REPORT_DIR: reportDir,
+	})) {
+		const previous = process.env[key];
+		process.env[key] = value;
+		t.after(() => {
+			if (previous === undefined) delete process.env[key];
+			else process.env[key] = previous;
+		});
+	}
+	const { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } =
+		await import("@earendil-works/pi-coding-agent");
+	const settings = SettingsManager.inMemory({
+		defaultTools: ["read", "context_recall"],
+		compaction: { enabled: false },
+		cacheWarming: "off",
+		retry: { enabled: false },
+	});
+	const errors: string[] = [];
+	const loader = new DefaultResourceLoader({
+		cwd: workspace,
+		agentDir,
+		settingsManager: settings,
+		noExtensions: true,
+		noSkills: true,
+		noThemes: true,
+		noContextFiles: true,
+		noPromptTemplates: true,
+		additionalExtensionPaths: [
+			path.resolve(import.meta.dirname, "../src/index.ts"),
+			path.resolve(trafficRoot!, "src/index.ts"),
+		],
+	});
+	let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+	try {
+		await loader.reload();
+		assert.deepEqual(loader.getExtensions().errors, []);
+		const runtime = await ModelRuntime.create({
+			authPath: path.join(agentDir, "auth.json"), modelsPath: null,
+			modelsStorePath: path.join(agentDir, "models-store.json"),
+			refreshOnCreate: false, allowModelNetwork: false,
+		});
+		({ session } = await createAgentSession({
+			cwd: workspace, agentDir, resourceLoader: loader, modelRuntime: runtime,
+			model: { ...TEST_MODEL }, thinkingLevel: "off",
+			sessionManager: SessionManager.inMemory(workspace), settingsManager: settings,
+		}));
+		await session.bindExtensions({ onError: (error) => errors.push(error.error) });
+		assert.ok(session.getActiveToolNames().includes("context_recall"));
+		await session.prompt("TRIGGER_UPSTREAM_BATCH");
+		assert.equal(session.getLastAssistantText(), "BATCH_COMPLETE");
+		await session.prompt("/traffic-opt stats");
+		assert.deepEqual(errors, []);
+		const summary = JSON.parse(fs.readFileSync(path.join(reportDir, "summary.json"), "utf8"));
+		assert.deepEqual(summary.requests.map((request: any) => request.transport), ["acp-upstream", "acp-upstream"]);
+		assert.deepEqual(summary.requests.map((request: any) => request.user_text_bytes), [5, 35]);
+		assert.deepEqual(summary.requests.map((request: any) => request.context_tokens), [null, 100]);
+
+		const largeText = "HEAD_MARKER_ALPHA\n" + "中文回传测试 0123456789\n".repeat(450) + "TAIL_MARKER_ZETA\n";
+		fs.writeFileSync(path.join(workspace, "large.ts"), largeText);
+		await session.prompt("TRIGGER_MCP_LARGE_TEXT");
+		assert.match(session.getLastAssistantText() ?? "", /HAS_HEAD=true.*HAS_TAIL=true/);
+		await session.prompt("/traffic-opt stats");
+		const fallback = JSON.parse(fs.readFileSync(path.join(reportDir, "summary.json"), "utf8"));
+		const localRequests = fallback.requests.slice(2);
+		assert.deepEqual(localRequests.map((request: any) => request.transport), ["acp-stdio", "acp-mcp-result", "acp-stdio"]);
+		assert.equal(localRequests[1].tool_result_bytes, 0, "延迟投递的正文由 ACP prompt 计量");
+		assert.ok(localRequests[2].tool_result_bytes >= Buffer.byteLength(largeText.trimEnd()));
+		assert.equal(fallback.acp_local_payload_bytes, localRequests.reduce((total: number, request: any) => total + request.total_payload_bytes, 0));
+		assert.equal(fallback.observed_upload_bytes, summary.total_upload_bytes);
+
+		await session.prompt("TRIGGER_UPSTREAM_PARTIAL_BATCH");
+		assert.equal(session.getLastAssistantText(), "BATCH_COMPLETE");
+		await session.prompt("/traffic-opt stats");
+		assert.deepEqual(errors, []);
+		const partial = JSON.parse(fs.readFileSync(path.join(reportDir, "summary.json"), "utf8"));
+		const newRequests = partial.requests.slice(fallback.request_count);
+		assert.deepEqual(newRequests.map((request: any) => request.transport), ["acp-upstream", "acp-stdio"]);
+		assert.deepEqual(newRequests.map((request: any) => request.user_text_bytes), [5, Buffer.byteLength("Continue from where you left off.")]);
+		assert.deepEqual(newRequests.map((request: any) => request.context_tokens), [null, 100]);
+	} finally {
+		try { await session?.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); }
+		finally {
+			session?.dispose();
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	}
 });

@@ -1,6 +1,6 @@
 {
   "name": "pi-antigravity-bridge",
-  "version": "0.1.15",
+  "version": "0.1.16",
   "description": "Google Antigravity CLI (agy acp) agent backend bridge for Pi",
   "license": "MIT",
   "type": "module",

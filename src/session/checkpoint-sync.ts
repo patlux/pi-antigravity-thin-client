@@ -154,7 +154,7 @@ function openSqliteWithTimeout(
 		? new sqlite.DatabaseSync(dbPath, { readOnly: true })
 		: new sqlite.DatabaseSync(dbPath);
 	try {
-		db.exec(`PRAGMA busy_timeout = ${Math.max(100, Math.floor(busyTimeoutMs))}`);
+		db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(busyTimeoutMs))}`);
 	} catch {
 		// 忽略只读连接或特殊环境下 PRAGMA 不可用异常
 	}
@@ -192,6 +192,26 @@ function verifyRequiredTables(db: import("node:sqlite").DatabaseSync): boolean {
 		.all() as Array<{ name: string }>;
 	const names = new Set(rows.map((r) => r.name));
 	return REQUIRED_TABLES.every((req) => names.has(req));
+}
+
+/** 新会话返回成功时，只读检查已落地的轨迹库是否缺少必需表。 */
+export async function hasIncompleteSqliteConversationSchema(
+	config: BridgeConfig,
+	agySessionId: string,
+): Promise<boolean> {
+	if (!hasLocalConversationDb(config, agySessionId)) return false;
+	const sqlite = await loadNodeSqlite();
+	if (!sqlite) return false;
+	const dbPath = path.join(resolveAgyConversationsDir(config), `${agySessionId}.db`);
+	let db: import("node:sqlite").DatabaseSync | undefined;
+	try {
+		db = openSqliteWithTimeout(sqlite, dbPath, true, 0);
+		return !verifyRequiredTables(db);
+	} catch {
+		return false;
+	} finally {
+		db?.close();
+	}
 }
 
 export interface SqliteGenerationUsage {
@@ -246,9 +266,8 @@ export interface SqliteUpstreamRequestSnapshot {
 }
 
 export interface SqliteUpstreamQueryResult {
-	latest?: SqliteUpstreamRequestSnapshot;
+	snapshots: SqliteUpstreamRequestSnapshot[];
 	maxGenIdx: number;
-	newGenCount: number;
 }
 
 function readProtobufVarint(buf: Uint8Array, offset: number): [number, number] | undefined {
@@ -977,17 +996,14 @@ export async function readCurrentMaxSqliteGenIdx(
 	}
 }
 
-/**
- * 以只读方式读取指定 `gen_metadata` 水位之后新产生的最新上游完整请求快照。
- * 若本地库不存在或无新生成，返回 `newGenCount: 0`；在 WAL 尚未完成落盘时支持短退避重试。
- */
-export async function readLatestSqliteUpstreamRequestSince(
+/** 以只读方式按代次提取上游请求快照，WAL 尚未落盘时短暂重试。 */
+export async function readSqliteUpstreamRequestsSince(
 	config: BridgeConfig,
 	agySessionId: string,
 	afterGenIdx: number,
 	retryDelaysMs: readonly number[] = [20, 40],
 ): Promise<SqliteUpstreamQueryResult> {
-	const empty: SqliteUpstreamQueryResult = { maxGenIdx: afterGenIdx, newGenCount: 0 };
+	const empty: SqliteUpstreamQueryResult = { maxGenIdx: afterGenIdx, snapshots: [] };
 	if (!agySessionId) return empty;
 	const dbPath = path.join(resolveAgyConversationsDir(config), `${agySessionId}.db`);
 	if (!fs.existsSync(dbPath)) return empty;
@@ -997,25 +1013,17 @@ export async function readLatestSqliteUpstreamRequestSince(
 	const probeOnce = (): SqliteUpstreamQueryResult => {
 		let db: import("node:sqlite").DatabaseSync | undefined;
 		try {
-			db = openSqliteWithTimeout(sqlite, dbPath, true, 300);
-			const meta = db
-				.prepare(
-					"SELECT COALESCE(MAX(idx), -1) AS maxIdx, COUNT(*) AS newCount FROM gen_metadata WHERE idx > ?",
-				)
-				.get(afterGenIdx) as { maxIdx?: number; newCount?: number } | undefined;
-			const newGenCount = Number(meta?.newCount ?? 0);
-			const maxGenIdx = typeof meta?.maxIdx === "number" ? meta.maxIdx : afterGenIdx;
-			if (newGenCount <= 0 || maxGenIdx <= afterGenIdx) {
-				return { maxGenIdx: afterGenIdx, newGenCount: 0 };
+			db = openSqliteWithTimeout(sqlite, dbPath, true, 100);
+			// 先读取索引，再逐条解析，避免同时加载多条可能含有大图的请求。
+			const rows = db.prepare("SELECT idx FROM gen_metadata WHERE idx > ? ORDER BY idx").all(afterGenIdx) as { idx: number }[];
+			const selectData = db.prepare("SELECT data FROM gen_metadata WHERE idx = ?");
+			const snapshots: SqliteUpstreamRequestSnapshot[] = [];
+			for (const { idx } of rows) {
+				const row = selectData.get(idx) as { data?: Uint8Array | null } | undefined;
+				const snapshot = row?.data?.length ? parseGenMetadataUpstreamRequest(row.data, idx) : undefined;
+				if (snapshot) snapshots.push(snapshot);
 			}
-			const latestRow = db
-				.prepare("SELECT idx, data FROM gen_metadata WHERE idx = ?")
-				.get(maxGenIdx) as { idx: number; data?: Uint8Array | null } | undefined;
-			const latest =
-				latestRow?.data && latestRow.data.byteLength > 0
-					? parseGenMetadataUpstreamRequest(latestRow.data, latestRow.idx)
-					: undefined;
-			return { latest, maxGenIdx, newGenCount };
+			return { snapshots, maxGenIdx: rows.at(-1)?.idx ?? afterGenIdx };
 		} catch {
 			return empty;
 		} finally {
@@ -1028,15 +1036,11 @@ export async function readLatestSqliteUpstreamRequestSince(
 	};
 
 	const first = probeOnce();
-	if (first.latest || first.newGenCount > 0) {
-		return first;
-	}
+	if (first.maxGenIdx > afterGenIdx) return first;
 	for (const delay of retryDelaysMs) {
 		await new Promise((r) => setTimeout(r, delay));
 		const next = probeOnce();
-		if (next.latest || next.newGenCount > 0) {
-			return next;
-		}
+		if (next.maxGenIdx > afterGenIdx) return next;
 	}
 	return empty;
 }
@@ -1110,6 +1114,14 @@ export async function waitForSqliteToolStepsSettled(
 	}
 }
 
+function readSqliteWatermarks(db: import("node:sqlite").DatabaseSync): Omit<SqliteDbCheckpoint, "fingerprint"> {
+	return db.prepare(`SELECT
+		(SELECT COALESCE(MAX(idx) + 1, 0) FROM steps) AS steps,
+		(SELECT COALESCE(MAX(idx) + 1, 0) FROM gen_metadata) AS generations,
+		(SELECT COALESCE(MAX(idx) + 1, 0) FROM executor_metadata) AS executions
+	`).get() as Omit<SqliteDbCheckpoint, "fingerprint">;
+}
+
 /**
  * 以只读模式采集 AGY 会话 SQLite 数据库的当前高水位检查点。
  * 遇到文件不存在、WAL 锁冲突或跨版本表结构差异时静默返回 `undefined`。
@@ -1118,9 +1130,7 @@ export async function captureSqliteCheckpoint(
 	config: BridgeConfig,
 	agySessionId: string,
 ): Promise<SqliteDbCheckpoint | undefined> {
-	if (!config.enableSqliteFork || !agySessionId) {
-		return undefined;
-	}
+	if (!agySessionId) return undefined;
 	const dbPath = path.join(resolveAgyConversationsDir(config), `${agySessionId}.db`);
 	if (!fs.existsSync(dbPath)) {
 		return undefined;
@@ -1136,28 +1146,11 @@ export async function captureSqliteCheckpoint(
 			return undefined;
 		}
 
-		const stepsRow = db
-			.prepare("SELECT COALESCE(MAX(idx) + 1, 0) AS n FROM steps")
-			.get() as { n: number };
-		const genRow = db
-			.prepare("SELECT COALESCE(MAX(idx) + 1, 0) AS n FROM gen_metadata")
-			.get() as { n: number };
-		const execRow = db
-			.prepare("SELECT COALESCE(MAX(idx) + 1, 0) AS n FROM executor_metadata")
-			.get() as { n: number };
-
-		const steps = Number(stepsRow?.n ?? 0);
-		if (steps <= 0) {
-			return undefined;
-		}
-
-		const fingerprint = computeStepsPrefixFingerprint(db, steps);
-		return {
-			steps,
-			generations: Number(genRow?.n ?? 0),
-			executions: Number(execRow?.n ?? 0),
-			fingerprint,
-		};
+		// 水位和步骤指纹取自同一个 WAL 读快照。
+		db.exec("BEGIN");
+		const watermarks = readSqliteWatermarks(db);
+		if (watermarks.steps <= 0) return undefined;
+		return { ...watermarks, fingerprint: computeStepsPrefixFingerprint(db, watermarks.steps) };
 	} catch {
 		return undefined;
 	} finally {
@@ -1200,17 +1193,6 @@ export async function forkSqliteConversationAtCheckpoint(
 		if (!verifyRequiredTables(srcDb)) {
 			return undefined;
 		}
-		const currentStepsRow = srcDb
-			.prepare("SELECT COALESCE(MAX(idx) + 1, 0) AS n FROM steps")
-			.get() as { n: number };
-		if (Number(currentStepsRow?.n ?? 0) < checkpoint.steps) {
-			return undefined;
-		}
-		const actualPrefixFp = computeStepsPrefixFingerprint(srcDb, checkpoint.steps);
-		if (actualPrefixFp !== checkpoint.fingerprint) {
-			return undefined;
-		}
-
 		srcDb.exec(`VACUUM INTO '${escapedTarget}'`);
 	} catch {
 		cleanupDbFilesSafe(targetDbPath);
@@ -1227,6 +1209,16 @@ export async function forkSqliteConversationAtCheckpoint(
 	let dstDb: import("node:sqlite").DatabaseSync | undefined;
 	try {
 		dstDb = openSqliteWithTimeout(sqlite, targetDbPath, false);
+		// 在副本上校验检查点，原库可以在复制期间继续接收写入。
+		const watermarks = readSqliteWatermarks(dstDb);
+		if (
+			watermarks.steps < checkpoint.steps ||
+			watermarks.generations < checkpoint.generations ||
+			watermarks.executions < checkpoint.executions ||
+			computeStepsPrefixFingerprint(dstDb, checkpoint.steps) !== checkpoint.fingerprint
+		) {
+			throw new Error("SQLite 会话副本与历史检查点不匹配");
+		}
 		const origMeta = dstDb
 			.prepare("SELECT trajectory_id FROM trajectory_meta LIMIT 1")
 			.get() as { trajectory_id?: string } | undefined;
@@ -1250,17 +1242,18 @@ export async function forkSqliteConversationAtCheckpoint(
 		return forkedSessionId;
 	} catch {
 		try {
-			dstDb?.exec("ROLLBACK");
+			dstDb?.close();
 		} catch {
-			// 忽略
+			// 忽略关闭异常
 		}
+		dstDb = undefined;
 		cleanupDbFilesSafe(targetDbPath);
 		return undefined;
 	} finally {
 		try {
 			dstDb?.close();
 		} catch {
-			// 忽略
+			// 忽略关闭异常
 		}
 	}
 }

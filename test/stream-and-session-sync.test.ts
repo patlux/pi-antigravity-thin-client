@@ -27,7 +27,7 @@ import {
 	parseStepPayloadPlannedToolCount,
 	readCurrentMaxSqliteGenIdx,
 	readCurrentMaxSqliteStepIdx,
-	readLatestSqliteUpstreamRequestSince,
+	readSqliteUpstreamRequestsSince,
 	readSqliteGenerationUsagesSince,
 	waitForSqliteToolStepsSettled,
 } from "../src/session/checkpoint-sync.ts";
@@ -1156,7 +1156,7 @@ describe("会话摘要、历史重放与 SQLite 只读快照分叉", () => {
 		const strippedGenData = pbBytes(1, Buffer.concat([pbBytes(19, "gemini-4-neon")]));
 		assert.equal(parseGenMetadataUpstreamRequest(strippedGenData, 4), undefined);
 
-		// 端到端验证 readCurrentMaxSqliteGenIdx 与 readLatestSqliteUpstreamRequestSince 只读查询
+		// 逐条读取有效请求，裁剪过的记录只推进水位，不复制其他代次补数。
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-gen-upstream-"));
 		try {
 			const cfg: BridgeConfig = {
@@ -1168,21 +1168,20 @@ describe("会话摘要、历史重放与 SQLite 只读快照分叉", () => {
 			const sid = "11112222-3333-4444-5555-666677778888";
 			const db = new DatabaseSync(path.join(convDir, `${sid}.db`));
 			db.exec("CREATE TABLE gen_metadata (idx integer PRIMARY KEY, data blob);");
-			db.prepare("INSERT INTO gen_metadata (idx, data) VALUES (?, ?)").run(0, strippedGenData);
-			db.prepare("INSERT INTO gen_metadata (idx, data) VALUES (?, ?)").run(1, fullGenData);
+			const insert = db.prepare("INSERT INTO gen_metadata (idx, data) VALUES (?, ?)");
+			insert.run(0, strippedGenData);
+			insert.run(1, fullGenData);
+			insert.run(2, pbBytes(1, pbBytes(2, Buffer.concat([pbVarint(2, 1), pbBytes(3, "不同请求")]))));
+			insert.run(3, strippedGenData);
 			db.close();
 
-			assert.equal(await readCurrentMaxSqliteGenIdx(cfg, sid), 1);
-			const res = await readLatestSqliteUpstreamRequestSince(cfg, sid, 0, []);
-			assert.equal(res.newGenCount, 1);
-			assert.equal(res.maxGenIdx, 1);
-			assert.ok(res.latest);
-			assert.equal(res.latest.total_payload_bytes, snap.total_payload_bytes);
-
-			// 无新代次时应返回 newGenCount === 0
-			const emptyRes = await readLatestSqliteUpstreamRequestSince(cfg, sid, 1, []);
-			assert.equal(emptyRes.newGenCount, 0);
-			assert.equal(emptyRes.latest, undefined);
+			assert.equal(await readCurrentMaxSqliteGenIdx(cfg, sid), 3);
+			const res = await readSqliteUpstreamRequestsSince(cfg, sid, 0, []);
+			assert.equal(res.maxGenIdx, 3);
+			assert.deepEqual(res.snapshots.map((entry) => entry.genIdx), [1, 2]);
+			assert.equal(res.snapshots[0].total_payload_bytes, snap.total_payload_bytes);
+			assert.equal(res.snapshots[1].user_text_bytes, Buffer.byteLength("不同请求"));
+			assert.deepEqual(await readSqliteUpstreamRequestsSince(cfg, sid, 3, []), { maxGenIdx: 3, snapshots: [] });
 		} finally {
 			fs.rmSync(tmpRoot, { recursive: true, force: true });
 		}

@@ -712,8 +712,8 @@ stateDiagram-v2
     CheckLiveLedger --> LiveResume: 内存 Ledger 命中前缀 (工具结果返回 / 连续追问 / Steering)
     CheckLiveLedger --> SearchBranchAnchor: 内存无会话或前缀偏离 (/resume, /fork, /tree, /retry)
 
-    SearchBranchAnchor --> ExactAnchorResume: 命中末尾锚点且后端会话文件存在
-    SearchBranchAnchor --> PartialAnchorFork: 命中历史中间锚点 (回退或分支)
+    SearchBranchAnchor --> ExactAnchorResume: 命中末尾锚点且轨迹库检查点一致
+    SearchBranchAnchor --> PartialAnchorFork: 命中中间锚点或轨迹库已超过末尾锚点
     SearchBranchAnchor --> FreshReplay: 无可用锚点 / 跨 Provider 切入 / 工具模式已切换
 
     ExactAnchorResume --> SessionResumeRPC: 调用 session/resume (零历史回放开销)
@@ -725,7 +725,7 @@ stateDiagram-v2
 关键场景行为保证：
 
 1. **正常多轮对话与工具续接（`LiveResume`）**：直接复用已打开的进程与 `agySessionId`，耗时接近 0ms。
-2. **重启 Pi 后执行 `pi -c` 或 `/resume`（`ExactAnchorResume`）**：从分支末端读取 `AgySessionAnchor`，校验 `transcriptDigest` 一致后，直接调用 **`session/resume`** 重新挂载后端会话，无需回放历史消息，完整保留 AGY 侧的思考历史与内部状态。
+2. **重启 Pi 后执行 `pi -c` 或 `/resume`（`ExactAnchorResume`）**。对话摘要、轨迹库水位及步骤指纹均匹配时，直接用 `session/resume` 恢复。轨迹已经继续写入时，从对应历史检查点截断副本。检查点缺失、轨迹记录减少或分叉不可用时，桥接从 Pi 历史恢复。首次原生会话导入仍可直接恢复已有步骤的源会话。
 3. **执行 `/fork`、`/tree` 回退历史节点或切换其他模型后再切回 Antigravity**：
    - 若回退点恰好存在记录了 `dbCheckpoint` 的 `AgySessionAnchor`，可选启用基于 Node.js `node:sqlite` 只读 `VACUUM INTO` 的副本截断分叉（严格校验表结构与前缀指纹，绝不修改原会话文件，Windows 下若检测到 WAL 锁冲突立即放弃并降级）。
    - 若中间穿插了其他 Provider（例如先用 OpenAI 聊了三轮，第 4 轮切到 `antigravity/gemini-4-neon`）或快照不可用，自动走 **`FreshReplay`**：新建 `session/new`，将前序完整对话（含文本、图片块、历史思考与已完成工具记录）封装在 `<conversation-checkpoint>...</conversation-checkpoint>` 标签内连同最新用户输入一并发送，确保跨 Provider 无缝接力。
@@ -892,3 +892,7 @@ stateDiagram-v2
 1. 实现 `hybrid` 混合增强模式、模式 A 下的 Pi MCP / Skills / `AGENTS.md` 去重桥接（含 `via-host` / `direct-config` 策略与 `additionalDirectories` 授权）及反向 Skills 发现。
 2. 实现基于 `node:sqlite` 的可选会话分叉加速（支持 `/fork` 与 `/tree` 还原后端检查点）及 `/agy sessions` 历史会话回放导入。
 3. 完成 Ubuntu 与 Windows 双环境端到端验证，完善面向公开用户的 `README.md` 与 `CHANGELOG.md`，验证 `pi install npm:pi-antigravity-bridge` 与 `pi install https://github.com/onprs/Pi-Antigravity-Bridge.git` 双渠道安装流程。
+
+## 双仓开发联调
+
+在两个源码仓库分别安装开发依赖后，将 `PI_TRAFFIC_OPT_ROOT` 设为 `Pi-Traffic-Optimization` 仓库的绝对路径。在本仓库运行 `npm run check`。双仓用例通过真实 Pi SDK 加载两个扩展入口，通过本地 ACP 和 HTTP MCP 模拟后端验证逐代计量、工具大文本回传及流量回退。Pi 配置、ACP 会话库和流量报告均写入临时目录。

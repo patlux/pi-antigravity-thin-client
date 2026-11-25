@@ -593,8 +593,8 @@ export class AgyTurnMirrorBroker {
 				return { outcome: { outcome: "cancelled" } };
 			}
 
-			const idx = labels.indexOf(selectedLabel);
-			const chosen = idx >= 0 ? params.options[idx] : params.options[0];
+			const chosen = params.options[labels.indexOf(selectedLabel)];
+			if (!chosen) return { outcome: { outcome: "cancelled" } };
 			return {
 				outcome: {
 					outcome: "selected",
