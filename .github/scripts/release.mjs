@@ -214,11 +214,13 @@ async function main() {
 		console.log(`Registry decision: ${decision}`);
 	} else if (command === "verify") {
 		const artifact = readArtifact(directory);
+		// npm answers "being processed and may take a few minutes"; 0.1.0 needed about two.
+		const attempts = 60;
 		let metadata;
-		for (let attempt = 0; attempt < 6; attempt++) {
+		for (let attempt = 0; attempt < attempts; attempt++) {
 			metadata = await registry();
 			if (metadata.versions?.[artifact.version] && metadata["dist-tags"]?.[artifact.distTag] === artifact.version) break;
-			if (attempt < 5) await delay(5_000);
+			if (attempt < attempts - 1) await delay(5_000);
 		}
 		assert.equal(registryDecision(artifact, metadata), "existing", "Published version not visible in registry");
 		const url = new URL(metadata.versions[artifact.version].dist.tarball);

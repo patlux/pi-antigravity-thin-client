@@ -104,7 +104,7 @@ Other `v*` tags start validation but cannot publish. Wait for a release to finis
 2. **Check:** the CI workflow for this commit: typecheck and tests on Ubuntu and Windows with Node 22 and 24, the packed package in a real Pi, workflow syntax, `npm audit`, no install lifecycle scripts.
 3. **Package:** run the checks again on Node 24, audit, pack once without lifecycle scripts, check the file allowlist and load that tarball in a real Pi with a stub `agy`. Upload tarball, SHA-512 and release notes as one Actions artifact.
 4. **Publish:** on a fresh runner in environment `npm`, verify artifact, Git refs and registry state again, then publish that exact tarball through OIDC without lifecycle scripts or dependency installation. Only this job has `id-token: write`. Provenance is generated automatically.
-5. **Verify:** download the public tarball, compare its SHA-512 with the tested artifact, check the dist-tag and load it in a real Pi again.
+5. **Verify:** wait up to five minutes until npm shows the version under its dist-tag (npm processes new versions for a minute or two), then download the public tarball, compare its SHA-512 with the tested artifact, check the dist-tag and load it in a real Pi again.
 6. **GitHub Release:** only after verification, create the release from the tag with its changelog section.
 
 No step uses an Antigravity account.
@@ -122,7 +122,8 @@ A local `gh run watch` timeout does not cancel the remote run. A release is comp
 
 ## Recovery
 
-- **Version briefly absent after publish:** npm can acknowledge a publish before the version is visible everywhere. Recheck with `--prefer-online` at bounded intervals; do not republish or move a tag.
+- **Version briefly absent after publish:** npm can acknowledge a publish before the version is visible everywhere (0.1.0 took about two minutes). Recheck with `--prefer-online` at bounded intervals, then rerun the failed jobs; do not republish or move a tag.
+- **GitHub API error while creating the release:** the release may exist anyway (0.1.0 got HTTP 504 and was created). Check `gh release view v<version>` before rerunning; the rerun leaves a matching release unchanged.
 - **Validation or tests fail before publish:** nothing is published. Fix the cause in a new commit with a new version and tag; do not move the failed tag. A transient infrastructure failure can be retried for the same commit.
 - **Publish reports an error:** check the exact version on npm first. Do not blindly repeat `npm publish`.
 - **Version exists, later steps failed:** after confirming the registry matches, rerun only the failed jobs (`gh run rerun <run-id> --repo patlux/pi-antigravity-thin-client --failed`). Publishing is skipped when registry integrity and dist-tag match exactly.
