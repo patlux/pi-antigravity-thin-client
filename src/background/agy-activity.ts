@@ -1,0 +1,409 @@
+/**
+ * Reads what Antigravity does between Pi turns from agy's own local files.
+ *
+ * agy runs long commands and `schedule` timers as background tasks. When one ends,
+ * agy gets a message and starts a turn by itself, without a prompt from the client.
+ * ACP clients see nothing of that turn, so the bridge reads agy's per-conversation
+ * files below `<app data>/brain/<conversation>/.system_generated/`:
+ * `logs/transcript.jsonl` (one JSON object per step), `messages/*.json` (task
+ * results) and `tasks/task-N.log` (live output). The format is agy-internal; every
+ * parser here is defensive and returns nothing it cannot read.
+ *
+ * Reading these files sends nothing to agy or Google.
+ */
+
+export interface TranscriptToolCall {
+	name: string;
+	/** agy stores each argument as a JSON-encoded string; decoded where possible. */
+	args: Record<string, string>;
+}
+
+export interface TranscriptStep {
+	index: number;
+	createdAtMs?: number;
+	source: string;
+	type: string;
+	status: string;
+	content: string;
+	toolCalls: TranscriptToolCall[];
+}
+
+export interface TaskMessage {
+	id: string;
+	taskId: string;
+	title?: string;
+	content: string;
+	timestampMs?: number;
+	toolCallId?: string;
+	/** False for progress notes such as "still running after 600s". */
+	terminal: boolean;
+}
+
+export type TaskOutcome = "ok" | "failed" | "canceled" | "expired";
+/** `running`: a progress note about a task that has not ended. */
+export type TriggerOutcome = TaskOutcome | "running";
+
+export interface BackgroundTask {
+	/** `task-N`; N is the transcript step that went to the background. */
+	taskId: string;
+	stepIndex: number;
+	kind: "command" | "timer";
+	/** Command line, or the timer prompt. */
+	description: string;
+	/** agy's short label for the command (`toolSummary`), when known. */
+	summary?: string;
+	timerSeconds?: number;
+	startedAtMs?: number;
+	finished?: {
+		outcome: TaskOutcome;
+		title?: string;
+		exitCode?: number;
+		atMs?: number;
+	};
+}
+
+export interface AutonomousTrigger {
+	taskId?: string;
+	title?: string;
+	outcome?: TriggerOutcome;
+	exitCode?: number;
+	kind?: BackgroundTask["kind"];
+}
+
+export interface AutonomousAction {
+	name: string;
+	summary: string;
+}
+
+export interface AutonomousTurn {
+	/** Transcript step of the message that woke agy up. */
+	startStep: number;
+	endStep?: number;
+	startedAtMs?: number;
+	endedAtMs?: number;
+	/** `running` until agy answers without tool calls; `interrupted` when a prompt arrived first. */
+	state: "running" | "done" | "interrupted";
+	triggers: AutonomousTrigger[];
+	actions: AutonomousAction[];
+	/** agy's text answers in this turn, in order. */
+	texts: string[];
+}
+
+export interface AgyActivity {
+	tasks: BackgroundTask[];
+	turns: AutonomousTurn[];
+	/** Highest step index of a prompt sent by the client, or -1. */
+	lastUserInputStep: number;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+	return isRecord(value) ? value : undefined;
+}
+
+function asString(value: unknown): string | undefined {
+	return typeof value === "string" ? value : undefined;
+}
+
+function parseTimeMs(value: unknown): number | undefined {
+	if (typeof value !== "string") return undefined;
+	const ms = Date.parse(value);
+	return Number.isFinite(ms) ? ms : undefined;
+}
+
+function decodeArgument(raw: unknown): string | undefined {
+	if (typeof raw === "number" || typeof raw === "boolean") return String(raw);
+	if (typeof raw !== "string") return undefined;
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (typeof parsed === "string") return parsed;
+		if (typeof parsed === "number" || typeof parsed === "boolean") return String(parsed);
+		return raw;
+	} catch {
+		return raw;
+	}
+}
+
+/** Parses one line of `transcript.jsonl`; undefined for anything unexpected. */
+export function parseTranscriptLine(line: string): TranscriptStep | undefined {
+	const trimmed = line.trim();
+	if (!trimmed) return undefined;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(trimmed);
+	} catch {
+		return undefined;
+	}
+	const obj = asRecord(parsed);
+	if (!obj || typeof obj.step_index !== "number" || !Number.isSafeInteger(obj.step_index)) {
+		return undefined;
+	}
+	const toolCalls: TranscriptToolCall[] = [];
+	if (Array.isArray(obj.tool_calls)) {
+		for (const rawCall of obj.tool_calls) {
+			const call = asRecord(rawCall);
+			const name = asString(call?.name);
+			if (!call || !name) continue;
+			const args: Record<string, string> = {};
+			const rawArgs = asRecord(call.args);
+			if (rawArgs) {
+				for (const [key, value] of Object.entries(rawArgs)) {
+					const decoded = decodeArgument(value);
+					if (decoded !== undefined) args[key] = decoded;
+				}
+			}
+			toolCalls.push({ name, args });
+		}
+	}
+	return {
+		index: obj.step_index,
+		createdAtMs: parseTimeMs(obj.created_at),
+		source: asString(obj.source) ?? "",
+		type: asString(obj.type) ?? "",
+		status: asString(obj.status) ?? "",
+		content: typeof obj.content === "string" ? obj.content : "",
+		toolCalls,
+	};
+}
+
+/** Last path segment of a task id such as `<conversation>/task-12`. */
+function shortTaskId(fullId: string): string | undefined {
+	const match = /(task-\d+)$/.exec(fullId.trim());
+	return match?.[1];
+}
+
+/** Parses one `messages/<uuid>.json` file of a conversation. */
+export function parseTaskMessage(json: string): TaskMessage | undefined {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(json);
+	} catch {
+		return undefined;
+	}
+	const obj = asRecord(parsed);
+	const id = asString(obj?.id);
+	const sender = asString(obj?.sender);
+	const taskId = sender ? shortTaskId(sender) : undefined;
+	if (!obj || !id || !taskId) return undefined;
+	const toolCall = asRecord(asRecord(asRecord(obj.sourceMetadata)?.tool)?.toolCall);
+	const title = asString(asRecord(obj.renderDetails)?.messageTitle);
+	const content = asString(obj.content) ?? "";
+	return {
+		id,
+		taskId,
+		title,
+		content,
+		timestampMs: parseTimeMs(obj.timestamp),
+		toolCallId: asString(toolCall?.id),
+		terminal: isTerminalNote(title, content),
+	};
+}
+
+const TERMINAL_CONTENT_PATTERN = /^Task id "[^"]*" (?:finished|was cancell?ed)/;
+const TERMINAL_TITLE_PATTERN = /(?:finished|was cancell?ed|timer has expired)\s*$/i;
+
+/** Whether a task note reports the end of the task rather than progress. */
+export function isTerminalNote(title: string | undefined, content: string): boolean {
+	return TERMINAL_CONTENT_PATTERN.test(content.trim()) || TERMINAL_TITLE_PATTERN.test(title ?? "");
+}
+
+const BACKGROUND_TASK_PATTERN = /background task with task id:\s*(\S+)/;
+const TASK_DESCRIPTION_PATTERN = /Task Description:\s*([\s\S]*?)(?:\n\s*Task logs are available at:|$)/;
+const TIMER_PATTERN = /^Timer:\s*(\d+)\s*s(?:,\s*Prompt:\s*([\s\S]*))?$/;
+const EXIT_CODE_PATTERN = /Command exited with code (-?\d+)/;
+const MESSAGE_HEADER_PATTERN = /\[Message\][^\n]*?\btimestamp=(\S+)[^\n]*?\bsender=(\S+)[^\n]*?\bcontent=([\s\S]*?)(?:\n<\/SYSTEM_MESSAGE>|$)/;
+const MESSAGE_SENDER_PATTERN = /\[Message\][^\n]*?\bsender=(\S+)/;
+
+function outcomeOf(title: string | undefined, content: string, kind: BackgroundTask["kind"] | undefined) {
+	const exitMatch = EXIT_CODE_PATTERN.exec(content);
+	const exitCode = exitMatch ? Number.parseInt(exitMatch[1], 10) : undefined;
+	let outcome: TaskOutcome;
+	if (/was cancell?ed/i.test(title ?? "") || /was cancell?ed/i.test(content)) {
+		outcome = "canceled";
+	} else if (kind === "timer" || /timer has expired/i.test(title ?? "")) {
+		outcome = "expired";
+	} else if (exitCode !== undefined && exitCode !== 0) {
+		outcome = "failed";
+	} else {
+		outcome = "ok";
+	}
+	return { outcome, exitCode };
+}
+
+function summarizeAction(call: TranscriptToolCall): AutonomousAction {
+	const args = call.args;
+	const summary =
+		args.toolSummary ??
+		args.CommandLine ??
+		args.Path ??
+		args.AbsolutePath ??
+		args.TargetFile ??
+		args.Query ??
+		(args.DurationSeconds ? `${args.DurationSeconds} s` : undefined) ??
+		(args.TaskId && args.Action ? `${args.Action} ${shortTaskId(args.TaskId) ?? args.TaskId}` : undefined) ??
+		"";
+	return { name: call.name, summary: summary.replace(/\s+/g, " ").trim() };
+}
+
+function isMessageDelivery(step: TranscriptStep): boolean {
+	return step.type === "SYSTEM_MESSAGE" && step.content.includes("[Message]");
+}
+
+/**
+ * Derives background tasks and the turns agy took on its own.
+ *
+ * A turn ends with a model response without tool calls. A message delivered after
+ * such an end starts an autonomous turn; a prompt from the client (`USER_INPUT`)
+ * interrupts it. Messages delivered inside a running turn only add triggers.
+ */
+export function deriveAgyActivity(
+	steps: readonly TranscriptStep[],
+	messages: readonly TaskMessage[],
+): AgyActivity {
+	const ordered = [...steps].sort((a, b) => a.index - b.index);
+	// Notes per task in time order; the first terminal one ends the task.
+	const notesByTask = new Map<string, TaskMessage[]>();
+	for (const message of messages) {
+		const notes = notesByTask.get(message.taskId) ?? [];
+		notes.push(message);
+		notesByTask.set(message.taskId, notes);
+	}
+	for (const notes of notesByTask.values()) {
+		notes.sort((a, b) => (a.timestampMs ?? 0) - (b.timestampMs ?? 0));
+	}
+	const endOf = (taskId: string) => notesByTask.get(taskId)?.find((note) => note.terminal);
+	/** The note delivered in a transcript step: same task, same second. */
+	const noteAt = (taskId: string, atMs: number | undefined) =>
+		atMs === undefined
+			? undefined
+			: notesByTask
+					.get(taskId)
+					?.find((note) => note.timestampMs !== undefined && Math.abs(note.timestampMs - atMs) < 1_000);
+
+	const tasks: BackgroundTask[] = [];
+	const taskKinds = new Map<string, BackgroundTask["kind"]>();
+	let lastPlannerCalls: TranscriptToolCall[] = [];
+	for (const step of ordered) {
+		if (step.type === "PLANNER_RESPONSE") {
+			lastPlannerCalls = step.toolCalls;
+			continue;
+		}
+		if (step.status !== "RUNNING") continue;
+		const idMatch = BACKGROUND_TASK_PATTERN.exec(step.content);
+		const taskId = idMatch ? shortTaskId(idMatch[1]) : undefined;
+		if (!taskId) continue;
+		const description = (TASK_DESCRIPTION_PATTERN.exec(step.content)?.[1] ?? "").trim();
+		const timer = TIMER_PATTERN.exec(description);
+		const kind: BackgroundTask["kind"] = timer ? "timer" : "command";
+		const summary = lastPlannerCalls.find(
+			(call) => call.name === "run_command" && call.args.CommandLine?.trim() === description,
+		)?.args.toolSummary;
+		const task: BackgroundTask = {
+			taskId,
+			stepIndex: step.index,
+			kind,
+			description: timer ? (timer[2] ?? "").trim() : description,
+			summary,
+			timerSeconds: timer ? Number.parseInt(timer[1], 10) : undefined,
+			startedAtMs: step.createdAtMs,
+		};
+		const end = endOf(taskId);
+		if (end) {
+			const { outcome, exitCode } = outcomeOf(end.title, end.content, kind);
+			task.finished = { outcome, title: end.title, exitCode, atMs: end.timestampMs };
+		}
+		taskKinds.set(taskId, kind);
+		tasks.push(task);
+	}
+
+	const turns: AutonomousTurn[] = [];
+	let lastUserInputStep = -1;
+	let inTurn = false;
+	let current: AutonomousTurn | undefined;
+	const closeCurrent = (state: AutonomousTurn["state"], endStep: number, endedAtMs?: number) => {
+		if (!current) return;
+		current.state = state;
+		current.endStep = endStep;
+		current.endedAtMs = endedAtMs;
+		if (current.texts.length > 0 || current.actions.length > 0 || state === "done") {
+			turns.push(current);
+		}
+		current = undefined;
+	};
+
+	for (const step of ordered) {
+		if (step.type === "USER_INPUT") {
+			lastUserInputStep = step.index;
+			closeCurrent("interrupted", step.index - 1, step.createdAtMs);
+			inTurn = true;
+			continue;
+		}
+		if (isMessageDelivery(step)) {
+			const header = MESSAGE_HEADER_PATTERN.exec(step.content);
+			const sender = header?.[2] ?? MESSAGE_SENDER_PATTERN.exec(step.content)?.[1];
+			const taskId = sender ? shortTaskId(sender) : undefined;
+			const kind = taskId ? taskKinds.get(taskId) : undefined;
+			const deliveredContent = (header?.[3] ?? "").trim();
+			const note = taskId ? noteAt(taskId, parseTimeMs(header?.[1])) : undefined;
+			const title = note?.title;
+			const content = note?.content ?? deliveredContent;
+			const terminal = note ? note.terminal : isTerminalNote(undefined, content) || kind === "timer";
+			const result = terminal ? outcomeOf(title, content, kind) : undefined;
+			const trigger: AutonomousTrigger = {
+				taskId,
+				title,
+				outcome: terminal ? result?.outcome : "running",
+				exitCode: result?.exitCode,
+				kind,
+			};
+			if (current) {
+				current.triggers.push(trigger);
+			} else if (!inTurn) {
+				current = {
+					startStep: step.index,
+					startedAtMs: step.createdAtMs,
+					state: "running",
+					triggers: [trigger],
+					actions: [],
+					texts: [],
+				};
+				inTurn = true;
+			}
+			continue;
+		}
+		if (step.type !== "PLANNER_RESPONSE") continue;
+		const text = step.content.trim();
+		if (current) {
+			if (text) current.texts.push(text);
+			current.actions.push(...step.toolCalls.map(summarizeAction));
+		}
+		if (step.toolCalls.length === 0) {
+			closeCurrent("done", step.index, step.createdAtMs);
+			inTurn = false;
+		}
+	}
+	if (current) {
+		turns.push(current);
+	}
+
+	return { tasks, turns, lastUserInputStep };
+}
+
+/** Last visible line of a task log: carriage-return progress and ANSI codes removed. */
+export function lastLogLine(logText: string): string | undefined {
+	const withoutAnsi = logText.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "");
+	const lines = withoutAnsi
+		.split("\n")
+		.map((line) => {
+			const parts = line.split("\r");
+			for (let i = parts.length - 1; i >= 0; i--) {
+				if (parts[i].trim()) return parts[i].trim();
+			}
+			return "";
+		})
+		.filter((line) => line.length > 0);
+	return lines.at(-1);
+}

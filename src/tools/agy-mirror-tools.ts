@@ -36,6 +36,7 @@ const MirrorToolParamsSchema = Type.Object(
 		command: Type.Optional(Type.String()),
 		query: Type.Optional(Type.String()),
 		agentRole: Type.Optional(Type.String()),
+		tool: Type.Optional(Type.String()),
 	},
 	{ additionalProperties: true },
 );
@@ -150,8 +151,14 @@ export function classifyAgyToolCall(input: {
 		lowerTitle.includes("workflow");
 
 	let mirrorToolName: AgyMirrorToolName = "agy_tool";
+	// agy reports its own non-shell tools (schedule, manage_task, ...) as kind
+	// "other" titled "Run <tool_name>"; they are not shell commands.
+	const internalTool =
+		kind === "other" && command === undefined ? /^run ([a-z][a-z0-9_]*)$/.exec(lowerTitle)?.[1] : undefined;
 
-	if (isExplicitSubagentTitle) {
+	if (internalTool) {
+		mirrorToolName = "agy_tool";
+	} else if (isExplicitSubagentTitle) {
 		mirrorToolName = "agy_subagent";
 	} else if (kind === "execute" || command !== undefined || lowerTitle.startsWith("run ")) {
 		mirrorToolName = "agy_bash";
@@ -183,6 +190,7 @@ export function classifyAgyToolCall(input: {
 	if (command) args.command = command;
 	if (query) args.query = query;
 	if (agentRole) args.agentRole = agentRole;
+	if (internalTool) args.tool = internalTool;
 
 	return {
 		mirrorToolName,
@@ -201,6 +209,7 @@ interface TrackedMirrorCallState {
 	command?: string;
 	query?: string;
 	agentRole?: string;
+	tool?: string;
 	status: AcpToolStatus;
 	contentBlocks: Array<TextContent | ImageContent>;
 	diffs: AgyDiffPayload[];
@@ -252,6 +261,16 @@ function formatRawOutputFallback(rawOutput: unknown): string | undefined {
 	}
 }
 
+/** What a note for a mirror call without output may look at. */
+export interface EmptyResultContext {
+	agySessionId: string;
+	kind?: string;
+	title?: string;
+	command?: string;
+	/** agy-internal tool name such as `schedule`. */
+	toolName?: string;
+}
+
 /**
  * 模式 A 镜像工具状态中枢，同时承载：
  * 1. `tool_call` / `tool_call_update` 与 `Mirror.execute()` 的跨循环实时同步；
@@ -262,6 +281,12 @@ export class AgyTurnMirrorBroker {
 	private readonly calls = new Map<string, TrackedMirrorCallState>();
 	private fallbackUiContext?: ExtensionContext;
 	private permissionMutex: Promise<void> = Promise.resolve();
+	private emptyResultNote?: (context: EmptyResultContext) => string | undefined;
+
+	/** Supplies a note for calls that agy finished without output (background tasks, timers). */
+	setEmptyResultNote(note: ((context: EmptyResultContext) => string | undefined) | undefined): void {
+		this.emptyResultNote = note;
+	}
 
 	setFallbackUiContext(ctx: ExtensionContext | undefined): void {
 		this.fallbackUiContext = ctx;
@@ -308,6 +333,7 @@ export class AgyTurnMirrorBroker {
 					typeof classified.arguments.agentRole === "string"
 						? classified.arguments.agentRole
 						: undefined,
+				tool: typeof classified.arguments.tool === "string" ? classified.arguments.tool : undefined,
 				status: payload.status ?? "pending",
 				contentBlocks: [],
 				diffs: [],
@@ -340,6 +366,9 @@ export class AgyTurnMirrorBroker {
 			}
 			if (typeof classified.arguments.agentRole === "string") {
 				state.agentRole = classified.arguments.agentRole;
+			}
+			if (typeof classified.arguments.tool === "string") {
+				state.tool = classified.arguments.tool;
 			}
 		}
 
@@ -624,6 +653,21 @@ export class AgyTurnMirrorBroker {
 					text: state.diffs.map((d) => `Updated ${d.path}`).join("\n"),
 				},
 			];
+		}
+		if (content.length === 0 && state.completed && !state.failed && this.emptyResultNote) {
+			let note: string | undefined;
+			try {
+				note = this.emptyResultNote({
+					agySessionId: state.agySessionId,
+					kind: state.kind,
+					title: state.title,
+					command: state.command,
+					toolName: state.tool,
+				});
+			} catch {
+				note = undefined;
+			}
+			if (note) content = [{ type: "text", text: note }];
 		}
 
 		return {

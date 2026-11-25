@@ -441,6 +441,11 @@ export class TurnCoordinator {
 		};
 	}
 
+	/** Whether the agy process serving this conversation is still running. */
+	isAgySessionAlive(agySessionId: string): boolean {
+		return Boolean(this.ledgersByAgyId.get(agySessionId)?.conn.isAlive);
+	}
+
 	/** 用户主动取消某个正在执行的 AGY 原生会话 */
 	cancelAgySessionById(agySessionId: string): void {
 		const ledger = this.ledgersByAgyId.get(agySessionId);

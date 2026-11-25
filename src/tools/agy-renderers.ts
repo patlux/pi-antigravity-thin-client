@@ -163,6 +163,16 @@ export function getMirrorToolRenderers(toolName: AgyMirrorToolName): ToolRendere
 					);
 				}
 				default: {
+					const internalTool = typeof args?.tool === "string" ? args.tool : undefined;
+					if (internalTool === "schedule") {
+						return new Text(`${theme.fg("toolTitle", theme.bold("⏰ timer"))}${duration}`, 0, 0);
+					}
+					if (internalTool === "manage_task") {
+						return new Text(`${theme.fg("toolTitle", theme.bold("task"))} ${theme.fg("muted", "Hintergrund-Task abfragen/steuern")}${duration}`, 0, 0);
+					}
+					if (internalTool) {
+						return new Text(`${theme.fg("toolTitle", theme.bold(internalTool))}${duration}`, 0, 0);
+					}
 					const fallbackName = title || "tool";
 					return new Text(
 						`${theme.fg("toolTitle", theme.bold(fallbackName))}${duration}`,

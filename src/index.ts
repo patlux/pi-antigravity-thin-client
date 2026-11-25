@@ -5,13 +5,16 @@ import type {
 	OAuthCredentials,
 	OAuthLoginCallbacks,
 } from "@earendil-works/pi-ai";
-import type {
-	ExtensionAPI,
-	ExtensionContext,
-	ProviderConfig,
-	TurnEndEvent,
+import {
+	getMarkdownTheme,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type ProviderConfig,
+	type TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
+import { Markdown } from "@earendil-works/pi-tui";
 import { buildAgySpawnSpec, resolveAgyBinary } from "./acp/binary-resolver.ts";
+import { BackgroundActivityController } from "./background/background-controller.ts";
 import { AcpProcessManager } from "./acp/process-manager.ts";
 import {
 	ANTIGRAVITY_API_ID,
@@ -35,6 +38,11 @@ import {
 	registerAntigravityCommands,
 	ToolActivationController,
 } from "./ui/commands.ts";
+import {
+	AUTONOMOUS_ENTRY_TYPE,
+	isAutonomousEntryData,
+	renderAutonomousEntry,
+} from "./ui/background-activity.ts";
 import { updateAntigravityStatusBar } from "./ui/status-bar.ts";
 
 const SENTINEL_API_KEY = "agy-managed";
@@ -218,6 +226,21 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 	}
 	pi.registerToolRenderer(createAgyToolRendererResolver());
 
+	// 2b. What agy does between Pi turns (background tasks, turns it takes on its own):
+	// a live widget and session cards. Display only; nothing goes to agy or the model.
+	const background = new BackgroundActivityController(pi, coordinator);
+	mirrorBroker.setEmptyResultNote((context) => background.emptyResultNote(context));
+	pi.registerEntryRenderer(AUTONOMOUS_ENTRY_TYPE, (entry, options, theme) => {
+		if (!isAutonomousEntryData(entry.data)) return undefined;
+		return renderAutonomousEntry(
+			entry.data,
+			options.expanded,
+			theme,
+			(text) => new Markdown(text, 0, 0, getMarkdownTheme()),
+			options.keyHint("app.tools.expand", "zum Aufklappen"),
+		);
+	});
+
 	// 3. 注册 `/agy` 命令族
 	let backgroundRefreshController: AbortController | undefined;
 	const refreshAndReRegisterModels = async (
@@ -312,6 +335,7 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 
 	pi.on("turn_end", async (event: TurnEndEvent, ctx) => {
 		if (ctx.model?.provider !== ANTIGRAVITY_PROVIDER_ID) return;
+		background.sync(ctx);
 		const stopReason = event.message.role === "assistant" ? event.message.stopReason : undefined;
 		if (stopReason === "toolUse") {
 			updateAntigravityStatusBar(ctx, coordinator.config, coordinator.getTelemetrySnapshot());
@@ -351,6 +375,7 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async () => {
+		background.stop();
 		backgroundRefreshController?.abort();
 		backgroundRefreshController = undefined;
 		await coordinator.dispose();
