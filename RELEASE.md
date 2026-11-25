@@ -133,9 +133,11 @@ Recovery stays within the CI/OIDC path. There is no alternative publishing path.
 
 ## Merge upstream changes
 
-The fork follows [onprs/Pi-Antigravity-Bridge](https://github.com/onprs/Pi-Antigravity-Bridge) (remote `upstream`):
+The fork follows [onprs/Pi-Antigravity-Bridge](https://github.com/onprs/Pi-Antigravity-Bridge) (remote `upstream`). Upstream uses the same `vX.Y.Z` tag names for its own versions, so fetch it without tags; tags in this repository are fork versions only:
 
 ```sh
+git remote add upstream https://github.com/onprs/Pi-Antigravity-Bridge.git
+git config remote.upstream.tagOpt --no-tags
 git fetch upstream
 git merge upstream/main
 ```
