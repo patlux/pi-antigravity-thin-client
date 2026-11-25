@@ -65,6 +65,25 @@ class TranscriptReader {
 	}
 }
 
+/** Adds new `messages/*.json` notes of a conversation to `cache` (keyed by file name). */
+function readTaskMessages(dir: string, cache: Map<string, TaskMessage>): void {
+	let names: string[];
+	try {
+		names = fs.readdirSync(dir);
+	} catch {
+		return;
+	}
+	for (const name of names) {
+		if (!name.endsWith(".json") || name === "read.json" || cache.has(name)) continue;
+		try {
+			const message = parseTaskMessage(fs.readFileSync(path.join(dir, name), "utf8"));
+			if (message) cache.set(name, message);
+		} catch {
+			// A file still being written is read again on the next poll.
+		}
+	}
+}
+
 export interface ActivitySnapshot {
 	agySessionId: string;
 	/** Running tasks and tasks that finished during the last few seconds. */
@@ -103,6 +122,7 @@ export class AgyActivityWatcher {
 	private readonly messages = new Map<string, TaskMessage>();
 	private readonly subagentRecords = new Map<string, SubagentRecord>();
 	private readonly subagentReaders = new Map<string, TranscriptReader>();
+	private readonly subagentMessages = new Map<string, Map<string, TaskMessage>>();
 	private readonly emittedTurns = new Set<number>();
 	private baselineStep: number | undefined;
 	private timer: NodeJS.Timeout | undefined;
@@ -163,12 +183,20 @@ export class AgyActivityWatcher {
 				);
 				this.subagentReaders.set(record.conversationId, reader);
 			}
+			let messages = this.subagentMessages.get(record.conversationId);
+			if (!messages) {
+				messages = new Map();
+				this.subagentMessages.set(record.conversationId, messages);
+			}
 			try {
 				reader.read();
+				readTaskMessages(path.join(brainDir, record.conversationId, ".system_generated", "messages"), messages);
 			} catch {
 				// Read again on the next poll.
 			}
-			result.push(deriveSubagentStatus(record, [...reader.steps.values()], parentSteps));
+			result.push(
+				deriveSubagentStatus(record, [...reader.steps.values()], parentSteps, [...messages.values()]),
+			);
 		}
 		return result.sort((a, b) => (a.startedAtMs ?? 0) - (b.startedAtMs ?? 0));
 	}
@@ -270,22 +298,7 @@ export class AgyActivityWatcher {
 	}
 
 	private readMessages(): void {
-		const dir = path.join(this.options.systemDir, "messages");
-		let names: string[];
-		try {
-			names = fs.readdirSync(dir);
-		} catch {
-			return;
-		}
-		for (const name of names) {
-			if (!name.endsWith(".json") || name === "read.json" || this.messages.has(name)) continue;
-			try {
-				const message = parseTaskMessage(fs.readFileSync(path.join(dir, name), "utf8"));
-				if (message) this.messages.set(name, message);
-			} catch {
-				// A file still being written is read again on the next poll.
-			}
-		}
+		readTaskMessages(path.join(this.options.systemDir, "messages"), this.messages);
 	}
 
 	private readLogTail(taskId: string): string | undefined {

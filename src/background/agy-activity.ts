@@ -504,6 +504,7 @@ export function deriveSubagentStatus(
 	record: SubagentRecord,
 	ownSteps: readonly TranscriptStep[],
 	parentSteps: readonly TranscriptStep[],
+	ownMessages: readonly TaskMessage[] = [],
 ): SubagentStatus {
 	const ordered = [...ownSteps].sort((a, b) => a.index - b.index);
 	const planners = ordered.filter((step) => step.type === "PLANNER_RESPONSE");
@@ -530,8 +531,20 @@ export function deriveSubagentStatus(
 		state = "working";
 		activity = "denkt nach …";
 	} else {
-		state = "idle";
-		activity = firstLine(lastPlanner.content);
+		// An answer without tool calls ends its turn, but a timer or background
+		// command it started still wakes it up again: then it waits, it is not done.
+		const pending = deriveAgyActivity(ordered, ownMessages).tasks.filter((task) => !task.finished);
+		const waitingFor = pending.at(-1);
+		if (waitingFor) {
+			state = "working";
+			activity =
+				waitingFor.kind === "timer"
+					? `wartet auf Timer ${waitingFor.timerSeconds ?? "?"} s`
+					: `wartet auf ${waitingFor.summary ?? waitingFor.description}`;
+		} else {
+			state = "idle";
+			activity = firstLine(lastPlanner.content);
+		}
 	}
 
 	const spawn = spawnArguments(record, parentSteps);

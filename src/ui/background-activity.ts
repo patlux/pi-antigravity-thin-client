@@ -258,7 +258,15 @@ function renderSubagentLine(status: SubagentStatus, now: number, spinner: string
 	const role = status.role ?? "Subagent";
 	const activity =
 		status.state === "idle" ? `fertig${status.activity ? `: ${status.activity}` : ""}` : (status.activity ?? "");
-	return ` ${mark} ${theme.fg("muted", status.conversationId.slice(0, 8))}  ${theme.fg("toolTitle", role)}  ${theme.fg("dim", elapsed)}  ${theme.fg("muted", subagentModelLabel(status))}  ${theme.fg("toolOutput", activity)}`;
+	const model = subagentModelLabel(status);
+	const parts = [
+		theme.fg("muted", status.conversationId.slice(0, 8)),
+		theme.fg("toolTitle", role),
+		elapsed ? theme.fg("dim", elapsed) : "",
+		model ? theme.fg("muted", model) : "",
+		activity ? theme.fg("toolOutput", activity) : "",
+	].filter((part) => part.length > 0);
+	return ` ${mark} ${parts.join("  ")}`;
 }
 
 /** Widget lines for running background tasks and an autonomous turn in progress. */

@@ -363,6 +363,23 @@ describe("agy subagents", () => {
 		assert.equal(killed.state, "killed");
 	});
 
+	it("shows a subagent that waits for its own timer as waiting, not as done", () => {
+		const record = parseSubagentRecord(SUB_RECORD);
+		assert.ok(record);
+		const line = (obj: Record<string, unknown>) => JSON.stringify(obj);
+		const own = [
+			...subagentLines().slice(0, 3),
+			line({ step_index: 3, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-25T15:01:44Z", tool_calls: [{ name: "schedule", args: { DurationSeconds: "10" } }] }),
+			line({ step_index: 4, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-25T15:01:48Z", content: `Tool is running as a background task with task id: ${SUB}/task-4\nTask Description: Timer: 10s, Prompt: weiter\nTask logs are available at: file:///x` }),
+			line({ step_index: 5, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-25T15:01:48Z", content: "Warte auf den 10-Sekunden-Timer." }),
+		];
+		const waiting = deriveSubagentStatus(record, steps(own), []);
+		assert.deepEqual([waiting.state, waiting.activity], ["working", "wartet auf Timer 10 s"]);
+		const expired = parseTaskMessage(JSON.stringify({ id: "t", sender: `${SUB}/task-4`, timestamp: "2026-11-25T15:01:58Z", renderDetails: { messageTitle: "10s timer: Timer has expired" }, content: "weiter" }));
+		assert.ok(expired);
+		assert.equal(deriveSubagentStatus(record, steps(own), [], [expired]).state, "idle");
+	});
+
 	it("writes the invoke_subagent card: who, which model, which task", () => {
 		const args = { agentRole: "File Creator Subagent", agentType: "self", prompt: "Lege die Datei an.\nDanach melden." };
 		assert.equal(
