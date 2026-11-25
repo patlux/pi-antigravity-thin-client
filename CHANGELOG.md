@@ -4,6 +4,10 @@ Fork releases of pi-antigravity-thin-client. The upstream changelog of pi-antigr
 
 ## Unreleased
 
+### Added
+
+- `npm run test:e2e-resume` (`scripts/e2e/resume.mjs`): runs the real Pi in tmux against a stand-in for `agy` and checks `pi --continue` after Antigravity worked on its own, the refusal in a forked Pi session and `/agy sessions`, including every ACP request.
+
 ### Fixed
 
 - A Pi session with an Antigravity conversation could not be continued after Pi restarted (`/resume`, `pi --continue`) once Antigravity had worked on its own after the last prompt: a background task, a timer or a subagent added steps, or a background command changed its status when it ended. The package took that for a branch and refused the next prompt. It now reopens the conversation with `session/resume` and sends only the typed prompt.

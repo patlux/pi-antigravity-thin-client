@@ -6,7 +6,7 @@ pi-antigravity-thin-client is a Pi extension that connects Pi to Google Antigrav
 
 - Never send prompts to Antigravity yourself: no tmux keystrokes into a Pi session that uses an `antigravity/…` model, no `pi -p`, no scripts. Only a person typing in the interactive session may prompt Antigravity. Ask the user to run live tests.
 - Tests must never reach a real `agy`. Use the mock in `test/turn-coordinator-e2e.test.ts` or a stub binary through `PI_AGY_BIN`.
-- The one exception to the tmux rule is `scripts/screenshots/capture.mjs`: it types into Pi only against `scripts/screenshots/mock-agy.mjs`, set as `PI_AGY_BIN` and as the first `agy` on `PATH` of a temporary home. Keep it that way; never point it at a real `agy`.
+- The only exceptions to the tmux rule are `scripts/screenshots/capture.mjs` and `scripts/e2e/resume.mjs`. They type into Pi only against their mock (`scripts/screenshots/mock-agy.mjs`, `scripts/e2e/mock-agy.mjs`), set as `PI_AGY_BIN` and as the first `agy` on `PATH` of a temporary home; `resume.mjs` also leaves every other directory with an `agy` out of `PATH` and checks that `agy` resolves to the mock. Keep it that way; never point them at a real `agy`.
 - Keep the thin-client policy intact (`src/thin-client-policy.ts`, `src/human-prompt-gate.ts`, the refusals in `src/session/reconcile.ts` and `src/session/turn-coordinator.ts`). Never weaken or skip the thin-client tests.
 - Keep upstream code close to upstream so merges stay small; put fork features in their own modules (`src/background/`, `src/ui/background-activity.ts`).
 - All interface texts (notifications, errors, widget, cards, command help) are English. Translate Chinese texts that upstream merges bring in.
@@ -18,7 +18,10 @@ pi-antigravity-thin-client is a Pi extension that connects Pi to Google Antigrav
 npm ci
 npm run check          # typecheck and all tests
 npm run test:release   # release-rule tests only
+npm run test:e2e-resume # real Pi in tmux against a mock agy: continuing conversations
 ```
+
+Run `npm run test:e2e-resume` after changes to session restore (`src/session/`), anchors or `/agy sessions`. It needs `pi` and `tmux` and takes about a minute.
 
 ## Releases and upstream merges
 
