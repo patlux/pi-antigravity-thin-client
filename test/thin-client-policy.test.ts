@@ -10,6 +10,7 @@ import { DEFAULT_BRIDGE_CONFIG, loadBridgeConfig, resolveEffectiveFlags } from "
 import { buildFreshReplayPlan } from "../src/session/reconcile.ts";
 import { TurnCoordinator } from "../src/session/turn-coordinator.ts";
 import { AgyTurnMirrorBroker, createAgyMirrorToolDefinitions } from "../src/tools/agy-mirror-tools.ts";
+import { typedByHuman } from "./human-input.ts";
 
 const TEST_MODEL: Model<"antigravity-acp"> = {
 	id: "gemini-4-neon",
@@ -47,19 +48,34 @@ function withTempAgentDir<T>(fn: (dir: string) => T): T {
 	}
 }
 
-/** Runs one turn on a coordinator whose agy binary does not exist: a refusal must come first. */
+/**
+ * Writes a stand-in for `agy` that only records its start and exits. A missing
+ * configured binary is not enough: the resolver then falls back to the real `agy`
+ * on PATH, and a test prompt must never reach Antigravity.
+ */
+function writeRecordingAgy(dir: string): { bin: string; marker: string } {
+	const bin = path.join(dir, "recording-agy");
+	const marker = path.join(dir, "agy-started");
+	fs.writeFileSync(bin, `#!/bin/sh\necho started >> '${marker}'\nexit 1\n`, { mode: 0o755 });
+	return { bin, marker };
+}
+
+/** Runs one turn on a coordinator whose agy only records its start; a refusal must come first. */
 async function runTurn(params: {
 	hasUI: boolean | undefined;
 	withTools: boolean;
 	systemPrompt?: string;
 	messageText?: string;
 	cacheRetention?: "none" | "short" | "long";
+	/** Report the message as typed by the human (Pi's `input` + `message_start`). Default: true. */
+	typed?: boolean;
 }) {
 	const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-policy-turn-"));
+	const agy = writeRecordingAgy(tmp);
 	const broker = new AgyTurnMirrorBroker();
 	const coord = new TurnCoordinator(stubPi(), new AcpProcessManager(), broker, {
 		...DEFAULT_BRIDGE_CONFIG,
-		agyBin: path.join(tmp, "missing-agy"),
+		agyBin: agy.bin,
 		geminiDir: path.join(tmp, ".gemini"),
 	});
 	if (params.hasUI !== undefined) {
@@ -77,16 +93,21 @@ async function runTurn(params: {
 			}))
 		: undefined;
 	try {
+		const message = user(params.messageText ?? "hello");
+		if (params.typed ?? true) {
+			typedByHuman(coord.humanPromptGate, message);
+		}
 		const ctx = normalizeContext({
 			systemPrompt: params.systemPrompt,
-			messages: [user(params.messageText ?? "hello")],
+			messages: [message],
 			tools,
 		});
 		const stream = coord.streamSimple(TEST_MODEL, ctx, {
 			sessionId: "pi-policy",
 			cacheRetention: params.cacheRetention,
 		});
-		return await stream.result();
+		const result = await stream.result();
+		return Object.assign(result, { agyStarted: fs.existsSync(agy.marker) });
 	} finally {
 		await coord.dispose();
 		fs.rmSync(tmp, { recursive: true, force: true });
@@ -223,9 +244,17 @@ describe("thin-client policy", () => {
 		assert.match(uncached.errorMessage ?? "", /refusing auxiliary request/);
 	});
 
-	it("lets an interactive prompt with declared tools reach the agy process", async () => {
+	it("lets a typed interactive prompt with declared tools reach the agy process", async () => {
 		const msg = await runTurn({ hasUI: true, withTools: true });
 		assert.equal(msg.stopReason, "error");
 		assert.doesNotMatch(msg.errorMessage ?? "", /thin client/);
+		assert.equal(msg.agyStarted, true);
+	});
+
+	it("refuses a prompt nobody typed before starting agy", async () => {
+		const msg = await runTurn({ hasUI: true, withTools: true, typed: false });
+		assert.equal(msg.stopReason, "error");
+		assert.match(msg.errorMessage ?? "", /refusing a message you did not type/);
+		assert.equal(msg.agyStarted, false);
 	});
 });

@@ -7,6 +7,14 @@
 > model's history are never replayed; auxiliary requests (compaction, titles, recaps) and headless
 > use (subagents, workflows, `pi -p`) are refused. Start a new Pi session for each Antigravity
 > conversation. Upstream tests for the disabled features are skipped (`test/thin-client-skip.ts`).
+>
+> No automated loops (`src/human-prompt-gate.ts`): only prompts typed in the Pi session reach agy,
+> each once. Pi's automatic retries, `/goal` continuations, injected context, extension messages
+> (`pi.sendMessage`, `pi.sendUserMessage`), RPC input and `!` shell output are refused before any
+> session work; the bridge never makes up a prompt of its own. An empty quota fails as
+> `quota exceeded (429)`, which Pi does not retry. Prompts typed into the TUI by another program
+> (tmux scripts, orchestrators, watchdogs) look typed and cannot be told apart: never drive an
+> Antigravity session that way.
 
 将 Google Antigravity CLI（`agy`）作为原生模型与 Agent 后端接入 [Pi](https://github.com/earendil-works/pi)（`@earendil-works/pi-coding-agent`），在完整的 Pi TUI 交互界面中直接使用 Antigravity 提供的模型、思考档位与工具生态。
 

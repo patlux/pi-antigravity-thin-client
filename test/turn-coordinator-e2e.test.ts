@@ -5,10 +5,13 @@ import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
 import {
+	isRetryableAssistantError,
 	normalizeContext,
 	type AssistantMessageEvent,
+	type Message,
 	type Model,
 	type ToolCall,
+	type UserMessage,
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { AcpProcessManager } from "../src/acp/process-manager.ts";
@@ -18,6 +21,7 @@ import {
 	AgyTurnMirrorBroker,
 	createAgyMirrorToolDefinitions,
 } from "../src/tools/agy-mirror-tools.ts";
+import { interactiveContext, typedByHuman } from "./human-input.ts";
 import { THIN_CLIENT_DISABLED } from "./thin-client-skip.ts";
 
 /**
@@ -246,6 +250,16 @@ rl.on("line", async (line) => {
 
     if (lastBlockText === "AUX_STOP_CANCELLED") {
       send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "cancelled" } });
+      return;
+    }
+
+    if (lastBlockText === "QUOTA_EXHAUSTED_429") {
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\u26a0 RESOURCE_EXHAUSTED (code 429): Resource has been exhausted.\\n" } } }
+      });
+      send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
       return;
     }
 
@@ -1279,6 +1293,7 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 			},
 		} as unknown as ExtensionContext;
 		coord.setActiveContext(stubUiCtx);
+		typedByHuman(coord.humanPromptGate, { role: "user", content: "Update src/app.ts", timestamp: 1 });
 
 		try {
 			// 第 1 步：启动流，预期在原生 tool_call 处自动分片，产出 agy_edit 工具调用
@@ -1375,6 +1390,8 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 			parameters: t.parameters,
 		}));
 
+		typedByHuman(coord.humanPromptGate, { role: "user", content: "HANG_FOREVER", timestamp: 1 });
+
 		try {
 			const ac = new AbortController();
 			const ctx = normalizeContext({
@@ -1400,6 +1417,68 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 
 			assert.equal(abortedMsg.stopReason, "aborted");
 			assert.ok(elapsed < 50, `Esc 中断耗时应小于 50ms，实际耗时 ${elapsed}ms`);
+		} finally {
+			await coord.dispose();
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("thin client: sends a typed prompt once and refuses Pi's automatic retry and automated prompts", async () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-gate-"));
+		const binPath = writeMockAgyExecutable(tmpRoot);
+		const cfg: BridgeConfig = {
+			...DEFAULT_BRIDGE_CONFIG,
+			toolMode: "agy-tools",
+			agyBin: binPath,
+			geminiDir: path.join(tmpRoot, ".gemini"),
+		};
+		const pm = new AcpProcessManager();
+		const broker = new AgyTurnMirrorBroker();
+		const coord = new TurnCoordinator(createStubPiApi(), pm, broker, cfg);
+		coord.setActiveContext(interactiveContext(tmpRoot));
+		const tools = createAgyMirrorToolDefinitions(broker).map((t) => ({
+			name: t.name,
+			description: t.description,
+			parameters: t.parameters,
+		}));
+		const sentPrompts: unknown[] = [];
+		const run = (messages: Message[]) =>
+			coord
+				.streamSimple(TEST_MODEL, normalizeContext({ messages, tools }), {
+					sessionId: "pi-sess-gate",
+					onPayload: (payload) => {
+						sentPrompts.push(payload);
+						return undefined;
+					},
+				})
+				.result();
+
+		try {
+			const typed: UserMessage = { role: "user", content: "QUOTA_EXHAUSTED_429", timestamp: 1 };
+			typedByHuman(coord.humanPromptGate, typed);
+
+			const first = await run([typed]);
+			assert.equal(first.stopReason, "error");
+			assert.match(first.errorMessage ?? "", /quota exceeded \(429\)/);
+			assert.equal(isRetryableAssistantError(first), false, "Pi must not schedule a retry on an empty quota");
+			assert.equal(sentPrompts.length, 1);
+
+			// Pi's retry drops the failed attempt and asks again with the same context.
+			const retry = await run([typed]);
+			assert.equal(retry.stopReason, "error");
+			assert.match(retry.errorMessage ?? "", /refusing to send the same prompt again/);
+			assert.equal(isRetryableAssistantError(retry), false);
+			assert.equal(sentPrompts.length, 1, "a retry must not reach agy");
+
+			// A goal continuation or extension message has no typed input behind it.
+			const automated: UserMessage = { role: "user", content: "Continue the goal.", timestamp: 2 };
+			coord.humanPromptGate.noteInput("extension", "Continue the goal.");
+			coord.humanPromptGate.noteUserMessage(automated);
+			const auto = await run([typed, retry, automated]);
+			assert.equal(auto.stopReason, "error");
+			assert.match(auto.errorMessage ?? "", /refusing a message you did not type/);
+			assert.equal(isRetryableAssistantError(auto), false);
+			assert.equal(sentPrompts.length, 1, "an automated prompt must not reach agy");
 		} finally {
 			await coord.dispose();
 			fs.rmSync(tmpRoot, { recursive: true, force: true });

@@ -288,6 +288,17 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 		}
 	});
 
+	// Thin-client guard: remember which user messages the human typed in this session.
+	pi.on("input", (event) => {
+		coordinator.humanPromptGate.noteInput(event.source, event.text);
+	});
+
+	pi.on("message_start", (event) => {
+		if (event.message.role === "user") {
+			coordinator.humanPromptGate.noteUserMessage(event.message);
+		}
+	});
+
 	pi.on("model_select", (_event, ctx) => {
 		coordinator.setActiveContext(ctx);
 		toolActivation.syncForContext(ctx, coordinator.config);

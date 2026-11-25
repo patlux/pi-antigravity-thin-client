@@ -18,10 +18,12 @@ import {
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { BRIDGE_AGENT_NAME, type AcpClientConnection, type AcpProcessManager } from "../acp/process-manager.ts";
+import { HumanPromptGate, trailingUserMessages } from "../human-prompt-gate.ts";
 import {
 	AUXILIARY_REFUSED,
 	enforceThinClientPolicy,
 	HEADLESS_REFUSED,
+	NO_NEW_PROMPT_REFUSED,
 	ThinClientPolicyError,
 } from "../thin-client-policy.ts";
 import type {
@@ -103,6 +105,12 @@ import {
 	type PreloadedSqliteTurn,
 	type TrafficOptProjectionState,
 } from "./reconcile.ts";
+
+/**
+ * Error prefix for an exhausted Antigravity quota. "quota exceeded" is in Pi's
+ * non-retryable provider-limit pattern, so Pi does not repeat the prompt by itself.
+ */
+const QUOTA_EXCEEDED_ERROR = "Antigravity quota exceeded (429)";
 
 type PumpQueueItem =
 	| { kind: "acp_update"; update: AcpSessionUpdatePayload }
@@ -370,6 +378,8 @@ export class TurnCoordinator {
 	private currentConfig: BridgeConfig;
 	private activeContext?: ExtensionContext;
 	private latestTier?: AcpTierInfo;
+	/** Fed by Pi's `input` and `message_start` events; see `HumanPromptGate`. */
+	readonly humanPromptGate = new HumanPromptGate();
 
 	constructor(
 		pi: ExtensionAPI,
@@ -915,6 +925,19 @@ export class TurnCoordinator {
 		const hostMcpTools = filterToolsForHostMcpBridge(declaredTools, this.currentConfig);
 		const toolsDigest = computeToolsFingerprint(hostMcpTools);
 		const visibleMessages = extractVisibleMessages(context.messages);
+
+		// Thin-client policy: no automated loops. Before any session work, every new
+		// user message must be typed by the human and not sent before; without one,
+		// only the continuation of a running agy turn (tool results) may pass.
+		const continuesActiveTurn = Boolean(
+			primaryLedger &&
+				primaryLedger.conn.isAlive &&
+				primaryLedger.toolMode === this.currentConfig.toolMode &&
+				(primaryLedger.activePump ||
+					primaryLedger.parkedCalls.size > 0 ||
+					primaryLedger.detachedCallIds.size > 0),
+		);
+		this.humanPromptGate.authorize(trailingUserMessages(visibleMessages), continuesActiveTurn);
 
 		// 2. 优先检查活跃轮次续接（2a / 2b）：不因中途编辑 AGENTS.md / SKILL.md 改变 mountDigest 而跳过挂起结算导致死锁，
 		// 将规则挂载变更延后至下一新轮次生效。
@@ -2695,6 +2718,10 @@ export class TurnCoordinator {
 		model: Model<Api>,
 		options?: SimpleStreamOptions,
 	): Promise<void> {
+		// Thin-client policy: never make up a prompt (no "Continue." of our own).
+		if (promptBlocks.length === 0) {
+			throw new ThinClientPolicyError(NO_NEW_PROMPT_REFUSED);
+		}
 		const idleOk = await this.waitForInFlightPrompt(ledger, 2_500, options?.signal);
 		if (options?.signal?.aborted) {
 			writer.fail("aborted", "Request aborted by user");
@@ -2731,7 +2758,7 @@ export class TurnCoordinator {
 			preloadedTurns?: readonly PreloadedSqliteTurn[];
 		} = {
 			sessionId: ledger.agySessionId,
-			prompt: promptBlocks.length > 0 ? promptBlocks : [{ type: "text", text: "Continue." }],
+			prompt: promptBlocks,
 			...(preloadedTurns && preloadedTurns.length > 0 ? { preloadedTurns } : {}),
 		};
 
@@ -2857,7 +2884,7 @@ export class TurnCoordinator {
 								status: 429,
 							});
 							abortCurrentTurnSync();
-							writer.fail("error", `Antigravity quota exhausted (429): ${quotaError}`);
+							writer.fail("error", `${QUOTA_EXCEEDED_ERROR}: ${quotaError}`);
 							return;
 						}
 					}
@@ -3054,7 +3081,7 @@ export class TurnCoordinator {
 					calibratedUsage,
 				);
 				if (quotaError) {
-					writer.fail("error", `Antigravity quota exhausted (429): ${quotaError}`);
+					writer.fail("error", `${QUOTA_EXCEEDED_ERROR}: ${quotaError}`);
 				}
 				return;
 			}
@@ -3899,7 +3926,7 @@ export class TurnCoordinator {
 					}
 					await cleanupTempSession();
 					if (detectedQuotaErr) {
-						writer.fail("error", `Antigravity quota exhausted (429): ${detectedQuotaErr}`);
+						writer.fail("error", `${QUOTA_EXCEEDED_ERROR}: ${detectedQuotaErr}`);
 						return;
 					}
 					if (promptRes.stopReason === "cancelled") {
@@ -3912,7 +3939,7 @@ export class TurnCoordinator {
 					}
 					const { quotaError } = writer.finishTurn(promptRes.stopReason, promptRes.usage);
 					if (quotaError) {
-						writer.fail("error", `Antigravity quota exhausted (429): ${quotaError}`);
+						writer.fail("error", `${QUOTA_EXCEEDED_ERROR}: ${quotaError}`);
 					}
 				} finally {
 					options?.signal?.removeEventListener("abort", onAuxAbort);
