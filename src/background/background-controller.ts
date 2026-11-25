@@ -15,7 +15,7 @@ import {
 	toAutonomousEntryData,
 } from "../ui/background-activity.ts";
 import { type ActivitySnapshot, AgyActivityWatcher } from "./activity-watcher.ts";
-import type { AutonomousTurn } from "./agy-activity.ts";
+import { type AutonomousTurn, singleLine } from "./agy-activity.ts";
 
 function recordedStartSteps(ctx: ExtensionContext | undefined, agySessionId: string): Set<number> {
 	const steps = new Set<number>();
@@ -79,7 +79,7 @@ export class BackgroundActivityController {
 				break;
 			case "tool_call":
 				live.toolCalls++;
-				live.tool = update.title?.trim() || update.kind || "Tool";
+				live.tool = singleLine(update.title ?? "").trim() || update.kind || "Tool";
 				break;
 			case "tool_call_update":
 				if (update.status === "completed" || update.status === "failed") live.tool = undefined;

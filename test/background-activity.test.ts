@@ -487,6 +487,29 @@ describe("background activity display", () => {
 		assert.deepEqual(renderActivityLines({ ...base, live: { ...live, lastAtMs: now - LIVE_STALE_MS - 1 } }, now, 1, plainTheme), []);
 	});
 
+	it("keeps every widget line on one terminal row when agy runs a multi-line command", () => {
+		// agy's ACP title of a run_command is the whole command line, newlines included
+		// (seen live on 2026-11-25: a heredoc with `lsof -iTCP:9222` and `PID_BEFORE=$(…)`).
+		// A line break inside one widget line puts Pi's row count off, and parts of the
+		// command stay on the editor border.
+		const now = Date.parse("2026-11-25T13:55:05Z");
+		const command = 'echo "=== BEFORE ==="\nlsof -nP -a -iTCP:9222 -sTCP:LISTEN\r\nPID_BEFORE=$(lsof -t -a -iTCP:9222 -sTCP:LISTEN)\tdone';
+		const lines = renderActivityLines(
+			{
+				agySessionId: CONV,
+				tasks: [{ taskId: "task-7", kind: "command", description: "Check the port\nand the PID", stepIndex: 1, startedAtMs: now - 2_000 }],
+				logTails: new Map([["task-7", "=== BEFORE ===\nCOMMAND PID"]]),
+				live: { startedAtMs: now - 4_000, lastAtMs: now - 500, text: "", toolCalls: 1, thinking: false, tool: command },
+			},
+			now,
+			0,
+			plainTheme,
+		);
+		for (const line of lines) assert.doesNotMatch(line, /[\r\n\t]/, JSON.stringify(line));
+		assert.match(lines.at(-1) ?? "", /→ echo "=== BEFORE ===" lsof -nP -a -iTCP:9222 -sTCP:LISTEN PID_BEFORE=\$\(lsof -t -a -iTCP:9222 -sTCP:LISTEN\) done$/);
+		assert.match(lines[1], /Check the port and the PID .*=== BEFORE === COMMAND PID$/);
+	});
+
 	it("names model and reasoning level", () => {
 		assert.deepEqual(splitAgyModel("gemini-4-neon-xhigh"), { baseId: "gemini-4-neon", reasoning: "xhigh" });
 		assert.deepEqual(splitAgyModel("gemini-3.8-flash-low"), { baseId: "gemini-3.8-flash", reasoning: "low" });

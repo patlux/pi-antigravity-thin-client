@@ -247,6 +247,14 @@ function outcomeOf(title: string | undefined, content: string, kind: BackgroundT
 }
 
 /** First non-empty line as plain text: Markdown links keep their label, code marks go. */
+/**
+ * Text for one terminal row: line breaks, tabs and the spaces around them become one
+ * space. agy's titles and command lines can span several lines.
+ */
+export function singleLine(text: string): string {
+	return text.replace(/\s*[\r\n\t\f\v\u2028\u2029]\s*/g, " ");
+}
+
 export function firstLine(text: string, max = 160): string | undefined {
 	const line = text
 		.split("\n")

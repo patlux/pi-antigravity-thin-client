@@ -7,6 +7,7 @@ import {
 	type AutonomousTurn,
 	type BackgroundTask,
 	type SubagentStatus,
+	singleLine,
 	splitAgyModel,
 	type TriggerOutcome,
 } from "../background/agy-activity.ts";
@@ -359,7 +360,9 @@ export function renderActivityLines(
 		const actions = turn.actions.length === 1 ? "1 tool call" : `${turn.actions.length} tool calls`;
 		lines.push(` ${spinner} ${theme.fg("toolTitle", "working on its own")}  ${theme.fg("dim", elapsed)}  ${theme.fg("muted", actions)}`);
 	}
-	return lines;
+	// One widget line is one terminal row: Pi counts rows by lines, so a line break
+	// inside a line (agy's multi-line command titles) leaves stray text on screen.
+	return lines.map(singleLine);
 }
 
 class ActivityWidgetComponent implements Component {
