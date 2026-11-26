@@ -29,20 +29,22 @@ import {
 	RESUME_DIVERGED_REFUSED,
 	ThinClientPolicyError,
 } from "../thin-client-policy.ts";
-import type {
-	AcpAvailableModel,
-	AcpConfigOption,
-	AcpMcpServerSpec,
-	AcpPromptBlock,
-	AcpPromptResponse,
-	AcpPromptUsage,
-	AcpRequestPermissionParams,
-	AcpSessionNewResult,
-	AcpSessionResumeResult,
-	AcpSessionUpdateNotification,
-	AcpSessionUpdatePayload,
-	AcpSetConfigOptionResult,
-	AcpTierInfo,
+import {
+	type AcpAvailableModel,
+	type AcpConfigOption,
+	type AcpMcpServerSpec,
+	type AcpPromptBlock,
+	type AcpPromptResponse,
+	type AcpPromptUsage,
+	type AcpRequestPermissionParams,
+	type AcpSessionNewResult,
+	type AcpSessionResumeResult,
+	type AcpSessionUpdateNotification,
+	type AcpSessionUpdatePayload,
+	type AcpSetConfigOptionResult,
+	type AcpTierInfo,
+	findConfigOption,
+	flattenConfigOptionChoices,
 } from "../acp/protocol.ts";
 import {
 	ANTIGRAVITY_PROVIDER_ID,
@@ -2794,7 +2796,7 @@ export class TurnCoordinator {
 				}
 				ledger.appliedModelValue = resolved.configModelValue;
 				// 切换模型后服务端可能重置 thought_level 为新模型默认值，同步刷新本地缓存以触发精确重对齐
-				const refreshedThought = ledger.configOptions.find((o) => o.id === "thought_level");
+				const refreshedThought = findConfigOption(ledger.configOptions, "thought_level");
 				ledger.appliedThoughtLevel = refreshedThought?.currentValue;
 			} catch {
 				// 若特定渠道不支持切换配置项则保持服务端默认选择
@@ -2803,8 +2805,8 @@ export class TurnCoordinator {
 
 		if (resolved.configThoughtLevel && ledger.appliedThoughtLevel !== resolved.configThoughtLevel) {
 			// 校验切换模型后最新通告的 thought_level 候选集
-			const thoughtOpt = ledger.configOptions.find((o) => o.id === "thought_level");
-			const supportedSet = new Set((thoughtOpt?.options ?? []).map((c) => c.value));
+			const thoughtOpt = findConfigOption(ledger.configOptions, "thought_level");
+			const supportedSet = new Set(flattenConfigOptionChoices(thoughtOpt).map((c) => c.value));
 			const targetEffort =
 				supportedSet.size === 0 || supportedSet.has(resolved.configThoughtLevel)
 					? resolved.configThoughtLevel
@@ -3964,8 +3966,8 @@ export class TurnCoordinator {
 
 			if (resolved.configThoughtLevel) {
 				const latestOpts = modelRes?.configOptions ?? sessionRes.configOptions ?? [];
-				const thoughtOpt = latestOpts.find((o) => o.id === "thought_level");
-				const supported = new Set((thoughtOpt?.options ?? []).map((c) => c.value));
+				const thoughtOpt = findConfigOption(latestOpts, "thought_level");
+				const supported = new Set(flattenConfigOptionChoices(thoughtOpt).map((c) => c.value));
 				if (supported.size === 0 || supported.has(resolved.configThoughtLevel)) {
 					await conn
 						.request(

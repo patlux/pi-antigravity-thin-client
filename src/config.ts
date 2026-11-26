@@ -13,7 +13,7 @@ export type AutoBoolean = boolean | "auto";
 export type PiMcpBridgeStrategy = "via-host" | "direct-config";
 
 /** AGY 原生执行权限策略（对应 ACP configId="mode"） */
-export type AgyExecutionMode = "default" | "accept-edits" | "plan";
+export type AgyExecutionMode = "default" | "accept-edits" | "plan" | "auto";
 
 /** 公开配置文件与内存态完整配置结构 */
 export interface BridgeConfig {
@@ -84,7 +84,7 @@ export const DEFAULT_BRIDGE_CONFIG: Readonly<BridgeConfig> = {
 
 const VALID_TOOL_MODES = new Set<ToolMode>(["pi-tools", "agy-tools", "hybrid"]);
 const VALID_STRATEGIES = new Set<PiMcpBridgeStrategy>(["via-host", "direct-config"]);
-const VALID_EXEC_MODES = new Set<AgyExecutionMode>(["default", "accept-edits", "plan"]);
+const VALID_EXEC_MODES = new Set<AgyExecutionMode>(["default", "accept-edits", "plan", "auto"]);
 
 /** 解析 Pi 全局 Agent 配置目录（遵循 PI_CODING_AGENT_DIR 覆盖约定） */
 export function resolvePiAgentDir(env: NodeJS.ProcessEnv = process.env): string {

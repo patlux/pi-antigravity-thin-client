@@ -10,11 +10,13 @@ import type { ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 
 export type ChatModelConfig = Extract<ProviderModelConfig, { reasoning: boolean }>;
 import type { AcpProcessManager } from "../acp/process-manager.ts";
-import type {
-	AcpAvailableModel,
-	AcpConfigOption,
-	AcpSessionNewResult,
-	AcpTierInfo,
+import {
+	type AcpAvailableModel,
+	type AcpConfigOption,
+	type AcpSessionNewResult,
+	type AcpTierInfo,
+	findConfigOption,
+	flattenConfigOptionChoices,
 } from "../acp/protocol.ts";
 import {
 	type BridgeConfig,
@@ -310,12 +312,11 @@ export function aggregateAcpModels(
 	models: ChatModelConfig[];
 	modelEfforts: Record<string, EffortSuffix[]>;
 } {
-	const modelConfigOpt = configOptions.find((opt) => opt.id === "model");
-	const configIds = new Set<string>(
-		(modelConfigOpt?.options ?? []).map((choice) => choice.value),
-	);
+	const modelConfigOpt = findConfigOption(configOptions, "model");
+	const modelChoices = flattenConfigOptionChoices(modelConfigOpt);
+	const configIds = new Set<string>(modelChoices.map((choice) => choice.value));
 	const configDisplayNames = new Map<string, string>(
-		(modelConfigOpt?.options ?? []).map((choice) => [choice.value, choice.name]),
+		modelChoices.map((choice) => [choice.value, choice.name]),
 	);
 
 	// 统计去掉档位后缀后的候选家族变体
@@ -345,8 +346,8 @@ export function aggregateAcpModels(
 	};
 
 	// 优先遵循 configOptions[id="model"] 的官方顺序
-	if (modelConfigOpt?.options && modelConfigOpt.options.length > 0) {
-		for (const choice of modelConfigOpt.options) {
+	if (modelChoices.length > 0) {
+		for (const choice of modelChoices) {
 			const id = choice.value;
 			const variants = groupedByBase.get(id);
 			if (variants && variants.length > 0) {
@@ -364,10 +365,11 @@ export function aggregateAcpModels(
 				registerEntry(id, choice.name || id, [selfSplit.effort]);
 			} else {
 				// 若该裸模型在 availableModels 中无展开变体，检查当前默认 thought_level 选项
-				const currentThoughtOpt = configOptions.find((opt) => opt.id === "thought_level");
+				const currentThoughtOpt = findConfigOption(configOptions, "thought_level");
+				const currentThoughtChoices = flattenConfigOptionChoices(currentThoughtOpt);
 				const fallbackEfforts =
-					modelConfigOpt.currentValue === id && currentThoughtOpt?.options
-						? currentThoughtOpt.options
+					modelConfigOpt?.currentValue === id && currentThoughtChoices.length > 0
+						? currentThoughtChoices
 								.map((o) => o.value as EffortSuffix)
 								.filter((v): v is EffortSuffix =>
 									(EFFORT_SUFFIXES as readonly string[]).includes(v),
@@ -625,8 +627,8 @@ export function resolveSessionModelSelection(
 	configOptions: readonly AcpConfigOption[] = [],
 	availableModels: readonly AcpAvailableModel[] = [],
 ): ResolvedModelSelection {
-	const modelOpt = configOptions.find((o) => o.id === "model");
-	const configValues = new Set((modelOpt?.options ?? []).map((c) => c.value));
+	const modelOpt = findConfigOption(configOptions, "model");
+	const configValues = new Set(flattenConfigOptionChoices(modelOpt).map((c) => c.value));
 	const availableIds = new Set(availableModels.map((m) => m.modelId));
 
 	// 收集该模型可用的后缀变体

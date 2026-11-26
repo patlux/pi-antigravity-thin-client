@@ -138,13 +138,49 @@ export interface AcpConfigOptionChoice {
 	description?: string;
 }
 
+export interface AcpConfigOptionChoiceGroup {
+	group: string;
+	name?: string;
+	options: AcpConfigOptionChoice[];
+}
+
+export type AcpConfigOptionEntry = AcpConfigOptionChoice | AcpConfigOptionChoiceGroup;
+
 export interface AcpConfigOption {
 	id: string;
 	name: string;
 	category?: string;
 	type: "select" | string;
 	currentValue: string;
-	options?: AcpConfigOptionChoice[];
+	options?: AcpConfigOptionEntry[];
+}
+
+/** Flattens both flat select choices and grouped select options from ACP configOptions. */
+export function flattenConfigOptionChoices(
+	option: Pick<AcpConfigOption, "options"> | undefined,
+): AcpConfigOptionChoice[] {
+	if (!option?.options) return [];
+	const choices: AcpConfigOptionChoice[] = [];
+	for (const entry of option.options) {
+		if ("value" in entry) {
+			choices.push(entry);
+		} else if (Array.isArray(entry.options)) {
+			choices.push(...entry.options);
+		}
+	}
+	return choices;
+}
+
+/** Finds an ACP configOption by category or id (preferring category match, then id match). */
+export function findConfigOption(
+	configOptions: readonly AcpConfigOption[] | undefined,
+	key: string,
+): AcpConfigOption | undefined {
+	if (!configOptions || configOptions.length === 0) return undefined;
+	return (
+		configOptions.find((opt) => opt.category === key) ??
+		configOptions.find((opt) => opt.id === key)
+	);
 }
 
 export interface AcpTierInfo {
@@ -331,6 +367,7 @@ export type AcpSessionUpdatePayload =
 			rawOutput?: unknown;
 			content?: AcpToolCallContentItem[];
 			locations?: AcpToolCallLocation[];
+			_meta?: Record<string, unknown>;
 	  }
 	| {
 			sessionUpdate: "tool_call_update";
@@ -344,6 +381,7 @@ export type AcpSessionUpdatePayload =
 			rawOutput?: unknown;
 			content?: AcpToolCallContentItem[];
 			locations?: AcpToolCallLocation[];
+			_meta?: Record<string, unknown>;
 	  }
 	| {
 			sessionUpdate: "usage_update";
@@ -382,6 +420,7 @@ export interface AcpPermissionOption {
 	optionId: string;
 	name: string;
 	kind?: "allow_once" | "allow_always" | "reject_once" | "reject_always" | string;
+	_meta?: Record<string, unknown>;
 }
 
 export interface AcpRequestPermissionParams {
@@ -395,6 +434,11 @@ export interface AcpRequestPermissionParams {
 		content?: AcpToolCallContentItem[];
 	};
 	options: AcpPermissionOption[];
+}
+
+/** Antigravity sends native interactive questions through `session/request_permission` with `interaction_*` toolCallIds. */
+export function isAntigravityUserInputRequest(params: AcpRequestPermissionParams): boolean {
+	return Boolean(params.toolCall?.toolCallId?.startsWith("interaction_"));
 }
 
 export type AcpRequestPermissionResult =
@@ -411,12 +455,28 @@ export type AcpRequestPermissionResult =
 	  };
 
 /** ACP Elicitation 结构化提问请求与响应 */
+export interface AcpElicitationTitledOption {
+	const: string;
+	title?: string;
+	description?: string;
+}
+
+export interface AcpElicitationArrayItemsSchema {
+	type?: string;
+	enum?: string[];
+	anyOf?: AcpElicitationTitledOption[];
+}
+
 export interface AcpElicitationPropertySchema {
 	type?: string;
 	title?: string;
 	description?: string;
 	enum?: string[];
 	enumNames?: string[];
+	oneOf?: AcpElicitationTitledOption[];
+	items?: AcpElicitationArrayItemsSchema;
+	minItems?: number;
+	maxItems?: number;
 	default?: unknown;
 }
 
