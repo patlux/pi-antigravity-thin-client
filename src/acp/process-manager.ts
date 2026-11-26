@@ -38,6 +38,9 @@ export const BRIDGE_AGENT_NAME = "pi-bridge";
 // Thin-client fork: report this package honestly, not the upstream name.
 export const CLIENT_INFO_NAME = "pi-antigravity-thin-client";
 export const CLIENT_INFO_VERSION = readPackageVersion();
+/** Allow up to 90s for cold ~1 GB PyInstaller runtime extraction before failing initialize. */
+export const INITIALIZE_TIMEOUT_MS = 90_000;
+const SAFE_SESSION_ID_RE = /^[\w-]+$/;
 
 export class AcpRpcError extends Error {
 	readonly code: number;
@@ -347,7 +350,7 @@ function pruneOldManagedAgentDirs(agentsRoot: string, activeName: string, maxHas
 	}
 }
 
-function appendNoProxyLoopback(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+export function buildAgyChildEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	const result: NodeJS.ProcessEnv = { ...env };
 	const existing = env.NO_PROXY || env.no_proxy || "";
 	const entries = existing
@@ -362,7 +365,22 @@ function appendNoProxyLoopback(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	const joined = entries.join(",");
 	result.NO_PROXY = joined;
 	result.no_proxy = joined;
+	// agy requires "true" (not "1") to suppress CLI self-updates during ACP runs.
+	const hasDisableAutoUpdate = Object.keys(result).some(
+		(key) => key.toUpperCase() === "AGY_CLI_DISABLE_AUTO_UPDATE" && result[key] !== undefined,
+	);
+	if (!hasDisableAutoUpdate) {
+		result.AGY_CLI_DISABLE_AUTO_UPDATE = "true";
+	}
 	return result;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isElicitationCreateParams(value: unknown): value is AcpElicitationCreateParams {
+	return isRecord(value);
 }
 
 function racePromiseWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
@@ -393,17 +411,28 @@ function scheduleOrphanedSessionDbCleanup(
 	appDataDirName: string,
 	sessionId: string,
 ): void {
-	const convDir = path.join(geminiDir, appDataDirName || "antigravity-cli", "conversations");
+	if (!SAFE_SESSION_ID_RE.test(sessionId)) return;
+	const appDataDir = path.join(geminiDir, appDataDirName || "antigravity-cli");
+	const convDir = path.join(appDataDir, "conversations");
+	const brainDir = path.join(appDataDir, "brain", sessionId);
+	const annotationFile = path.join(appDataDir, "annotations", `${sessionId}.pbtxt`);
 	const tryUnlink = () => {
-		for (const suffix of [".db", ".db-wal", ".db-shm", ".db-journal"]) {
+		for (const suffix of [".db", ".db-wal", ".db-shm", ".db-journal", ".meta"]) {
 			try {
-				const target = path.join(convDir, `${sessionId}${suffix}`);
-				if (fs.existsSync(target)) {
-					fs.unlinkSync(target);
-				}
+				fs.rmSync(path.join(convDir, `${sessionId}${suffix}`), { force: true });
 			} catch {
-				// Windows 下 worker 退出前可能短暂持有文件句柄，由后续延时重试兜底
+				// Windows worker may briefly hold file handles before exit; delayed retries cover it
 			}
+		}
+		try {
+			fs.rmSync(brainDir, { recursive: true, force: true });
+		} catch {
+			// Retry on delayed sweep
+		}
+		try {
+			fs.rmSync(annotationFile, { force: true });
+		} catch {
+			// Retry on delayed sweep
 		}
 	};
 	tryUnlink();
@@ -465,7 +494,7 @@ export class AcpClientConnection {
 		const spawnSpec = buildAgySpawnSpec(binary, args, env);
 
 		this.proc = spawn(spawnSpec.command, spawnSpec.args, {
-			env: appendNoProxyLoopback(env),
+			env: buildAgyChildEnv(env),
 			stdio: ["pipe", "pipe", "pipe"],
 			windowsVerbatimArguments: spawnSpec.windowsVerbatimArguments,
 			detached: process.platform !== "win32",
@@ -558,7 +587,7 @@ export class AcpClientConnection {
 						version: CLIENT_INFO_VERSION,
 					},
 				},
-				{ timeoutMs: 20_000 },
+				{ timeoutMs: INITIALIZE_TIMEOUT_MS },
 			)
 				.then((res) => {
 					this.initResult = res;
@@ -843,7 +872,9 @@ export class AcpClientConnection {
 				return;
 			}
 
-			if (req.method === "elicitation/create") {
+			const isLegacyElicitation =
+				req.method === "session/elicitation" || req.method === "_session/elicitation";
+			if (req.method === "elicitation/create" || isLegacyElicitation) {
 				if (!this.handlers.onElicitationCreate) {
 					this.writeJson({
 						jsonrpc: "2.0",
@@ -852,10 +883,24 @@ export class AcpClientConnection {
 					});
 					return;
 				}
-				const result = await this.handlers.onElicitationCreate(
-					req.params as AcpElicitationCreateParams,
-				);
-				this.writeJson({ jsonrpc: "2.0", id: req.id, result });
+				if (!isElicitationCreateParams(req.params)) {
+					this.writeJson({
+						jsonrpc: "2.0",
+						id: req.id,
+						error: { code: -32602, message: "Invalid elicitation params" },
+					});
+					return;
+				}
+				const params: AcpElicitationCreateParams =
+					typeof req.params.message === "string"
+						? req.params
+						: { ...req.params, message: "" };
+				const result = await this.handlers.onElicitationCreate(params);
+				this.writeJson({
+					jsonrpc: "2.0",
+					id: req.id,
+					result: isLegacyElicitation ? { action: result } : result,
+				});
 				return;
 			}
 

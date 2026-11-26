@@ -9,17 +9,23 @@ import {
 import type { ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 
 export type ChatModelConfig = Extract<ProviderModelConfig, { reasoning: boolean }>;
-import type { AcpProcessManager } from "../acp/process-manager.ts";
+import {
+	type AcpClientConnection,
+	type AcpProcessManager,
+	AcpRpcError,
+} from "../acp/process-manager.ts";
 import {
 	type AcpAvailableModel,
 	type AcpConfigOption,
 	type AcpSessionNewResult,
+	type AcpSetConfigOptionResult,
 	type AcpTierInfo,
 	findConfigOption,
 	flattenConfigOptionChoices,
 } from "../acp/protocol.ts";
 import {
 	type BridgeConfig,
+	resolveAgyAppDataDir,
 	resolveAgyConversationsDir,
 	resolveModelCachePath,
 } from "../config.ts";
@@ -30,6 +36,24 @@ export const ANTIGRAVITY_BASE_URL = "acp://antigravity-cli";
 
 const EFFORT_SUFFIXES = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
 type EffortSuffix = (typeof EFFORT_SUFFIXES)[number];
+const EFFORT_SUFFIX_SET: ReadonlySet<string> = new Set(EFFORT_SUFFIXES);
+const SAFE_SESSION_ID_RE = /^[\w-]+$/;
+
+function isEffortSuffix(value: string): value is EffortSuffix {
+	return EFFORT_SUFFIX_SET.has(value);
+}
+
+function extractValidEfforts(values: readonly string[] | undefined): EffortSuffix[] {
+	if (!values || values.length === 0) return [];
+	const found = new Set<EffortSuffix>();
+	for (const raw of values) {
+		const normalized = raw.trim().toLowerCase();
+		if (isEffortSuffix(normalized)) {
+			found.add(normalized);
+		}
+	}
+	return EFFORT_ORDER.filter((effort) => found.has(effort));
+}
 
 const EFFORT_ORDER: readonly EffortSuffix[] = [
 	"minimal",
@@ -308,6 +332,7 @@ function makeChatModelConfig(
 export function aggregateAcpModels(
 	availableModels: readonly AcpAvailableModel[] = [],
 	configOptions: readonly AcpConfigOption[] = [],
+	probedEffortsByModel?: ReadonlyMap<string, readonly string[]>,
 ): {
 	models: ChatModelConfig[];
 	modelEfforts: Record<string, EffortSuffix[]>;
@@ -317,6 +342,10 @@ export function aggregateAcpModels(
 	const configIds = new Set<string>(modelChoices.map((choice) => choice.value));
 	const configDisplayNames = new Map<string, string>(
 		modelChoices.map((choice) => [choice.value, choice.name]),
+	);
+	const currentThoughtOpt = findConfigOption(configOptions, "thought_level");
+	const currentThoughtEfforts = extractValidEfforts(
+		flattenConfigOptionChoices(currentThoughtOpt).map((choice) => choice.value),
 	);
 
 	// 统计去掉档位后缀后的候选家族变体
@@ -335,14 +364,18 @@ export function aggregateAcpModels(
 	const models: ChatModelConfig[] = [];
 	const modelEfforts: Record<string, EffortSuffix[]> = {};
 	const emittedIds = new Set<string>();
+	const seenDisplayNames = new Set<string>();
 
-	const registerEntry = (id: string, name: string, rawEfforts: Iterable<EffortSuffix>) => {
-		if (emittedIds.has(id)) return;
+	const registerEntry = (id: string, rawName: string, rawEfforts: Iterable<EffortSuffix>) => {
+		if (!id.trim() || emittedIds.has(id)) return;
 		emittedIds.add(id);
+		const baseName = rawName.trim() || id;
+		const displayName = seenDisplayNames.has(baseName) ? `${baseName} (${id})` : baseName;
+		seenDisplayNames.add(baseName);
 		const set = new Set(rawEfforts);
 		const ordered = EFFORT_ORDER.filter((e) => set.has(e));
 		modelEfforts[id] = ordered;
-		models.push(makeChatModelConfig(id, name, ordered));
+		models.push(makeChatModelConfig(id, displayName, ordered));
 	};
 
 	// 优先遵循 configOptions[id="model"] 的官方顺序
@@ -364,18 +397,14 @@ export function aggregateAcpModels(
 			if (selfSplit && !configIds.has(selfSplit.baseId)) {
 				registerEntry(id, choice.name || id, [selfSplit.effort]);
 			} else {
-				// 若该裸模型在 availableModels 中无展开变体，检查当前默认 thought_level 选项
-				const currentThoughtOpt = findConfigOption(configOptions, "thought_level");
-				const currentThoughtChoices = flattenConfigOptionChoices(currentThoughtOpt);
-				const fallbackEfforts =
-					modelConfigOpt?.currentValue === id && currentThoughtChoices.length > 0
-						? currentThoughtChoices
-								.map((o) => o.value as EffortSuffix)
-								.filter((v): v is EffortSuffix =>
-									(EFFORT_SUFFIXES as readonly string[]).includes(v),
-								)
-						: [];
-				registerEntry(id, choice.name || id, fallbackEfforts);
+				const probed = probedEffortsByModel?.get(id);
+				const resolvedEfforts =
+					probed !== undefined
+						? extractValidEfforts(probed)
+						: modelConfigOpt?.currentValue === id
+							? currentThoughtEfforts
+							: [];
+				registerEntry(id, choice.name || id, resolvedEfforts);
 			}
 		}
 	}
@@ -494,19 +523,30 @@ function raceCatalogProbeWithSignal<T>(promise: Promise<T>, signal?: AbortSignal
  * 支持延时异步重试，兼容 Windows 下 `agy acp --worker` 退出前短暂持有文件句柄的场景。
  */
 export function removeEmptyProbeSessionFiles(config: BridgeConfig, sessionId: string): void {
-	if (!sessionId) return;
+	if (!SAFE_SESSION_ID_RE.test(sessionId)) return;
+	const appDataDir = resolveAgyAppDataDir(config);
 	const convDir = resolveAgyConversationsDir(config);
+	const brainDir = path.join(appDataDir, "brain", sessionId);
+	const annotationFile = path.join(appDataDir, "annotations", `${sessionId}.pbtxt`);
 	const tryRemove = (): boolean => {
 		let allGone = true;
-		for (const suffix of [".db", ".db-wal", ".db-shm", ".db-journal"]) {
+		for (const suffix of [".db", ".db-wal", ".db-shm", ".db-journal", ".meta"]) {
 			const target = path.join(convDir, `${sessionId}${suffix}`);
 			try {
-				if (fs.existsSync(target)) {
-					fs.unlinkSync(target);
-				}
+				fs.rmSync(target, { force: true });
 			} catch {
 				allGone = false;
 			}
+		}
+		try {
+			fs.rmSync(brainDir, { recursive: true, force: true });
+		} catch {
+			allGone = false;
+		}
+		try {
+			fs.rmSync(annotationFile, { force: true });
+		} catch {
+			allGone = false;
 		}
 		return allGone;
 	};
@@ -520,6 +560,71 @@ export function removeEmptyProbeSessionFiles(config: BridgeConfig, sessionId: st
 			}
 		}, 600).unref();
 	}
+}
+
+async function probePerModelThoughtLevels(
+	conn: AcpClientConnection,
+	sessionRes: AcpSessionNewResult,
+): Promise<Map<string, EffortSuffix[]>> {
+	const probed = new Map<string, EffortSuffix[]>();
+	if (!sessionRes.sessionId) return probed;
+
+	const modelConfigOpt = findConfigOption(sessionRes.configOptions, "model");
+	if (!modelConfigOpt) return probed;
+
+	const modelChoices = flattenConfigOptionChoices(modelConfigOpt);
+	if (modelChoices.length === 0) return probed;
+
+	const configIds = new Set<string>(modelChoices.map((choice) => choice.value));
+	const availableBases = new Set<string>();
+	for (const item of sessionRes.models?.availableModels ?? []) {
+		const split = splitEffortSuffix(item.modelId);
+		if (split) {
+			availableBases.add(split.baseId);
+		}
+	}
+
+	const modelsToProbe: string[] = [];
+	const seen = new Set<string>();
+	for (const choice of modelChoices) {
+		const id = choice.value;
+		if (!id.trim() || seen.has(id)) continue;
+		seen.add(id);
+		if (id === modelConfigOpt.currentValue) continue;
+		if (availableBases.has(id)) continue;
+		const selfSplit = splitEffortSuffix(id);
+		if (selfSplit && !configIds.has(selfSplit.baseId)) continue;
+		modelsToProbe.push(id);
+	}
+
+	for (const modelId of modelsToProbe) {
+		if (!conn.isAlive) break;
+		try {
+			const res = await conn.request<AcpSetConfigOptionResult>(
+				"session/set_config_option",
+				{
+					sessionId: sessionRes.sessionId,
+					configId: modelConfigOpt.id,
+					value: modelId,
+				},
+				{ timeoutMs: 8_000 },
+			);
+			if (Array.isArray(res?.configOptions)) {
+				const thoughtOpt = findConfigOption(res.configOptions, "thought_level");
+				const efforts = extractValidEfforts(
+					flattenConfigOptionChoices(thoughtOpt).map((choice) => choice.value),
+				);
+				probed.set(modelId, efforts);
+			}
+		} catch (error) {
+			if (error instanceof AcpRpcError && error.code === -32601) {
+				break;
+			}
+			// Ignore per-model probe failures so catalog discovery still succeeds.
+		}
+	}
+
+	return probed;
 }
 
 export interface ProbeCatalogOptions {
@@ -578,9 +683,11 @@ export async function probeLiveAntigravityCatalog(
 			);
 
 			try {
+				const probedEffortsByModel = await probePerModelThoughtLevels(conn, sessionRes);
 				const { models, modelEfforts } = aggregateAcpModels(
 					sessionRes.models?.availableModels ?? [],
 					sessionRes.configOptions ?? [],
+					probedEffortsByModel,
 				);
 				const snapshot: DiscoveredCatalogSnapshot = {
 					version: 1,
@@ -629,6 +736,10 @@ export function resolveSessionModelSelection(
 ): ResolvedModelSelection {
 	const modelOpt = findConfigOption(configOptions, "model");
 	const configValues = new Set(flattenConfigOptionChoices(modelOpt).map((c) => c.value));
+	const thoughtOpt = findConfigOption(configOptions, "thought_level");
+	const currentThoughtEfforts = extractValidEfforts(
+		flattenConfigOptionChoices(thoughtOpt).map((c) => c.value),
+	);
 	const availableIds = new Set(availableModels.map((m) => m.modelId));
 
 	// 收集该模型可用的后缀变体
@@ -650,7 +761,9 @@ export function resolveSessionModelSelection(
 			return candidates[0];
 		}
 		// 按档位邻近度就近回退
-		const targetIdx = EFFORT_ORDER.indexOf(requestedReasoning as EffortSuffix);
+		const targetIdx = isEffortSuffix(requestedReasoning)
+			? EFFORT_ORDER.indexOf(requestedReasoning)
+			: -1;
 		if (targetIdx !== -1) {
 			for (let i = targetIdx; i >= 0; i--) {
 				if (candidates.includes(EFFORT_ORDER[i])) return EFFORT_ORDER[i];
@@ -671,7 +784,13 @@ export function resolveSessionModelSelection(
 				effectiveEffort: selfSuffix.effort,
 			};
 		}
-		const chosenEffort = pickBestEffort(variantEfforts);
+		const effortCandidates =
+			variantEfforts.length > 0
+				? variantEfforts
+				: modelOpt?.currentValue === requestedModelId
+					? currentThoughtEfforts
+					: [];
+		const chosenEffort = pickBestEffort(effortCandidates);
 		return {
 			configModelValue: requestedModelId,
 			configThoughtLevel: chosenEffort ?? requestedReasoning,

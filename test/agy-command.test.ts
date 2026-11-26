@@ -23,6 +23,7 @@ interface Recorder {
 	activeToolChanges: string[][];
 	notes: Array<{ message: string; level: string | undefined }>;
 	statuses: Array<{ key: string; text: string | undefined }>;
+	selects: Array<{ title: string; items: string[] }>;
 }
 
 function isExtensionApi(value: object): value is ExtensionAPI {
@@ -74,13 +75,14 @@ function stubContext(
 	recorder: Recorder,
 	cwd: string,
 	options?: {
+		hasUI?: boolean;
 		mode?: "tui" | "rpc" | "json" | "print";
 		confirmResult?: boolean;
 		selectResult?: string | undefined;
 	},
 ): ExtensionCommandContext {
 	const stub = {
-		hasUI: true,
+		hasUI: options?.hasUI ?? true,
 		mode: options?.mode ?? "tui",
 		cwd,
 		model: { provider: "antigravity", id: "gemini-4-neon" },
@@ -92,7 +94,8 @@ function stubContext(
 			setStatus(key: string, text: string | undefined) {
 				recorder.statuses.push({ key, text });
 			},
-			async select(_title: string, items: string[]) {
+			async select(title: string, items: string[]) {
+				recorder.selects.push({ title, items: [...items] });
 				return options?.selectResult !== undefined ? options.selectResult : items[0];
 			},
 			async confirm() {
@@ -135,6 +138,7 @@ async function withAgyCommand(
 		onRefreshProviderModels?: (ctx: ExtensionContext) => Promise<number>;
 		onLogout?: () => void;
 		ctxOptions?: {
+			hasUI?: boolean;
 			mode?: "tui" | "rpc" | "json" | "print";
 			confirmResult?: boolean;
 			selectResult?: string | undefined;
@@ -145,7 +149,13 @@ async function withAgyCommand(
 	const agentDir = path.join(root, "agent");
 	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 	process.env.PI_CODING_AGENT_DIR = agentDir;
-	const recorder: Recorder = { commands: new Map(), activeToolChanges: [], notes: [], statuses: [] };
+	const recorder: Recorder = {
+		commands: new Map(),
+		activeToolChanges: [],
+		notes: [],
+		statuses: [],
+		selects: [],
+	};
 	const pi = stubPi(recorder);
 	const agyBin =
 		options?.agyBinFactory?.(root) ??
@@ -220,17 +230,84 @@ describe("/agy command in the thin client", () => {
 		);
 	});
 
-	it("/agy logout invokes onLogout callback after auth/logout succeeds", async () => {
+	it("/agy logout uses ACP v1 logout first and invokes onLogout callback", async () => {
 		let logoutCalls = 0;
-		const rpcMock = `
+		let methodsPath = "";
+		await withAgyCommand(
+			async (run, _agy, recorder) => {
+				await run("logout");
+				assert.equal(logoutCalls, 1);
+				assert.deepEqual(recorder.notes, [{ message: "Signed out of Antigravity.", level: "info" }]);
+				const methods: unknown = JSON.parse(fs.readFileSync(methodsPath, "utf8"));
+				assert.deepEqual(methods, ["initialize", "logout"]);
+			},
+			{
+				agyBinFactory: (root) => {
+					methodsPath = path.join(root, "logout-methods.json");
+					const rpcMock = `
+import * as fs from "node:fs";
 import * as readline from "node:readline";
+const methodsPath = ${JSON.stringify(methodsPath)};
+const seen = [];
 const rl = readline.createInterface({ input: process.stdin });
 const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
 rl.on("line", (line) => {
 	if (!line.trim()) return;
 	const msg = JSON.parse(line);
+	if (msg.method) {
+		seen.push(msg.method);
+		fs.writeFileSync(methodsPath, JSON.stringify(seen));
+	}
 	if (msg.method === "initialize") {
 		send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { auth: { logout: {} } } } });
+	} else if (msg.method === "logout") {
+		send({ jsonrpc: "2.0", id: msg.id, result: {} });
+	} else if (msg.id !== undefined) {
+		send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "unexpected method: " + msg.method } });
+	}
+});
+`;
+					return writeStubAgyScript(root, "mock-agy-logout-v1", rpcMock);
+				},
+				onLogout: () => {
+					logoutCalls++;
+				},
+			},
+		);
+	});
+
+	it("/agy logout falls back to auth/logout when logout returns -32601", async () => {
+		let logoutCalls = 0;
+		let methodsPath = "";
+		await withAgyCommand(
+			async (run, _agy, recorder) => {
+				await run("logout");
+				assert.equal(logoutCalls, 1);
+				assert.deepEqual(recorder.notes, [{ message: "Signed out of Antigravity.", level: "info" }]);
+				const methods: unknown = JSON.parse(fs.readFileSync(methodsPath, "utf8"));
+				assert.deepEqual(methods, ["initialize", "logout", "auth/logout"]);
+			},
+			{
+				agyBinFactory: (root) => {
+					methodsPath = path.join(root, "logout-fallback-methods.json");
+					const rpcMock = `
+import * as fs from "node:fs";
+import * as readline from "node:readline";
+const methodsPath = ${JSON.stringify(methodsPath)};
+const seen = [];
+const rl = readline.createInterface({ input: process.stdin });
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+rl.on("line", (line) => {
+	if (!line.trim()) return;
+	const msg = JSON.parse(line);
+	if (msg.method) {
+		seen.push(msg.method);
+		fs.writeFileSync(methodsPath, JSON.stringify(seen));
+	}
+	if (msg.method === "initialize") {
+		send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { auth: { logout: {} } } } });
+	} else if (msg.method === "logout") {
+		send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
 	} else if (msg.method === "auth/logout") {
 		send({ jsonrpc: "2.0", id: msg.id, result: {} });
 	} else if (msg.id !== undefined) {
@@ -238,17 +315,164 @@ rl.on("line", (line) => {
 	}
 });
 `;
-		await withAgyCommand(
-			async (run, _agy, recorder) => {
-				await run("logout");
-				assert.equal(logoutCalls, 1);
-				assert.deepEqual(recorder.notes, [{ message: "Signed out of Antigravity.", level: "info" }]);
-			},
-			{
-				agyBinFactory: (root) => writeStubAgyScript(root, "mock-agy-logout", rpcMock),
+					return writeStubAgyScript(root, "mock-agy-logout-fallback", rpcMock);
+				},
 				onLogout: () => {
 					logoutCalls++;
 				},
+			},
+		);
+	});
+
+	it("/agy logout does not fall back when logout fails with a non--32601 error", async () => {
+		let logoutCalls = 0;
+		let methodsPath = "";
+		await withAgyCommand(
+			async (run, _agy, recorder) => {
+				await run("logout");
+				assert.equal(logoutCalls, 0);
+				assert.equal(recorder.notes.length, 1);
+				assert.equal(recorder.notes[0].level, "error");
+				assert.match(recorder.notes[0].message, /Sign-out failed: keyring locked/);
+				const methods: unknown = JSON.parse(fs.readFileSync(methodsPath, "utf8"));
+				assert.deepEqual(methods, ["initialize", "logout"]);
+			},
+			{
+				agyBinFactory: (root) => {
+					methodsPath = path.join(root, "logout-err-methods.json");
+					const rpcMock = `
+import * as fs from "node:fs";
+import * as readline from "node:readline";
+const methodsPath = ${JSON.stringify(methodsPath)};
+const seen = [];
+const rl = readline.createInterface({ input: process.stdin });
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+rl.on("line", (line) => {
+	if (!line.trim()) return;
+	const msg = JSON.parse(line);
+	if (msg.method) {
+		seen.push(msg.method);
+		fs.writeFileSync(methodsPath, JSON.stringify(seen));
+	}
+	if (msg.method === "initialize") {
+		send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { auth: { logout: {} } } } });
+	} else if (msg.method === "logout") {
+		send({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: "keyring locked" } });
+	} else if (msg.id !== undefined) {
+		send({ jsonrpc: "2.0", id: msg.id, result: {} });
+	}
+});
+`;
+					return writeStubAgyScript(root, "mock-agy-logout-err", rpcMock);
+				},
+				onLogout: () => {
+					logoutCalls++;
+				},
+			},
+		);
+	});
+
+	it("/agy agent-mode supports auto in completions, interactive menu, and persisted config", async () => {
+		await withAgyCommand(async (run, agy, recorder, agentDir) => {
+			const allModeItems = (await agy.getArgumentCompletions?.("agent-mode ")) ?? [];
+			assert.deepEqual(
+				allModeItems.map((i) => i.value),
+				["agent-mode default", "agent-mode accept-edits", "agent-mode plan", "agent-mode auto"],
+			);
+			const autoOnly = (await agy.getArgumentCompletions?.("agent-mode au")) ?? [];
+			assert.deepEqual(
+				autoOnly.map((i) => i.value),
+				["agent-mode auto"],
+			);
+
+			await run("agent-mode auto");
+			assert.deepEqual(recorder.notes, [{ message: "agy execution mode set to auto.", level: "info" }]);
+			const saved: unknown = JSON.parse(fs.readFileSync(path.join(agentDir, "antigravity.json"), "utf8"));
+			assert.ok(saved && typeof saved === "object" && "agyExecutionMode" in saved);
+			assert.equal(saved.agyExecutionMode, "auto");
+		});
+
+		await withAgyCommand(
+			async (run, _agy, recorder, agentDir) => {
+				await run("agent-mode");
+				assert.equal(recorder.selects.length, 1);
+				assert.ok(
+					recorder.selects[0].items.includes(
+						"auto — let Antigravity auto-approve safe actions when supported",
+					),
+				);
+				const saved: unknown = JSON.parse(fs.readFileSync(path.join(agentDir, "antigravity.json"), "utf8"));
+				assert.ok(saved && typeof saved === "object" && "agyExecutionMode" in saved);
+				assert.equal(saved.agyExecutionMode, "auto");
+			},
+			{
+				ctxOptions: {
+					selectResult: "auto — let Antigravity auto-approve safe actions when supported",
+				},
+			},
+		);
+
+		await withAgyCommand(
+			async (run, _agy, recorder) => {
+				await run("agent-mode invalid-mode");
+				assert.deepEqual(recorder.notes, [
+					{ message: "Usage: /agy agent-mode <default | accept-edits | plan | auto>", level: "warning" },
+				]);
+			},
+			{
+				ctxOptions: { hasUI: false },
+			},
+		);
+	});
+
+	it("/agy status warns when agy version is older than 1.5.1 and stays quiet for 1.5.1+", async () => {
+		const hint = "Note: agy 1.5.1 or newer is recommended for full model access.";
+
+		await withAgyCommand(
+			async (run, _agy, recorder) => {
+				await run("status");
+				assert.equal(recorder.selects.length, 1);
+				assert.ok(recorder.selects[0].items.includes(hint));
+			},
+			{
+				agyBinFactory: (root) =>
+					writeStubAgyScript(root, "mock-agy-v150", 'console.log("1.5.0");\n'),
+			},
+		);
+
+		await withAgyCommand(
+			async (run, _agy, recorder) => {
+				await run("status");
+				assert.equal(recorder.selects.length, 1);
+				assert.ok(!recorder.selects[0].items.includes(hint));
+			},
+			{
+				agyBinFactory: (root) =>
+					writeStubAgyScript(root, "mock-agy-v151", 'console.log("1.5.1");\n'),
+			},
+		);
+
+		await withAgyCommand(
+			async (run, _agy, recorder) => {
+				await run("status");
+				assert.equal(recorder.selects.length, 1);
+				assert.ok(!recorder.selects[0].items.includes(hint));
+			},
+			{
+				agyBinFactory: (root) =>
+					writeStubAgyScript(root, "mock-agy-v1513", 'console.log("1.5.13");\n'),
+			},
+		);
+
+		await withAgyCommand(
+			async (run, _agy, recorder) => {
+				await run("status");
+				assert.equal(recorder.selects.length, 1);
+				assert.ok(!recorder.selects[0].items.includes(hint));
+			},
+			{
+				agyBinFactory: (root) =>
+					writeStubAgyScript(root, "mock-agy-vdev", 'console.log("dev-snapshot");\n'),
 			},
 		);
 	});
@@ -329,7 +553,13 @@ rl.on("line", (line) => {
 
 describe("footer badge", () => {
 	it("shows no AGY badge, also for an Antigravity model, and clears an old one", () => {
-		const recorder: Recorder = { commands: new Map(), activeToolChanges: [], notes: [], statuses: [] };
+		const recorder: Recorder = {
+			commands: new Map(),
+			activeToolChanges: [],
+			notes: [],
+			statuses: [],
+			selects: [],
+		};
 		const ctx: ExtensionContext = stubContext(recorder, os.tmpdir());
 		updateAntigravityStatusBar(ctx, DEFAULT_BRIDGE_CONFIG, { backendCompactedRecently: true });
 		assert.deepEqual(recorder.statuses, [{ key: STATUS_BAR_KEY, text: undefined }]);

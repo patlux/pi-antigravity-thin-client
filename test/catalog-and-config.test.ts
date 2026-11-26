@@ -8,13 +8,20 @@ import {
 	quoteWindowsCmdArg,
 	resolveAgyBinary,
 } from "../src/acp/binary-resolver.ts";
-import { AcpProcessManager } from "../src/acp/process-manager.ts";
+import {
+	AcpClientConnection,
+	AcpProcessManager,
+	buildAgyChildEnv,
+	INITIALIZE_TIMEOUT_MS,
+	resolveProcessProfileForConfig,
+} from "../src/acp/process-manager.ts";
 import type { AcpAvailableModel, AcpConfigOption } from "../src/acp/protocol.ts";
 import {
 	aggregateAcpModels,
 	getSeedModels,
 	probeLiveAntigravityCatalog,
 	readCachedCatalog,
+	removeEmptyProbeSessionFiles,
 	resolveBuiltinModelCost,
 	resolveSessionModelSelection,
 	writeCachedCatalog,
@@ -509,6 +516,684 @@ describe("双轨模型家族聚合与 Thinking 档位解析", () => {
 			assert.equal(hydrated.models[0].cost.output, neon.cost.output);
 			assert.equal(hydrated.models[0].cost.cacheRead, neon.cost.cacheRead);
 		} finally {
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("supports grouped configOptions, category matching, probed efforts, and duplicate name disambiguation", () => {
+		const groupedConfigOptions: AcpConfigOption[] = [
+			{
+				id: "selected_model",
+				category: "model",
+				name: "Model",
+				type: "select",
+				currentValue: "gemini-4-neon",
+				options: [
+					{
+						group: "recommended",
+						name: "Recommended",
+						options: [
+							{ value: "gemini-4-neon", name: "Gemini 4 Neon" },
+							{ value: "gemini-4-pro", name: "Gemini 4 Pro" },
+						],
+					},
+					{
+						group: "other",
+						name: "Other",
+						options: [
+							{ value: "gemini-4-pro-preview", name: "Gemini 4 Pro" },
+							{ value: "claude-opus-5-5", name: "Claude Opus 5.5" },
+							{ value: "gemini-pro-orchestrator", name: "Orchestrator" },
+						],
+					},
+				],
+			},
+			{
+				id: "thinking_budget",
+				category: "thought_level",
+				name: "Thinking",
+				type: "select",
+				currentValue: "high",
+				options: [
+					{
+						group: "standard",
+						options: [
+							{ value: "low", name: "Low" },
+							{ value: "medium", name: "Medium" },
+						],
+					},
+					{
+						group: "deep",
+						options: [
+							{ value: "high", name: "High" },
+							{ value: "xhigh", name: "Extra High" },
+						],
+					},
+				],
+			},
+		];
+
+		const probedEfforts = new Map<string, readonly string[]>([
+			["gemini-4-pro", ["low", "high", "unknown-effort"]],
+			["gemini-4-pro-preview", ["medium"]],
+			["claude-opus-5-5", ["low", "medium", "high"]],
+			["gemini-pro-orchestrator", []],
+		]);
+
+		const { models, modelEfforts } = aggregateAcpModels([], groupedConfigOptions, probedEfforts);
+		assert.deepEqual(
+			models.map((m) => ({ id: m.id, name: m.name })),
+			[
+				{ id: "gemini-4-neon", name: "Gemini 4 Neon" },
+				{ id: "gemini-4-pro", name: "Gemini 4 Pro" },
+				{ id: "gemini-4-pro-preview", name: "Gemini 4 Pro (gemini-4-pro-preview)" },
+				{ id: "claude-opus-5-5", name: "Claude Opus 5.5" },
+				{ id: "gemini-pro-orchestrator", name: "Orchestrator" },
+			],
+		);
+		assert.deepEqual(modelEfforts["gemini-4-neon"], ["low", "medium", "high", "xhigh"]);
+		assert.deepEqual(modelEfforts["gemini-4-pro"], ["low", "high"]);
+		assert.deepEqual(modelEfforts["gemini-4-pro-preview"], ["medium"]);
+		assert.deepEqual(modelEfforts["claude-opus-5-5"], ["low", "medium", "high"]);
+		assert.deepEqual(modelEfforts["gemini-pro-orchestrator"], []);
+
+		const neon = models.find((m) => m.id === "gemini-4-neon");
+		const orch = models.find((m) => m.id === "gemini-pro-orchestrator");
+		assert.equal(neon?.reasoning, true);
+		assert.equal(orch?.reasoning, false);
+
+		// resolveSessionModelSelection uses grouped model & thought_level matched by category.
+		const currentClamped = resolveSessionModelSelection(
+			"gemini-4-neon",
+			"max",
+			groupedConfigOptions,
+			[],
+		);
+		assert.equal(currentClamped.configModelValue, "gemini-4-neon");
+		assert.equal(currentClamped.configThoughtLevel, "xhigh");
+
+		const currentDefault = resolveSessionModelSelection(
+			"gemini-4-neon",
+			undefined,
+			groupedConfigOptions,
+			[],
+		);
+		assert.equal(currentDefault.configModelValue, "gemini-4-neon");
+		assert.equal(currentDefault.configThoughtLevel, "low");
+
+		// Switching to another model does not wrongly clamp against the old model's thought_level.
+		const otherModel = resolveSessionModelSelection(
+			"claude-opus-5-5",
+			"max",
+			groupedConfigOptions,
+			[],
+		);
+		assert.equal(otherModel.configModelValue, "claude-opus-5-5");
+		assert.equal(otherModel.configThoughtLevel, "max");
+	});
+});
+
+function writeCatalogTestMock(root: string, name: string, source: string): string {
+	const scriptPath = path.join(root, `${name}.mjs`);
+	fs.writeFileSync(scriptPath, `#!/usr/bin/env node\n${source}`, { mode: 0o755 });
+	if (process.platform === "win32") {
+		const cmdWrap = path.join(root, `${name}.cmd`);
+		fs.writeFileSync(cmdWrap, `@node "${scriptPath}" %*\r\n`);
+		return cmdWrap;
+	}
+	return scriptPath;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+describe("ACP process hardening, elicitation compatibility, per-model probing, and session cleanup", () => {
+	it("probes per-model thought_level sequentially on the temporary session and handles per-model errors", async () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-probe-efforts-"));
+		const geminiDir = path.join(tmpRoot, ".gemini");
+		const appDataDir = path.join(geminiDir, "antigravity-cli");
+		const logFile = path.join(tmpRoot, "probe-calls.json");
+
+		const mockSource = `
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as readline from "node:readline";
+
+const appDataDir = ${JSON.stringify(appDataDir)};
+const logFile = ${JSON.stringify(logFile)};
+const setConfigCalls = [];
+const flush = () => fs.writeFileSync(logFile, JSON.stringify({ setConfigCalls }));
+flush();
+
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+const modelOption = {
+	id: "selected_model",
+	category: "model",
+	name: "Model",
+	type: "select",
+	currentValue: "gemini-4-neon",
+	options: [
+		{
+			group: "featured",
+			options: [
+				{ value: "gemini-4-neon", name: "Gemini 4 Neon" },
+				{ value: "gemini-4-carbon", name: "Gemini 4 Carbon" },
+			],
+		},
+		{
+			group: "more",
+			options: [
+				{ value: "claude-opus-5-5", name: "Claude Opus 5.5" },
+				{ value: "gemini-pro-orchestrator", name: "Orchestrator" },
+				{ value: "gpt-oss-120b-medium", name: "GPT-OSS 120B (Medium)" },
+			],
+		},
+	],
+};
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+	if (!line.trim()) return;
+	const msg = JSON.parse(line);
+	if (msg.method === "initialize") {
+		send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } });
+		return;
+	}
+	if (msg.method === "session/new") {
+		const sid = "probe-efforts-1";
+		fs.mkdirSync(path.join(appDataDir, "conversations"), { recursive: true });
+		fs.mkdirSync(path.join(appDataDir, "brain", sid, "logs"), { recursive: true });
+		fs.mkdirSync(path.join(appDataDir, "annotations"), { recursive: true });
+		fs.writeFileSync(path.join(appDataDir, "conversations", sid + ".db"), "db");
+		fs.writeFileSync(path.join(appDataDir, "conversations", sid + ".meta"), "{}");
+		fs.writeFileSync(path.join(appDataDir, "brain", sid, "logs", "transcript.jsonl"), "");
+		fs.writeFileSync(path.join(appDataDir, "annotations", sid + ".pbtxt"), "ok");
+		send({
+			jsonrpc: "2.0",
+			id: msg.id,
+			result: {
+				sessionId: sid,
+				configOptions: [
+					modelOption,
+					{
+						id: "thinking_effort",
+						category: "thought_level",
+						name: "Thinking",
+						type: "select",
+						currentValue: "high",
+						options: [
+							{ value: "low", name: "Low" },
+							{ value: "medium", name: "Medium" },
+							{ value: "high", name: "High" },
+							{ value: "xhigh", name: "Extra" },
+						],
+					},
+				],
+			},
+		});
+		return;
+	}
+	if (msg.method === "session/set_config_option") {
+		setConfigCalls.push({ configId: msg.params?.configId, value: msg.params?.value });
+		flush();
+		const modelId = msg.params?.value;
+		if (modelId === "gemini-4-carbon") {
+			send({
+				jsonrpc: "2.0",
+				id: msg.id,
+				result: {
+					configOptions: [
+						{ ...modelOption, currentValue: modelId },
+						{
+							id: "thinking_effort",
+							category: "thought_level",
+							name: "Thinking",
+							type: "select",
+							currentValue: "medium",
+							options: [
+								{
+									group: "levels",
+									options: [
+										{ value: "low", name: "Low" },
+										{ value: "medium", name: "Medium" },
+										{ value: "high", name: "High" },
+									],
+								},
+							],
+						},
+					],
+				},
+			});
+			return;
+		}
+		if (modelId === "claude-opus-5-5") {
+			send({
+				jsonrpc: "2.0",
+				id: msg.id,
+				error: { code: -32603, message: "temporary backend error" },
+			});
+			return;
+		}
+		// gemini-pro-orchestrator: no thought_level option
+		send({
+			jsonrpc: "2.0",
+			id: msg.id,
+			result: { configOptions: [{ ...modelOption, currentValue: modelId }] },
+		});
+		return;
+	}
+	if (msg.id !== undefined) {
+		send({ jsonrpc: "2.0", id: msg.id, result: {} });
+	}
+});
+`;
+		const mockBin = writeCatalogTestMock(tmpRoot, "mock-probe-efforts", mockSource);
+		const pm = new AcpProcessManager();
+		try {
+			const cfg = { ...DEFAULT_BRIDGE_CONFIG, agyBin: mockBin, geminiDir };
+			const snapshot = await probeLiveAntigravityCatalog(pm, cfg, tmpRoot, {
+				force: true,
+				env: { PI_CODING_AGENT_DIR: path.join(tmpRoot, "pi-agent") },
+			});
+
+			assert.deepEqual(snapshot.modelEfforts["gemini-4-neon"], ["low", "medium", "high", "xhigh"]);
+			assert.deepEqual(snapshot.modelEfforts["gemini-4-carbon"], ["low", "medium", "high"]);
+			assert.deepEqual(snapshot.modelEfforts["claude-opus-5-5"], []);
+			assert.deepEqual(snapshot.modelEfforts["gemini-pro-orchestrator"], []);
+			assert.deepEqual(snapshot.modelEfforts["gpt-oss-120b-medium"], ["medium"]);
+
+			const logged: unknown = JSON.parse(fs.readFileSync(logFile, "utf8"));
+			assert.ok(isRecord(logged) && Array.isArray(logged.setConfigCalls));
+			assert.deepEqual(logged.setConfigCalls, [
+				{ configId: "selected_model", value: "gemini-4-carbon" },
+				{ configId: "selected_model", value: "claude-opus-5-5" },
+				{ configId: "selected_model", value: "gemini-pro-orchestrator" },
+			]);
+
+			// Full temporary session cleanup
+			assert.equal(fs.existsSync(path.join(appDataDir, "conversations", "probe-efforts-1.db")), false);
+			assert.equal(fs.existsSync(path.join(appDataDir, "conversations", "probe-efforts-1.meta")), false);
+			assert.equal(fs.existsSync(path.join(appDataDir, "brain", "probe-efforts-1")), false);
+			assert.equal(fs.existsSync(path.join(appDataDir, "annotations", "probe-efforts-1.pbtxt")), false);
+		} finally {
+			await pm.disposeAll();
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("stops per-model probing immediately when session/set_config_option returns -32601", async () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-probe-32601-"));
+		const geminiDir = path.join(tmpRoot, ".gemini");
+		const logFile = path.join(tmpRoot, "calls.json");
+
+		const mockSource = `
+import * as fs from "node:fs";
+import * as readline from "node:readline";
+
+const logFile = ${JSON.stringify(logFile)};
+let setConfigCount = 0;
+const flush = () => fs.writeFileSync(logFile, JSON.stringify({ setConfigCount }));
+flush();
+
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+	if (!line.trim()) return;
+	const msg = JSON.parse(line);
+	if (msg.method === "initialize") {
+		send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } });
+		return;
+	}
+	if (msg.method === "session/new") {
+		send({
+			jsonrpc: "2.0",
+			id: msg.id,
+			result: {
+				sessionId: "probe-32601-1",
+				configOptions: [
+					{
+						id: "model",
+						name: "Model",
+						type: "select",
+						currentValue: "gemini-4-neon",
+						options: [
+							{ value: "gemini-4-neon", name: "Gemini 4 Neon" },
+							{ value: "gemini-4-carbon", name: "Gemini 4 Carbon" },
+							{ value: "claude-opus-5-5", name: "Claude Opus 5.5" },
+						],
+					},
+					{
+						id: "thought_level",
+						name: "Thinking",
+						type: "select",
+						currentValue: "high",
+						options: [{ value: "low", name: "Low" }, { value: "high", name: "High" }],
+					},
+				],
+			},
+		});
+		return;
+	}
+	if (msg.method === "session/set_config_option") {
+		setConfigCount++;
+		flush();
+		send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
+		return;
+	}
+	if (msg.id !== undefined) {
+		send({ jsonrpc: "2.0", id: msg.id, result: {} });
+	}
+});
+`;
+		const mockBin = writeCatalogTestMock(tmpRoot, "mock-probe-32601", mockSource);
+		const pm = new AcpProcessManager();
+		try {
+			const cfg = { ...DEFAULT_BRIDGE_CONFIG, agyBin: mockBin, geminiDir };
+			const snapshot = await probeLiveAntigravityCatalog(pm, cfg, tmpRoot, {
+				force: true,
+				env: { PI_CODING_AGENT_DIR: path.join(tmpRoot, "pi-agent") },
+			});
+			assert.equal(snapshot.models.length, 3);
+			assert.deepEqual(snapshot.modelEfforts["gemini-4-neon"], ["low", "high"]);
+			assert.deepEqual(snapshot.modelEfforts["gemini-4-carbon"], []);
+			assert.deepEqual(snapshot.modelEfforts["claude-opus-5-5"], []);
+
+			const logged: unknown = JSON.parse(fs.readFileSync(logFile, "utf8"));
+			assert.ok(isRecord(logged));
+			assert.equal(logged.setConfigCount, 1);
+		} finally {
+			await pm.disposeAll();
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("removes .db*, .meta, brain/<id>/, and annotations/<id>.pbtxt while rejecting path traversal", async () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-cleanup-"));
+		const geminiDir = path.join(tmpRoot, ".gemini");
+		const appDataDir = path.join(geminiDir, "antigravity-cli");
+		const convDir = path.join(appDataDir, "conversations");
+		const brainRoot = path.join(appDataDir, "brain");
+		const annDir = path.join(appDataDir, "annotations");
+		fs.mkdirSync(convDir, { recursive: true });
+		fs.mkdirSync(brainRoot, { recursive: true });
+		fs.mkdirSync(annDir, { recursive: true });
+
+		const seedSessionArtifacts = (id: string) => {
+			for (const suffix of [".db", ".db-wal", ".db-shm", ".db-journal", ".meta"]) {
+				fs.writeFileSync(path.join(convDir, `${id}${suffix}`), "data");
+			}
+			const nestedBrain = path.join(brainRoot, id, ".system_generated", "logs");
+			fs.mkdirSync(nestedBrain, { recursive: true });
+			fs.writeFileSync(path.join(nestedBrain, "transcript.jsonl"), "{}\n");
+			fs.writeFileSync(path.join(annDir, `${id}.pbtxt`), "annotation");
+		};
+
+		const sentinelDb = path.join(appDataDir, "escape.db");
+		fs.writeFileSync(sentinelDb, "keep-me");
+		seedSessionArtifacts("probe-clean_1");
+		seedSessionArtifacts("keep-sess-1");
+
+		const cfg = { ...DEFAULT_BRIDGE_CONFIG, geminiDir };
+		try {
+			// Path traversal and invalid IDs must be ignored completely.
+			removeEmptyProbeSessionFiles(cfg, "../escape");
+			removeEmptyProbeSessionFiles(cfg, "nested/id");
+			removeEmptyProbeSessionFiles(cfg, "dot.id");
+			removeEmptyProbeSessionFiles(cfg, "");
+			assert.equal(fs.existsSync(sentinelDb), true);
+
+			// Valid ID cleans up every artifact category without touching sibling sessions.
+			removeEmptyProbeSessionFiles(cfg, "probe-clean_1");
+			for (const suffix of [".db", ".db-wal", ".db-shm", ".db-journal", ".meta"]) {
+				assert.equal(fs.existsSync(path.join(convDir, `probe-clean_1${suffix}`)), false);
+				assert.equal(fs.existsSync(path.join(convDir, `keep-sess-1${suffix}`)), true);
+			}
+			assert.equal(fs.existsSync(path.join(brainRoot, "probe-clean_1")), false);
+			assert.equal(fs.existsSync(path.join(annDir, "probe-clean_1.pbtxt")), false);
+			assert.equal(fs.existsSync(path.join(brainRoot, "keep-sess-1")), true);
+			assert.equal(fs.existsSync(path.join(annDir, "keep-sess-1.pbtxt")), true);
+
+			// Also verify orphaned session/new cleanup in AcpClientConnection removes all files and rejects traversal.
+			const mockSource = `
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as readline from "node:readline";
+
+const appDataDir = ${JSON.stringify(appDataDir)};
+let callNum = 0;
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+	if (!line.trim()) return;
+	const msg = JSON.parse(line);
+	if (msg.method === "initialize") {
+		send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } });
+		return;
+	}
+	if (msg.method === "session/new") {
+		callNum++;
+		const sid = callNum === 1 ? "orphan-full-1" : "../escape";
+		if (callNum === 1) {
+			for (const suffix of [".db", ".db-wal", ".meta"]) {
+				fs.writeFileSync(path.join(appDataDir, "conversations", sid + suffix), "x");
+			}
+			fs.mkdirSync(path.join(appDataDir, "brain", sid, "nested"), { recursive: true });
+			fs.writeFileSync(path.join(appDataDir, "brain", sid, "nested", "a.txt"), "x");
+			fs.writeFileSync(path.join(appDataDir, "annotations", sid + ".pbtxt"), "x");
+		}
+		setTimeout(() => {
+			send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: sid } });
+		}, 40);
+		return;
+	}
+	if (msg.id !== undefined) {
+		send({ jsonrpc: "2.0", id: msg.id, result: {} });
+	}
+});
+`;
+			const mockBin = writeCatalogTestMock(tmpRoot, "mock-orphan-full", mockSource);
+			const pm = new AcpProcessManager();
+			try {
+				const conn = await pm.acquire({ ...cfg, agyBin: mockBin });
+
+				const ac1 = new AbortController();
+				const req1 = conn.request("session/new", { cwd: tmpRoot, mcpServers: [] }, { signal: ac1.signal });
+				setTimeout(() => ac1.abort(), 10);
+				await assert.rejects(req1);
+
+				const ac2 = new AbortController();
+				const req2 = conn.request("session/new", { cwd: tmpRoot, mcpServers: [] }, { signal: ac2.signal });
+				setTimeout(() => ac2.abort(), 10);
+				await assert.rejects(req2);
+
+				const deadline = Date.now() + 3_000;
+				while (Date.now() < deadline) {
+					if (
+						!fs.existsSync(path.join(convDir, "orphan-full-1.db")) &&
+						!fs.existsSync(path.join(convDir, "orphan-full-1.meta")) &&
+						!fs.existsSync(path.join(brainRoot, "orphan-full-1")) &&
+						!fs.existsSync(path.join(annDir, "orphan-full-1.pbtxt"))
+					) {
+						break;
+					}
+					await new Promise((r) => setTimeout(r, 15));
+				}
+
+				assert.equal(fs.existsSync(path.join(convDir, "orphan-full-1.db")), false);
+				assert.equal(fs.existsSync(path.join(convDir, "orphan-full-1.db-wal")), false);
+				assert.equal(fs.existsSync(path.join(convDir, "orphan-full-1.meta")), false);
+				assert.equal(fs.existsSync(path.join(brainRoot, "orphan-full-1")), false);
+				assert.equal(fs.existsSync(path.join(annDir, "orphan-full-1.pbtxt")), false);
+				assert.equal(fs.existsSync(sentinelDb), true, "traversal sessionId never deletes files outside conversations");
+			} finally {
+				await pm.disposeAll();
+			}
+		} finally {
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("sets AGY_CLI_DISABLE_AUTO_UPDATE=true unless overridden, uses 90s init timeout, and wraps legacy elicitation responses", async () => {
+		assert.equal(INITIALIZE_TIMEOUT_MS, 90_000);
+
+		const defaultEnv = buildAgyChildEnv({ PATH: "/usr/bin" });
+		assert.equal(defaultEnv.AGY_CLI_DISABLE_AUTO_UPDATE, "true");
+		assert.ok(defaultEnv.NO_PROXY?.includes("127.0.0.1"));
+
+		const undefinedEnv = buildAgyChildEnv({ AGY_CLI_DISABLE_AUTO_UPDATE: undefined });
+		assert.equal(undefinedEnv.AGY_CLI_DISABLE_AUTO_UPDATE, "true");
+
+		const overriddenEnv = buildAgyChildEnv({ AGY_CLI_DISABLE_AUTO_UPDATE: "false" });
+		assert.equal(overriddenEnv.AGY_CLI_DISABLE_AUTO_UPDATE, "false");
+
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-env-elicit-"));
+		const defaultReportFile = path.join(tmpRoot, "report-default.json");
+		const overriddenReportFile = path.join(tmpRoot, "report-overridden.json");
+		const mockSource = `
+import * as fs from "node:fs";
+import * as readline from "node:readline";
+
+const reportFile = process.env.TEST_REPORT_FILE;
+const report = {
+	autoUpdateEnv: process.env.AGY_CLI_DISABLE_AUTO_UPDATE,
+	responses: {},
+};
+const flush = () => fs.writeFileSync(reportFile, JSON.stringify(report));
+flush();
+
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+	if (!line.trim()) return;
+	const msg = JSON.parse(line);
+	if (msg.method === "initialize") {
+		send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } });
+		return;
+	}
+	if (msg.method === "test/trigger-elicitations") {
+		send({
+			jsonrpc: "2.0",
+			id: "elicit-v2",
+			method: "elicitation/create",
+			params: { sessionId: "s1", mode: "form", message: "v2 question" },
+		});
+		send({
+			jsonrpc: "2.0",
+			id: "elicit-v1",
+			method: "session/elicitation",
+			params: { sessionId: "s1", mode: "form", message: "v1 question" },
+		});
+		send({
+			jsonrpc: "2.0",
+			id: "elicit-v1-unstable",
+			method: "_session/elicitation",
+			params: { sessionId: "s1", mode: "url", message: "unstable question", url: "https://example.invalid" },
+		});
+		send({ jsonrpc: "2.0", id: msg.id, result: { triggered: true } });
+		return;
+	}
+	if (msg.id && ("result" in msg || "error" in msg)) {
+		report.responses[String(msg.id)] = msg;
+		flush();
+	}
+});
+`;
+		const mockBin = writeCatalogTestMock(tmpRoot, "mock-elicit", mockSource);
+		const profile = resolveProcessProfileForConfig({
+			...DEFAULT_BRIDGE_CONFIG,
+			agyBin: mockBin,
+			geminiDir: path.join(tmpRoot, ".gemini"),
+		});
+		const binary = {
+			binPath: mockBin,
+			isWindowsWrapperScript: process.platform === "win32",
+			source: "config" as const,
+		};
+
+		const cleanBaseEnv: NodeJS.ProcessEnv = {};
+		for (const [key, value] of Object.entries(process.env)) {
+			if (key.toUpperCase() !== "AGY_CLI_DISABLE_AUTO_UPDATE") {
+				cleanBaseEnv[key] = value;
+			}
+		}
+
+		const connDefault = new AcpClientConnection(
+			binary,
+			profile,
+			{
+				onElicitationCreate: async (params) => {
+					if (params.message === "v2 question") {
+						return { action: "accept", content: { answer: "v2" } };
+					}
+					if (params.message === "v1 question") {
+						return { action: "accept", content: { answer: "v1" } };
+					}
+					return { action: "decline" };
+				},
+			},
+			{ ...cleanBaseEnv, TEST_REPORT_FILE: defaultReportFile },
+		);
+		const connOverridden = new AcpClientConnection(
+			binary,
+			profile,
+			{},
+			{
+				...cleanBaseEnv,
+				TEST_REPORT_FILE: overriddenReportFile,
+				AGY_CLI_DISABLE_AUTO_UPDATE: "false",
+			},
+		);
+
+		try {
+			await connDefault.ensureInitialized();
+			await connDefault.request("test/trigger-elicitations", {});
+
+			const deadline = Date.now() + 3_000;
+			let parsed: Record<string, unknown> | undefined;
+			while (Date.now() < deadline) {
+				try {
+					const raw: unknown = JSON.parse(fs.readFileSync(defaultReportFile, "utf8"));
+					if (
+						isRecord(raw) &&
+						isRecord(raw.responses) &&
+						"elicit-v2" in raw.responses &&
+						"elicit-v1" in raw.responses &&
+						"elicit-v1-unstable" in raw.responses
+					) {
+						parsed = raw;
+						break;
+					}
+				} catch {
+					// Wait for mock to finish flushing
+				}
+				await new Promise((r) => setTimeout(r, 15));
+			}
+			assert.ok(parsed, "received all 3 elicitation responses");
+			assert.equal(parsed.autoUpdateEnv, "true");
+			assert.ok(isRecord(parsed.responses));
+			const v2Resp = parsed.responses["elicit-v2"];
+			const v1Resp = parsed.responses["elicit-v1"];
+			const unstableResp = parsed.responses["elicit-v1-unstable"];
+			assert.ok(isRecord(v2Resp) && isRecord(v1Resp) && isRecord(unstableResp));
+			assert.deepEqual(v2Resp.result, { action: "accept", content: { answer: "v2" } });
+			assert.deepEqual(v1Resp.result, {
+				action: { action: "accept", content: { answer: "v1" } },
+			});
+			assert.deepEqual(unstableResp.result, {
+				action: { action: "decline" },
+			});
+
+			// Verify overridden env reaches the spawned child intact.
+			await connOverridden.ensureInitialized();
+			const overriddenReport: unknown = JSON.parse(
+				fs.readFileSync(overriddenReportFile, "utf8"),
+			);
+			assert.ok(isRecord(overriddenReport));
+			assert.equal(overriddenReport.autoUpdateEnv, "false");
+		} finally {
+			await connDefault.dispose();
+			await connOverridden.dispose();
 			fs.rmSync(tmpRoot, { recursive: true, force: true });
 		}
 	});

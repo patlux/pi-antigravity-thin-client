@@ -310,7 +310,7 @@ rl.on("line", (line) => {
 		}
 		return;
 	}
-	if (msg.method === "session/close" || msg.method === "auth/logout") {
+	if (msg.method === "session/close" || msg.method === "logout" || msg.method === "auth/logout") {
 		reply({});
 		return;
 	}
@@ -895,8 +895,8 @@ describe("extension lifecycle hooks (src/index.ts)", () => {
 			await agyCmd.handler("logout", s3.ctx);
 			assert.equal(latestBgWidget(s3.ui), false, "/agy logout clears background widget");
 			assert.ok(
-				readCallsLog(callsLog).some((c) => c.method === "auth/logout"),
-				"/agy logout sent auth/logout",
+				readCallsLog(callsLog).some((c) => c.method === "logout"),
+				"/agy logout sent logout",
 			);
 		} finally {
 			const dummy = createUiContext({ cwd: root, piSessionId: "shutdown" });

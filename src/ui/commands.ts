@@ -15,7 +15,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { buildAgySpawnSpec, probeAgyVersion, resolveAgyBinary } from "../acp/binary-resolver.ts";
-import type { AcpProcessManager } from "../acp/process-manager.ts";
+import { type AcpProcessManager, AcpRpcError } from "../acp/process-manager.ts";
 import type {
 	AcpSessionListResult,
 	AcpSessionLoadResult,
@@ -205,12 +205,47 @@ export const THIN_CLIENT_FIXED_MODE =
 
 const SUBCOMMANDS: AutocompleteItem[] = [
 	{ value: "status", label: "status", description: "Antigravity CLI, subscription tier, execution mode and session" },
-	{ value: "agent-mode", label: "agent-mode", description: "Switch agy's own execution mode (default | accept-edits | plan)" },
+	{ value: "agent-mode", label: "agent-mode", description: "Switch agy's own execution mode (default | accept-edits | plan | auto)" },
 	{ value: "refresh", label: "refresh", description: "Reload the models and thinking levels of this account" },
 	{ value: "sessions", label: "sessions", description: "Browse local agy sessions and import one into Pi" },
 	{ value: "login", label: "login", description: "Sign in with the official agy CLI" },
 	{ value: "logout", label: "logout", description: "Sign out of the agy account" },
 ];
+
+const VALID_EXECUTION_MODES: readonly AgyExecutionMode[] = [
+	"default",
+	"accept-edits",
+	"plan",
+	"auto",
+];
+
+const MIN_RECOMMENDED_AGY_VERSION: readonly [number, number, number] = [1, 5, 1];
+
+function parseExecutionMode(raw: string | undefined): AgyExecutionMode | undefined {
+	if (!raw) return undefined;
+	const normalized = raw.trim().toLowerCase();
+	return VALID_EXECUTION_MODES.find((mode) => mode === normalized);
+}
+
+function isAgyVersionOlderThan(
+	version: string | undefined,
+	minimum: readonly [number, number, number] = MIN_RECOMMENDED_AGY_VERSION,
+): boolean {
+	if (!version) return false;
+	const match = /(\d+)\.(\d+)\.(\d+)/.exec(version);
+	if (!match) return false;
+	const parsed: readonly [number, number, number] = [
+		Number(match[1]),
+		Number(match[2]),
+		Number(match[3]),
+	];
+	for (let i = 0; i < 3; i++) {
+		if (parsed[i] !== minimum[i]) {
+			return parsed[i] < minimum[i];
+		}
+	}
+	return false;
+}
 
 function buildCompletions(prefix: string): AutocompleteItem[] | null {
 	const trimmed = prefix.trimStart();
@@ -230,6 +265,7 @@ function buildCompletions(prefix: string): AutocompleteItem[] | null {
 			{ value: "agent-mode default", label: "default", description: "Ask before edits and commands, as the permission rules say" },
 			{ value: "agent-mode accept-edits", label: "accept-edits", description: "Approve file edits in the workspace automatically" },
 			{ value: "agent-mode plan", label: "plan", description: "Plan first, then act" },
+			{ value: "agent-mode auto", label: "auto", description: "Let Antigravity auto-approve safe actions when supported" },
 		].filter((i) => i.value.startsWith(`agent-mode ${arg1}`));
 	}
 
@@ -314,6 +350,9 @@ async function handleStatusSubcommand(
 
 	const lines = [
 		`Antigravity CLI: ${bin ? `${bin.binPath}${ver ? ` (v${ver})` : ""}` : "not found"}`,
+		...(isAgyVersionOlderThan(ver)
+			? ["Note: agy 1.5.1 or newer is recommended for full model access."]
+			: []),
 		`Subscription: ${telemetry.tier ? `${telemetry.tier.name}` : "known after the first connection"}`,
 		"Thin client: Antigravity's own tools; Pi MCP, skills and AGENTS.md are never passed on",
 		`agy execution mode: ${cfg.agyExecutionMode}`,
@@ -337,12 +376,11 @@ async function handleAgentModeSubcommand(
 	ctx: ExtensionCommandContext,
 	coordinator: TurnCoordinator,
 ): Promise<void> {
-	const valid: AgyExecutionMode[] = ["default", "accept-edits", "plan"];
-	let chosen = args[0]?.toLowerCase() as AgyExecutionMode | undefined;
+	let chosen = parseExecutionMode(args[0]);
 
-	if (!chosen || !valid.includes(chosen)) {
+	if (!chosen) {
 		if (!ctx.hasUI) {
-			ctx.ui.notify("Usage: /agy agent-mode <default | accept-edits | plan>", "warning");
+			ctx.ui.notify("Usage: /agy agent-mode <default | accept-edits | plan | auto>", "warning");
 			return;
 		}
 		const picked = await ctx.ui.select(
@@ -351,10 +389,12 @@ async function handleAgentModeSubcommand(
 				"default — ask before edits and commands, as the permission settings say",
 				"accept-edits — approve file edits in the workspace automatically",
 				"plan — write a plan first, then act",
+				"auto — let Antigravity auto-approve safe actions when supported",
 			],
 		);
 		if (!picked) return;
-		chosen = picked.split(" ")[0] as AgyExecutionMode;
+		chosen = parseExecutionMode(picked.split(" ")[0]);
+		if (!chosen) return;
 	}
 
 	const nextConfig: BridgeConfig = {
@@ -442,7 +482,15 @@ async function handleLogoutSubcommand(
 ): Promise<void> {
 	try {
 		const conn = await processManager.acquire(coordinator.config);
-		await conn.request("auth/logout", {}, { timeoutMs: 10_000 });
+		try {
+			await conn.request("logout", {}, { timeoutMs: 10_000 });
+		} catch (error) {
+			if (error instanceof AcpRpcError && error.code === -32601) {
+				await conn.request("auth/logout", {}, { timeoutMs: 10_000 });
+			} else {
+				throw error;
+			}
+		}
 		onLogout?.();
 		await coordinator.dispose();
 		ctx.ui.notify("Signed out of Antigravity.", "info");
