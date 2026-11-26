@@ -29,6 +29,8 @@ export interface TranscriptStep {
 	toolCalls: TranscriptToolCall[];
 	/** Model that produced a `PLANNER_RESPONSE`, e.g. `gemini-4-neon-high`. */
 	model?: string;
+	/** True when `transcript.jsonl` shortened at least one field (`truncated_fields`). */
+	truncated?: boolean;
 }
 
 export interface TaskMessage {
@@ -53,10 +55,10 @@ export interface BackgroundTask {
 	/** `task-N`; N is the transcript step that went to the background. */
 	taskId: string;
 	stepIndex: number;
-	kind: "command" | "timer";
-	/** Command line, or the timer prompt. */
+	kind: "command" | "timer" | "cron";
+	/** Command line, or the timer/cron prompt. */
 	description: string;
-	/** agy's short label for the command (`toolSummary`), when known. */
+	/** agy's short label for the command (`toolSummary`), or the cron expression (`*\/5 * * * *`). */
 	summary?: string;
 	timerSeconds?: number;
 	startedAtMs?: number;
@@ -179,6 +181,7 @@ export function parseTranscriptLine(line: string): TranscriptStep | undefined {
 		content: typeof obj.content === "string" ? obj.content : "",
 		toolCalls,
 		model: asString(obj.model),
+		truncated: Array.isArray(obj.truncated_fields) && obj.truncated_fields.length > 0,
 	};
 }
 
@@ -216,8 +219,9 @@ export function parseTaskMessage(json: string): TaskMessage | undefined {
 	};
 }
 
-const TERMINAL_CONTENT_PATTERN = /^Task id "[^"]*" (?:finished|was cancell?ed)/;
+const TERMINAL_CONTENT_PATTERN = /^Task id "[^"]*" (?:finished|was cancell?ed)/i;
 const TERMINAL_TITLE_PATTERN = /(?:finished|was cancell?ed|timer has expired)\s*$/i;
+const CONTENT_CANCELED_PATTERN = /^(?:Task id "[^"]*"|Task|Timer) was cancell?ed\b/i;
 
 /** Whether a task note reports the end of the task rather than progress. */
 export function isTerminalNote(title: string | undefined, content: string): boolean {
@@ -227,14 +231,105 @@ export function isTerminalNote(title: string | undefined, content: string): bool
 const BACKGROUND_TASK_PATTERN = /background task with task id:\s*(\S+)/;
 const TASK_DESCRIPTION_PATTERN = /Task Description:\s*([\s\S]*?)(?:\n\s*Task logs are available at:|$)/;
 const TIMER_PATTERN = /^Timer:\s*([^,\n]+?)(?:,\s*Prompt:\s*([\s\S]*))?$/;
+const CRON_PATTERN = /^Cron:\s*([^,\n]+?)(?:,\s*Prompt:\s*([\s\S]*))?$/i;
 const TASK_CANCELLED_PATTERN = /^Task "([^"]+)" cancell?ed\.?$/i;
 const TASK_NOT_RUNNING_PATTERN = /cannot kill task "([^"]+)": task is not running \(status:\s*([^)]+)\)/i;
 const TASK_STATUS_PATTERN = /^Task:\s*(\S+)\r?\nStatus:\s*(\S+)/;
 const NO_RUNNING_TASKS_PATTERN = /^No background tasks are currently running\.?$/;
 const RUNNING_TASKS_LIST_PATTERN = /^You have (\d+) background task\(s\) currently running:\r?\n([\s\S]+)$/;
 const EXIT_CODE_PATTERN = /Command exited with code (-?\d+)/;
-const MESSAGE_HEADER_PATTERN = /\[Message\][^\n]*?\btimestamp=(\S+)[^\n]*?\bsender=(\S+)[^\n]*?\bcontent=([\s\S]*?)(?:\n<\/SYSTEM_MESSAGE>|$)/;
-const MESSAGE_SENDER_PATTERN = /\[Message\][^\n]*?\bsender=(\S+)/;
+const MESSAGE_LINE_PATTERN = /(?:^|\r?\n|<SYSTEM_MESSAGE>\s*)(\[Message\][^\r\n]*)/g;
+
+const TERMINAL_TASK_STATUSES = new Set([
+	"DONE",
+	"COMPLETED",
+	"COMPLETE",
+	"FINISHED",
+	"SUCCEEDED",
+	"SUCCESS",
+	"FAILED",
+	"FAILURE",
+	"ERROR",
+	"CANCELLED",
+	"CANCELED",
+	"KILLED",
+	"STOPPED",
+	"ABORTED",
+	"EXPIRED",
+	"TIMED_OUT",
+	"TIMEOUT",
+]);
+
+const CANCELED_STEP_STATUSES = new Set(["CANCELED", "CANCELLED", "ABORTED"]);
+const ERROR_OR_CANCELED_STEP_STATUSES = new Set(["CANCELED", "CANCELLED", "ABORTED", "ERROR"]);
+
+function isTerminalTaskStatus(status: string): boolean {
+	const normalized = status.trim().toUpperCase().replace(/^TASK_STATUS_/, "");
+	return TERMINAL_TASK_STATUSES.has(normalized);
+}
+
+function isCanceledStepStatus(status: string): boolean {
+	return CANCELED_STEP_STATUSES.has(status.trim().toUpperCase());
+}
+
+function isErrorOrCanceledStepStatus(status: string): boolean {
+	return ERROR_OR_CANCELED_STEP_STATUSES.has(status.trim().toUpperCase());
+}
+
+function isInheritModel(model: string | undefined): boolean {
+	return model !== undefined && model.trim().toLowerCase() === "inherit";
+}
+
+interface DeliveredMessage {
+	timestampMs?: number;
+	sender: string;
+	content: string;
+}
+
+function parseSystemMessages(stepContent: string): DeliveredMessage[] {
+	const headers: Array<{
+		start: number;
+		end: number;
+		sender: string;
+		timestampMs?: number;
+		firstContentLine: string;
+	}> = [];
+	for (const match of stepContent.matchAll(MESSAGE_LINE_PATTERN)) {
+		if (match.index === undefined) continue;
+		const headerLine = match[1];
+		const contentMatch = /\bcontent=/.exec(headerLine);
+		const metaPart = contentMatch ? headerLine.slice(0, contentMatch.index) : headerLine;
+		const sender = /\bsender=(\S+)/.exec(metaPart)?.[1];
+		if (!sender) continue;
+		const timestampRaw = /\btimestamp=(\S+)/.exec(metaPart)?.[1];
+		const firstContentLine = contentMatch
+			? headerLine.slice(contentMatch.index + contentMatch[0].length)
+			: "";
+		headers.push({
+			start: match.index,
+			end: match.index + match[0].length,
+			sender,
+			timestampMs: parseTimeMs(timestampRaw),
+			firstContentLine,
+		});
+	}
+	const messages: DeliveredMessage[] = [];
+	for (let i = 0; i < headers.length; i++) {
+		const current = headers[i];
+		const nextStart = i + 1 < headers.length ? headers[i + 1].start : stepContent.length;
+		let tail = stepContent.slice(current.end, nextStart);
+		const closeMatch = /\r?\n<\/SYSTEM_MESSAGE>/.exec(tail);
+		if (closeMatch) {
+			tail = tail.slice(0, closeMatch.index);
+		}
+		messages.push({
+			timestampMs: current.timestampMs,
+			sender: current.sender,
+			content: `${current.firstContentLine}${tail}`.trim(),
+		});
+	}
+	return messages;
+}
 
 const DURATION_UNIT_SECONDS: Record<string, number> = {
 	d: 86_400,
@@ -281,8 +376,11 @@ export function formatDuration(totalSeconds: number): string {
 
 function outcomeFromTaskStatus(status: string, kind: BackgroundTask["kind"]): TaskOutcome {
 	const upper = status.trim().toUpperCase();
-	if (upper.includes("CANCEL") || upper.includes("KILL")) return "canceled";
-	if (upper.includes("FAIL") || upper.includes("ERROR")) return "failed";
+	if (upper.includes("CANCEL") || upper.includes("KILL") || upper.includes("ABORT")) return "canceled";
+	if (upper.includes("EXPIRE")) return "expired";
+	if (upper.includes("FAIL") || upper.includes("ERROR") || upper.includes("TIMED_OUT") || upper.includes("TIMEOUT")) {
+		return kind === "timer" ? "expired" : "failed";
+	}
 	if (kind === "timer") return "expired";
 	return "ok";
 }
@@ -346,11 +444,35 @@ function findScheduleCall(
 	return schedules.length === 1 ? schedules[0] : undefined;
 }
 
+function findCronScheduleCall(
+	calls: readonly TranscriptToolCall[],
+	description: string,
+): TranscriptToolCall | undefined {
+	const cronCalls = calls.filter((call) => call.name === "schedule" && Boolean(call.args.CronExpression?.trim()));
+	if (cronCalls.length === 0) return undefined;
+	const trimmed = description.trim();
+	const exactPrompt = cronCalls.find((call) => call.args.Prompt?.trim() === trimmed);
+	if (exactPrompt) return exactPrompt;
+	const containsExpr = cronCalls.find((call) => {
+		const expr = call.args.CronExpression?.trim();
+		return expr !== undefined && expr.length > 0 && trimmed.includes(expr);
+	});
+	if (containsExpr) return containsExpr;
+	const hasRunCommand = calls.some((call) => call.name === "run_command");
+	return !hasRunCommand && cronCalls.length === 1 ? cronCalls[0] : undefined;
+}
+
+function taskContentHeader(content: string): string {
+	const match = /(?:^|\r?\n)Command output:/i.exec(content);
+	return (match ? content.slice(0, match.index) : content).trim();
+}
+
 function outcomeOf(title: string | undefined, content: string, kind: BackgroundTask["kind"] | undefined) {
-	const exitMatch = EXIT_CODE_PATTERN.exec(content);
+	const header = taskContentHeader(content);
+	const exitMatch = EXIT_CODE_PATTERN.exec(header);
 	const exitCode = exitMatch ? Number.parseInt(exitMatch[1], 10) : undefined;
 	let outcome: TaskOutcome;
-	if (/was cancell?ed/i.test(title ?? "") || /was cancell?ed/i.test(content)) {
+	if (/was cancell?ed/i.test(title ?? "") || CONTENT_CANCELED_PATTERN.test(header)) {
 		outcome = "canceled";
 	} else if (kind === "timer" || /timer has expired/i.test(title ?? "")) {
 		outcome = "expired";
@@ -395,13 +517,14 @@ function summarizeAction(call: TranscriptToolCall): AutonomousAction {
 		args.TargetFile ??
 		args.Query ??
 		(args.DurationSeconds ? `${args.DurationSeconds} s` : undefined) ??
+		(args.CronExpression ? `cron ${args.CronExpression}` : undefined) ??
 		(args.TaskId && args.Action ? `${args.Action} ${shortTaskId(args.TaskId) ?? args.TaskId}` : undefined) ??
 		"";
 	return { name: call.name, summary: summary.replace(/\s+/g, " ").trim() };
 }
 
 function isMessageDelivery(step: TranscriptStep): boolean {
-	return step.type === "SYSTEM_MESSAGE" && step.content.includes("[Message]");
+	return step.type === "SYSTEM_MESSAGE" && parseSystemMessages(step.content).length > 0;
 }
 
 /**
@@ -433,12 +556,19 @@ export function deriveAgyActivity(
 	}
 	const endOf = (taskId: string) => notesByTask.get(taskId)?.find((note) => note.terminal);
 	/** The note delivered in a transcript step: same sender, same second. */
-	const noteAt = (senderId: string, atMs: number | undefined) =>
-		atMs === undefined
-			? undefined
-			: notesBySender
-					.get(senderId)
-					?.find((note) => note.timestampMs !== undefined && Math.abs(note.timestampMs - atMs) < 1_000);
+	const noteAt = (senderId: string, atMs: number | undefined, deliveredContent?: string) => {
+		if (atMs === undefined) return undefined;
+		const matching = notesBySender
+			.get(senderId)
+			?.filter((note) => note.timestampMs !== undefined && Math.abs(note.timestampMs - atMs) < 1_000);
+		if (!matching || matching.length === 0) return undefined;
+		if (matching.length === 1 || !deliveredContent) return matching[0];
+		return (
+			matching.find(
+				(note) => note.content.trim() === deliveredContent || note.content.trim().startsWith(deliveredContent),
+			) ?? matching[0]
+		);
+	};
 
 	const tasks: BackgroundTask[] = [];
 	const tasksById = new Map<string, BackgroundTask>();
@@ -466,17 +596,17 @@ export function deriveAgyActivity(
 			lastPlannerStepIndex = step.index;
 			continue;
 		}
-		if (isMessageDelivery(step)) {
-			const header = MESSAGE_HEADER_PATTERN.exec(step.content);
-			const sender = header?.[2] ?? MESSAGE_SENDER_PATTERN.exec(step.content)?.[1];
-			if (sender) {
-				const atMs = parseTimeMs(header?.[1]) ?? step.createdAtMs;
+		if (step.type === "SYSTEM_MESSAGE") {
+			const deliveredList = parseSystemMessages(step.content);
+			if (deliveredList.length === 0) continue;
+			for (const delivered of deliveredList) {
+				const sender = delivered.sender;
+				const atMs = delivered.timestampMs ?? step.createdAtMs;
 				const senderTaskId = shortTaskId(sender);
 				if (senderTaskId) {
 					const task = tasksById.get(senderTaskId);
-					const deliveredContent = (header?.[3] ?? "").trim();
-					if (task && !task.finished && (isTerminalNote(undefined, deliveredContent) || task.kind === "timer")) {
-						const { outcome, exitCode } = outcomeOf(undefined, deliveredContent, task.kind);
+					if (task && !task.finished && (isTerminalNote(undefined, delivered.content) || task.kind === "timer")) {
+						const { outcome, exitCode } = outcomeOf(undefined, delivered.content, task.kind);
 						finishTask(task, outcome, atMs, exitCode);
 					}
 				}
@@ -502,25 +632,59 @@ export function deriveAgyActivity(
 			if (!taskId) continue;
 			const description = (TASK_DESCRIPTION_PATTERN.exec(step.content)?.[1] ?? "").trim();
 			const timerMatch = TIMER_PATTERN.exec(description);
+			const cronMatch = !timerMatch ? CRON_PATTERN.exec(description) : undefined;
 			const parsedTimerSeconds = timerMatch ? parseDurationSeconds(timerMatch[1]) : undefined;
-			const scheduleCall = timerMatch ? findScheduleCall(lastPlannerCalls, timerMatch[2]) : undefined;
+			const scheduleCall = timerMatch
+				? findScheduleCall(lastPlannerCalls, timerMatch[2])
+				: cronMatch
+					? (lastPlannerCalls.find(
+							(call) =>
+								call.name === "schedule" && call.args.CronExpression?.trim() === cronMatch[1].trim(),
+						) ?? findScheduleCall(lastPlannerCalls, cronMatch[2]))
+					: undefined;
 			const argSeconds = scheduleCall?.args.DurationSeconds
 				? Number.parseInt(scheduleCall.args.DurationSeconds, 10)
 				: undefined;
 			const timerSeconds =
 				parsedTimerSeconds ??
 				(argSeconds !== undefined && Number.isFinite(argSeconds) ? argSeconds : undefined);
-			const kind: BackgroundTask["kind"] = timerMatch && timerSeconds !== undefined ? "timer" : "command";
-			const summary = lastPlannerCalls.find(
+			const commandCall = lastPlannerCalls.find(
 				(call) => call.name === "run_command" && call.args.CommandLine?.trim() === description,
-			)?.args.toolSummary;
+			);
+			const fallbackCronCall =
+				!timerMatch && !cronMatch && !commandCall
+					? findCronScheduleCall(lastPlannerCalls, description)
+					: undefined;
+			const cronExpression =
+				cronMatch?.[1].trim() ||
+				(cronMatch ? scheduleCall?.args.CronExpression?.trim() : undefined) ||
+				fallbackCronCall?.args.CronExpression?.trim();
+			let kind: BackgroundTask["kind"];
+			let taskDescription: string;
+			let summary: string | undefined;
+			if (timerMatch && timerSeconds !== undefined) {
+				kind = "timer";
+				taskDescription = (timerMatch[2] ?? "").trim();
+			} else if (cronMatch) {
+				kind = "cron";
+				taskDescription = (cronMatch[2] ?? scheduleCall?.args.Prompt ?? "").trim();
+				summary = cronExpression || undefined;
+			} else if (fallbackCronCall) {
+				kind = "cron";
+				taskDescription = (fallbackCronCall.args.Prompt ?? description).trim();
+				summary = cronExpression || undefined;
+			} else {
+				kind = "command";
+				taskDescription = description;
+				summary = commandCall?.args.toolSummary;
+			}
 			const task: BackgroundTask = {
 				taskId,
 				stepIndex: step.index,
 				kind,
-				description: kind === "timer" ? (timerMatch?.[2] ?? "").trim() : description,
+				description: taskDescription,
 				summary,
-				timerSeconds,
+				timerSeconds: kind === "timer" ? timerSeconds : undefined,
 				startedAtMs: step.createdAtMs,
 			};
 			const end = endOf(taskId);
@@ -559,10 +723,12 @@ export function deriveAgyActivity(
 			continue;
 		}
 		const statusMatch = TASK_STATUS_PATTERN.exec(body);
-		if (statusMatch && statusMatch[2].trim().toUpperCase() !== "RUNNING") {
-			const id = shortTaskId(statusMatch[1]);
-			const task = id ? tasksById.get(id) : undefined;
-			if (task) finishTask(task, outcomeFromTaskStatus(statusMatch[2], task.kind), atMs);
+		if (statusMatch) {
+			if (isTerminalTaskStatus(statusMatch[2])) {
+				const id = shortTaskId(statusMatch[1]);
+				const task = id ? tasksById.get(id) : undefined;
+				if (task) finishTask(task, outcomeFromTaskStatus(statusMatch[2], task.kind), atMs);
+			}
 			continue;
 		}
 		if (lastPlannerStepIndex !== undefined && manageCalls.some((call) => call.args.Action === "list")) {
@@ -571,7 +737,7 @@ export function deriveAgyActivity(
 				for (const task of tasks) {
 					if (task.finished || task.stepIndex >= lastPlannerStepIndex) continue;
 					if (!running.has(task.taskId)) {
-						finishTask(task, task.kind === "timer" ? "canceled" : "ok", atMs);
+						finishTask(task, task.kind === "timer" || task.kind === "cron" ? "canceled" : "ok", atMs);
 					}
 				}
 			}
@@ -582,12 +748,17 @@ export function deriveAgyActivity(
 	let lastUserInputStep = -1;
 	let inTurn = false;
 	let current: AutonomousTurn | undefined;
-	const closeCurrent = (state: AutonomousTurn["state"], endStep: number, endedAtMs?: number) => {
+	const closeCurrent = (
+		state: AutonomousTurn["state"],
+		endStep: number,
+		endedAtMs?: number,
+		allowEmpty = state === "done",
+	) => {
 		if (!current) return;
 		current.state = state;
 		current.endStep = endStep;
 		current.endedAtMs = endedAtMs;
-		if (current.texts.length > 0 || current.actions.length > 0 || state === "done") {
+		if (current.texts.length > 0 || current.actions.length > 0 || allowEmpty) {
 			turns.push(current);
 		}
 		current = undefined;
@@ -597,46 +768,55 @@ export function deriveAgyActivity(
 		if (step.type === "USER_INPUT") {
 			lastUserInputStep = step.index;
 			closeCurrent("interrupted", step.index - 1, step.createdAtMs);
-			inTurn = true;
+			inTurn = !isCanceledStepStatus(step.status);
 			continue;
 		}
-		if (isMessageDelivery(step)) {
-			const header = MESSAGE_HEADER_PATTERN.exec(step.content);
-			const sender = header?.[2] ?? MESSAGE_SENDER_PATTERN.exec(step.content)?.[1];
-			const taskId = sender ? shortTaskId(sender) : undefined;
-			const kind = taskId ? taskKinds.get(taskId) : undefined;
-			const deliveredContent = (header?.[3] ?? "").trim();
-			const note = sender ? noteAt(sender, parseTimeMs(header?.[1])) : undefined;
-			const title = note?.title;
-			let trigger: AutonomousTrigger;
-			if (taskId) {
-				const content = note?.content ?? deliveredContent;
-				const terminal = note ? note.terminal : isTerminalNote(undefined, content) || kind === "timer";
-				const result = terminal ? outcomeOf(title, content, kind) : undefined;
-				trigger = {
-					taskId,
-					title,
-					outcome: terminal ? result?.outcome : "running",
-					exitCode: result?.exitCode,
-					kind,
-				};
-			} else {
-				// A subagent (or another agent) sent agy a message.
-				const preview = firstLine(note?.content ?? deliveredContent);
-				trigger = { agentId: sender, title, ...(preview ? { preview } : {}) };
+		if (step.type === "GENERIC" && isCanceledStepStatus(step.status)) {
+			closeCurrent("interrupted", step.index, step.createdAtMs, false);
+			inTurn = false;
+			continue;
+		}
+		if (step.type === "SYSTEM_MESSAGE") {
+			const deliveredList = parseSystemMessages(step.content);
+			if (deliveredList.length === 0) continue;
+			const triggers: AutonomousTrigger[] = [];
+			for (const delivered of deliveredList) {
+				const sender = delivered.sender;
+				const taskId = shortTaskId(sender);
+				const kind = taskId ? taskKinds.get(taskId) : undefined;
+				const note = noteAt(sender, delivered.timestampMs, delivered.content);
+				const title = note?.title;
+				if (taskId) {
+					const content = note?.content ?? delivered.content;
+					const terminal = note ? note.terminal : isTerminalNote(undefined, content) || kind === "timer";
+					const result = terminal ? outcomeOf(title, content, kind) : undefined;
+					triggers.push({
+						taskId,
+						title,
+						outcome: terminal ? result?.outcome : "running",
+						exitCode: result?.exitCode,
+						kind,
+					});
+				} else {
+					// A subagent (or another agent) sent agy a message.
+					const preview = firstLine(note?.content ?? delivered.content);
+					triggers.push({ agentId: sender, title, ...(preview ? { preview } : {}) });
+				}
 			}
-			if (current) {
-				current.triggers.push(trigger);
-			} else if (!inTurn) {
-				current = {
-					startStep: step.index,
-					startedAtMs: step.createdAtMs,
-					state: "running",
-					triggers: [trigger],
-					actions: [],
-					texts: [],
-				};
-				inTurn = true;
+			if (triggers.length > 0) {
+				if (current) {
+					current.triggers.push(...triggers);
+				} else if (!inTurn) {
+					current = {
+						startStep: step.index,
+						startedAtMs: step.createdAtMs,
+						state: "running",
+						triggers,
+						actions: [],
+						texts: [],
+					};
+					inTurn = true;
+				}
 			}
 			continue;
 		}
@@ -647,8 +827,9 @@ export function deriveAgyActivity(
 			if (text) current.texts.push(text);
 			current.actions.push(...step.toolCalls.map(summarizeAction));
 		}
-		if (step.toolCalls.length === 0) {
-			closeCurrent("done", step.index, step.createdAtMs);
+		const failedOrCanceled = isErrorOrCanceledStepStatus(step.status);
+		if (step.toolCalls.length === 0 || failedOrCanceled) {
+			closeCurrent("done", step.index, step.createdAtMs, !failedOrCanceled);
 			inTurn = false;
 		}
 	}
@@ -659,10 +840,17 @@ export function deriveAgyActivity(
 	return { tasks, turns, lastUserInputStep };
 }
 
-/** Last visible line of a task log: carriage-return progress and ANSI codes removed. */
+const OSC_SEQUENCE_PATTERN = /\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g;
+const CSI_SEQUENCE_PATTERN = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
+const STRAY_CONTROL_PATTERN = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g;
+
+/** Last visible line of a task log: carriage-return progress, ANSI/OSC codes and control chars removed. */
 export function lastLogLine(logText: string): string | undefined {
-	const withoutAnsi = logText.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "");
-	const lines = withoutAnsi
+	const cleaned = logText
+		.replace(OSC_SEQUENCE_PATTERN, "")
+		.replace(CSI_SEQUENCE_PATTERN, "")
+		.replace(STRAY_CONTROL_PATTERN, "");
+	const lines = cleaned
 		.split("\n")
 		.map((line) => {
 			const parts = line.split("\r");
@@ -760,7 +948,9 @@ export function deriveSubagentStatus(
 	const waitingText = waitingFor
 		? waitingFor.kind === "timer"
 			? `waiting for timer ${waitingFor.timerSeconds !== undefined ? formatDuration(waitingFor.timerSeconds) : "?"}`
-			: `waiting for ${waitingFor.summary ?? waitingFor.description}`
+			: waitingFor.kind === "cron"
+				? `waiting for cron ${waitingFor.summary ?? waitingFor.description}`
+				: `waiting for ${waitingFor.summary ?? waitingFor.description}`
 		: undefined;
 	if (record.state === "SUBAGENT_STATE_KILLED") {
 		state = "killed";
@@ -781,8 +971,12 @@ export function deriveSubagentStatus(
 			const more = lastPlanner.toolCalls.length > 1 ? ` (+${lastPlanner.toolCalls.length - 1})` : "";
 			activity = `→ ${action.name}${action.summary ? ` ${action.summary}` : ""}${more}`;
 		}
-	} else if (last && last.index > lastPlanner.index) {
-		// A message arrived after its last answer: it works again.
+	} else if (
+		ordered.some(
+			(step) => step.index > lastPlanner.index && (isMessageDelivery(step) || step.type === "USER_INPUT"),
+		)
+	) {
+		// A message or prompt arrived after its last answer: it works again.
 		state = "working";
 		activity = "thinking …";
 	} else if (waitingText) {
@@ -797,12 +991,26 @@ export function deriveSubagentStatus(
 
 	const spawn = spawnArguments(record, parentSteps);
 	const typeName = record.typeName ?? spawn?.TypeName;
+	const rawRequestedModel = spawn?.Model?.trim();
+	const inheritsParentModel = isInheritModel(rawRequestedModel);
+	const requestedModel = rawRequestedModel && !inheritsParentModel ? rawRequestedModel : undefined;
 	const ownModel = [...planners].reverse().find((step) => step.model)?.model;
 	const parentModel =
-		!ownModel && typeName === "self" && !spawn?.Model
+		!ownModel && (inheritsParentModel || (typeName === "self" && !rawRequestedModel))
 			? [...parentSteps]
 					.filter((step) => step.type === "PLANNER_RESPONSE" && step.model)
 					.sort((a, b) => b.index - a.index)[0]?.model
+			: undefined;
+	let latestOwnMessageMs: number | undefined;
+	for (const message of ownMessages) {
+		if (!message.terminal || message.timestampMs === undefined) continue;
+		if (latestOwnMessageMs === undefined || message.timestampMs > latestOwnMessageMs) {
+			latestOwnMessageMs = message.timestampMs;
+		}
+	}
+	const lastAtMs =
+		last?.createdAtMs !== undefined || latestOwnMessageMs !== undefined
+			? Math.max(last?.createdAtMs ?? 0, latestOwnMessageMs ?? 0)
 			: undefined;
 	return {
 		conversationId: record.conversationId,
@@ -810,13 +1018,13 @@ export function deriveSubagentStatus(
 		typeName,
 		model: ownModel ?? parentModel,
 		...(parentModel ? { modelFromParent: true } : {}),
-		requestedModel: spawn?.Model,
+		requestedModel,
 		prompt: spawn?.Prompt,
 		state,
 		activity,
 		toolCalls: planners.reduce((sum, step) => sum + step.toolCalls.length, 0),
 		startedAtMs: ordered[0]?.createdAtMs,
-		lastAtMs: last?.createdAtMs,
+		lastAtMs,
 	};
 }
 

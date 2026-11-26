@@ -173,15 +173,21 @@ export function describeTrigger(trigger: AutonomousTrigger, theme: ThemeLike): s
 	}
 	const fallback =
 		trigger.outcome === "running"
-			? "still running"
+			? trigger.kind === "cron"
+				? "cron triggered"
+				: "still running"
 			: trigger.kind === "timer"
 				? "timer expired"
-				: trigger.taskId
-					? "task finished"
-					: "message";
+				: trigger.kind === "cron"
+					? "cron finished"
+					: trigger.taskId
+						? "task finished"
+						: "message";
 	const label = trigger.title ?? fallback;
 	const exit =
-		trigger.exitCode !== undefined && trigger.kind !== "timer" ? ` (Exit ${trigger.exitCode})` : "";
+		trigger.exitCode !== undefined && trigger.kind !== "timer" && trigger.kind !== "cron"
+			? ` (Exit ${trigger.exitCode})`
+			: "";
 	const id = trigger.taskId ? `${theme.fg("muted", trigger.taskId)} · ` : "";
 	return `${outcomeMark(trigger.outcome, theme)} ${id}${label}${exit}`;
 }
@@ -238,16 +244,24 @@ function taskLabel(task: BackgroundTask): string {
 	if (task.kind === "timer") {
 		return `Timer ${task.timerSeconds !== undefined ? formatDuration(task.timerSeconds) : "?"}`;
 	}
+	if (task.kind === "cron") {
+		return task.summary ? `Cron ${task.summary}` : (task.description ? `Cron ${task.description}` : "Cron");
+	}
 	return task.summary ?? task.description;
 }
 
 const MAX_SUBAGENT_LINES = 6;
 
+function isInheritModel(value: string | undefined): boolean {
+	return value !== undefined && value.trim().toLowerCase() === "inherit";
+}
+
 /** Model and reasoning level the subagent runs on, else what was asked for. */
 export function subagentModelLabel(status: SubagentStatus): string {
 	const model = formatAgyModel(status.model);
 	if (model) return model;
-	if (status.requestedModel) return `${status.requestedModel} (requested)`;
+	if (isInheritModel(status.requestedModel)) return "same model as the main agent";
+	if (status.requestedModel?.trim()) return `${status.requestedModel.trim()} (requested)`;
 	if (status.typeName === "self") return "same model as the main agent";
 	return status.typeName ?? "";
 }
@@ -263,10 +277,16 @@ export function subagentStartNote(
 	const role = typeof args.agentRole === "string" ? args.agentRole : undefined;
 	const count = typeof args.agentCount === "number" ? args.agentCount : 1;
 	const startedModel = started ? subagentModelLabel(started) : "";
-	const model =
-		startedModel ||
-		(typeof args.model === "string" ? `${args.model} (requested)` : undefined) ||
-		(args.agentType === "self" ? "same model as the main agent" : undefined);
+	const rawArgModel = typeof args.model === "string" ? args.model.trim() : undefined;
+	const argModelLabel =
+		rawArgModel && isInheritModel(rawArgModel)
+			? "same model as the main agent"
+			: rawArgModel
+				? `${rawArgModel} (requested)`
+				: args.agentType === "self"
+					? "same model as the main agent"
+					: undefined;
+	const model = startedModel || argModelLabel;
 	const who = count > 1 ? `${count} subagents (${role ?? "no role"})` : `Subagent "${role ?? "no role"}"`;
 	const details = [started?.conversationId.slice(0, 8), model].filter((part) => part !== undefined).join(" · ");
 	const lines = [
@@ -335,6 +355,8 @@ export function renderActivityLines(
 		} else if (task.kind === "timer" && task.startedAtMs !== undefined && task.timerSeconds !== undefined) {
 			const left = task.startedAtMs + task.timerSeconds * 1000 - now;
 			detail = left > 0 ? `${formatDuration(Math.ceil(left / 1000))} left` : "expiring";
+		} else if (task.kind === "cron" || task.kind === "timer") {
+			detail = "scheduled";
 		} else {
 			detail = snapshot.logTails.get(task.taskId) ?? "no output yet";
 		}

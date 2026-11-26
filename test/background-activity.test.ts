@@ -27,6 +27,7 @@ import {
 	formatAgyModel,
 	senderRole,
 	setAgyModelNames,
+	subagentModelLabel,
 	subagentStartNote,
 	renderActivityLines,
 	renderAutonomousEntry,
@@ -308,6 +309,203 @@ describe("agy activity from local files", () => {
 		assert.equal(after.tasks[0].finished?.outcome, "ok");
 		assert.equal(after.tasks[1].finished?.outcome, "canceled");
 	});
+
+	it("parses multiple [Message] blocks in one SYSTEM_MESSAGE step for tasks, timers and triggers", () => {
+		const line = (obj: Record<string, unknown>) => JSON.stringify(obj);
+		const sub = "7c7c7c7c-1111-2222-3333-444444444444";
+		const lines = [
+			line({ step_index: 0, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", created_at: "2026-11-26T10:00:00Z", content: "start jobs" }),
+			line({ step_index: 1, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T10:00:01Z", tool_calls: [{ name: "run_command", args: { CommandLine: "\"job-1\"" } }, { name: "run_command", args: { CommandLine: "\"job-2\"" } }, { name: "schedule", args: { DurationSeconds: "120", Prompt: "\"Wait for job-2\"", TimerCondition: `"${CONV}/task-3"` } }] }),
+			line({ step_index: 2, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T10:00:02Z", content: `Tool is running as a background task with task id: ${CONV}/task-2\nTask Description: job-1` }),
+			line({ step_index: 3, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T10:00:02Z", content: `Tool is running as a background task with task id: ${CONV}/task-3\nTask Description: job-2` }),
+			line({ step_index: 4, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T10:00:02Z", content: `Tool is running as a background task with task id: ${CONV}/task-4\nTask Description: Timer: 2m, Prompt: Wait for job-2` }),
+			line({ step_index: 5, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T10:00:03Z", content: "Started." }),
+			line({
+				step_index: 6,
+				source: "SYSTEM",
+				type: "SYSTEM_MESSAGE",
+				status: "DONE",
+				created_at: "2026-11-26T10:00:30Z",
+				content:
+					`<SYSTEM_MESSAGE>\n` +
+					`[Message] timestamp=2026-11-26T10:00:29Z sender=${CONV}/task-2 priority=MESSAGE_PRIORITY_HIGH content=Task id "${CONV}/task-2" finished with result:\nCommand exited with code 0.\n` +
+					`[Message] timestamp=2026-11-26T10:00:30Z sender=${CONV}/task-3 priority=MESSAGE_PRIORITY_HIGH content=Task id "${CONV}/task-3" finished with result:\nCommand exited with code 2.\n` +
+					`</SYSTEM_MESSAGE>The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n` +
+					`<SYSTEM_MESSAGE>\n` +
+					`[Message] timestamp=2026-11-26T10:00:30Z sender=${sub} priority=MESSAGE_PRIORITY_HIGH content=Subagent finished cleanly.\n` +
+					`</SYSTEM_MESSAGE>`,
+			}),
+			line({ step_index: 7, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T10:00:31Z", content: "All handled." }),
+		];
+		const activity = deriveAgyActivity(steps(lines), []);
+		assert.deepEqual(
+			activity.tasks.map((task) => [task.taskId, task.finished?.outcome, task.finished?.exitCode]),
+			[
+				["task-2", "ok", 0],
+				["task-3", "failed", 2],
+				["task-4", "canceled", undefined],
+			],
+		);
+		assert.equal(activity.turns.length, 1);
+		assert.deepEqual(activity.turns[0].triggers, [
+			{ taskId: "task-2", title: undefined, outcome: "ok", exitCode: 0, kind: "command" },
+			{ taskId: "task-3", title: undefined, outcome: "failed", exitCode: 2, kind: "command" },
+			{ agentId: sub, title: undefined, preview: "Subagent finished cleanly." },
+		]);
+	});
+
+	it("does not misclassify a successful command as canceled when its stdout mentions cancellation", () => {
+		const line = (obj: Record<string, unknown>) => JSON.stringify(obj);
+		const lines = [
+			line({ step_index: 0, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", created_at: "2026-11-26T10:00:00Z", content: "run" }),
+			line({ step_index: 1, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T10:00:01Z", tool_calls: [{ name: "run_command", args: { CommandLine: "\"check-builds\"" } }, { name: "run_command", args: { CommandLine: "\"long-job\"" } }] }),
+			line({ step_index: 2, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T10:00:02Z", content: `Tool is running as a background task with task id: ${CONV}/task-2\nTask Description: check-builds` }),
+			line({ step_index: 3, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T10:00:02Z", content: `Tool is running as a background task with task id: ${CONV}/task-3\nTask Description: long-job` }),
+			line({ step_index: 4, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T10:00:03Z", content: "Running." }),
+		];
+		const okMsg = parseTaskMessage(
+			JSON.stringify({
+				id: "m1",
+				sender: `${CONV}/task-2`,
+				timestamp: "2026-11-26T10:00:10Z",
+				renderDetails: { messageTitle: "check-builds finished" },
+				content: `Task id "${CONV}/task-2" finished with result:\nCommand exited with code 0.\n\nCommand output:\nPrevious job was cancelled.\nTask id "${CONV}/task-2" was cancelled in log output\nCommand exited with code 1`,
+			}),
+		);
+		const canceledMsg = parseTaskMessage(
+			JSON.stringify({
+				id: "m2",
+				sender: `${CONV}/task-3`,
+				timestamp: "2026-11-26T10:00:12Z",
+				renderDetails: { messageTitle: "long-job update" },
+				content: `Task id "${CONV}/task-3" was cancelled.`,
+			}),
+		);
+		assert.ok(okMsg && canceledMsg);
+		const activity = deriveAgyActivity(steps(lines), [okMsg, canceledMsg]);
+		assert.deepEqual(activity.tasks[0].finished, {
+			outcome: "ok",
+			title: "check-builds finished",
+			exitCode: 0,
+			atMs: Date.parse("2026-11-26T10:00:10Z"),
+		});
+		assert.equal(activity.tasks[1].finished?.outcome, "canceled");
+	});
+
+	it("resets inTurn after canceled or errored user turns without resetting on normal tool errors", () => {
+		const line = (obj: Record<string, unknown>) => JSON.stringify(obj);
+		// 1. User turn whose PLANNER_RESPONSE errors out (even with tool_calls) must not swallow the next autonomous turn.
+		const erroredPlanner = [
+			line({ step_index: 0, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", content: "try" }),
+			line({ step_index: 1, source: "MODEL", type: "PLANNER_RESPONSE", status: "ERROR", content: "", tool_calls: [{ name: "run_command", args: { CommandLine: "\"x\"" } }] }),
+			line({ step_index: 2, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-26T10:01:00Z sender=${CONV}/task-9 priority=HIGH content=done\n</SYSTEM_MESSAGE>` }),
+			line({ step_index: 3, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "Autonomous reply after planner error." }),
+		];
+		assert.deepEqual(
+			deriveAgyActivity(steps(erroredPlanner), []).turns.map((turn) => [turn.startStep, turn.state, turn.texts]),
+			[[2, "done", ["Autonomous reply after planner error."]]],
+		);
+
+		// 2. Canceled USER_INPUT and canceled GENERIC reset inTurn.
+		const canceledSteps = [
+			line({ step_index: 0, source: "USER_EXPLICIT", type: "USER_INPUT", status: "CANCELED", content: "abort immediately" }),
+			line({ step_index: 1, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-26T10:02:00Z sender=${CONV}/task-1 priority=HIGH content=done\n</SYSTEM_MESSAGE>` }),
+			line({ step_index: 2, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "After canceled user input." }),
+			line({ step_index: 3, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", content: "run tool" }),
+			line({ step_index: 4, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "", tool_calls: [{ name: "run_command", args: { CommandLine: "\"sleep 60\"" } }] }),
+			line({ step_index: 5, source: "MODEL", type: "GENERIC", status: "CANCELLED", content: "Aborted" }),
+			line({ step_index: 6, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-26T10:03:00Z sender=${CONV}/task-2 priority=HIGH content=done\n</SYSTEM_MESSAGE>` }),
+			line({ step_index: 7, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "After canceled tool." }),
+		];
+		assert.deepEqual(
+			deriveAgyActivity(steps(canceledSteps), []).turns.map((turn) => [turn.startStep, turn.texts]),
+			[
+				[1, ["After canceled user input."]],
+				[6, ["After canceled tool."]],
+			],
+		);
+
+		// 3. Normal tool error (GENERIC status ERROR) keeps inTurn active because agy continues the user turn.
+		const toolError = [
+			line({ step_index: 0, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", content: "check" }),
+			line({ step_index: 1, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "", tool_calls: [{ name: "manage_task", args: { Action: "\"kill\"", TaskId: `"${CONV}/task-1"` } }] }),
+			line({ step_index: 2, source: "MODEL", type: "GENERIC", status: "ERROR", content: "task is not running" }),
+			line({ step_index: 3, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-26T10:04:00Z sender=${CONV}/task-2 priority=HIGH content=done\n</SYSTEM_MESSAGE>` }),
+			line({ step_index: 4, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "Recovered in user turn." }),
+		];
+		assert.deepEqual(deriveAgyActivity(steps(toolError), []).turns, []);
+
+		// 4. Autonomous turn whose PLANNER_RESPONSE fails with empty text and no actions is not emitted as empty done.
+		const emptyErroredAuto = [
+			line({ step_index: 0, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-26T10:05:00Z sender=${CONV}/task-2 priority=HIGH content=done\n</SYSTEM_MESSAGE>` }),
+			line({ step_index: 1, source: "MODEL", type: "PLANNER_RESPONSE", status: "ABORTED", content: "" }),
+			line({ step_index: 2, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-26T10:06:00Z sender=${CONV}/task-3 priority=HIGH content=done\n</SYSTEM_MESSAGE>` }),
+			line({ step_index: 3, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "Next autonomous turn works." }),
+		];
+		assert.deepEqual(
+			deriveAgyActivity(steps(emptyErroredAuto), []).turns.map((turn) => [turn.startStep, turn.texts]),
+			[[2, ["Next autonomous turn works."]]],
+		);
+	});
+
+	it("classifies cron jobs cleanly, keeps them running across ticks and only finishes manage_task status on terminal states", () => {
+		const line = (obj: Record<string, unknown>) => JSON.stringify(obj);
+		const lines = [
+			line({ step_index: 1, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T10:00:00Z", tool_calls: [{ name: "schedule", args: { CronExpression: "\"*/5 * * * *\"", Prompt: "\"Check deploy\"" } }, { name: "schedule", args: { CronExpression: "\"0 * * * *\"", Prompt: "\"Hourly check\"" } }, { name: "run_command", args: { CommandLine: "\"build\"" } }] }),
+			line({ step_index: 2, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T10:00:01Z", content: `Tool is running as a background task with task id: ${CONV}/task-2\nTask Description: Cron: */5 * * * *, Prompt: Check deploy` }),
+			line({ step_index: 3, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T10:00:01Z", content: `Tool is running as a background task with task id: ${CONV}/task-3\nTask Description: Hourly check` }),
+			line({ step_index: 4, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T10:00:01Z", content: `Tool is running as a background task with task id: ${CONV}/task-4\nTask Description: build` }),
+			line({ step_index: 5, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T10:00:02Z", content: "Scheduled." }),
+			// Cron tick wakes agy up without ending the recurring cron job.
+			line({ step_index: 6, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", created_at: "2026-11-26T10:05:00Z", content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-26T10:05:00Z sender=${CONV}/task-2 priority=MESSAGE_PRIORITY_HIGH content=Check deploy\n</SYSTEM_MESSAGE>` }),
+			line({ step_index: 7, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T10:05:01Z", content: "Deploy healthy." }),
+			// manage_task status with PENDING / QUEUED / IN_PROGRESS must NOT mark tasks finished.
+			line({ step_index: 8, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T10:06:00Z", tool_calls: [{ name: "manage_task", args: { Action: "\"status\"", TaskId: `"${CONV}/task-4"` } }] }),
+			line({ step_index: 9, source: "MODEL", type: "GENERIC", status: "DONE", created_at: "2026-11-26T10:06:01Z", content: `Task: ${CONV}/task-4\nStatus: PENDING` }),
+			line({ step_index: 10, source: "MODEL", type: "GENERIC", status: "DONE", created_at: "2026-11-26T10:06:02Z", content: `Task: ${CONV}/task-4\nStatus: QUEUED` }),
+			line({ step_index: 11, source: "MODEL", type: "GENERIC", status: "DONE", created_at: "2026-11-26T10:06:03Z", content: `Task: ${CONV}/task-4\nStatus: IN_PROGRESS` }),
+		];
+		const mid = deriveAgyActivity(steps(lines), []);
+		assert.deepEqual(
+			mid.tasks.map((task) => [task.taskId, task.kind, task.summary, task.description, task.finished]),
+			[
+				["task-2", "cron", "*/5 * * * *", "Check deploy", undefined],
+				["task-3", "cron", "0 * * * *", "Hourly check", undefined],
+				["task-4", "command", undefined, "build", undefined],
+			],
+		);
+		assert.equal(describeTrigger(mid.turns[0].triggers[0], plainTheme), "⏳ task-2 · cron triggered");
+		const widgetLines = renderActivityLines(
+			{ agySessionId: CONV, tasks: mid.tasks.slice(0, 1), logTails: new Map() },
+			Date.parse("2026-11-26T10:00:31Z"),
+			0,
+			plainTheme,
+		);
+		assert.deepEqual(widgetLines, [
+			"Antigravity · 1 background task",
+			" ⠋ task-2  Cron */5 * * * *  0:30  scheduled",
+		]);
+
+		// Terminal manage_task statuses finish tasks with the expected outcomes.
+		lines.push(
+			line({ step_index: 12, source: "MODEL", type: "GENERIC", status: "DONE", created_at: "2026-11-26T10:07:00Z", content: `Task: ${CONV}/task-4\nStatus: TIMED_OUT` }),
+			line({ step_index: 13, source: "MODEL", type: "GENERIC", status: "DONE", created_at: "2026-11-26T10:07:01Z", content: `Task: ${CONV}/task-3\nStatus: CANCELLED` }),
+		);
+		const ended = deriveAgyActivity(steps(lines), []);
+		assert.equal(ended.tasks[2].finished?.outcome, "failed");
+		assert.equal(ended.tasks[1].finished?.outcome, "canceled");
+	});
+
+	it("strips OSC hyperlinks, titles and stray control characters in lastLogLine", () => {
+		assert.equal(
+			lastLogLine(
+				"\u001b]0;cargo build\u0007Compiling \u001b]8;;https://example.com\u001b\\crate\u001b]8;;\u001b\\\r\n" +
+					"\u001b[32mSee \u001b]8;;file:///tmp/a.rs\u0007a.rs\u001b]8;;\u0007\u001b[0m\u0007\u0000\u0008\u007f\r\n" +
+					"\u001b]0;Window Title Only\u0007\r\n",
+			),
+			"See a.rs",
+		);
+	});
 });
 
 describe("AgyActivityWatcher", () => {
@@ -484,6 +682,244 @@ describe("AgyActivityWatcher", () => {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
+
+	it("decodes multi-byte UTF-8 split across chunks, ignores 0-byte transcript_full.jsonl and resets decoder on rewind", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-brain-utf8-"));
+		try {
+			fs.mkdirSync(path.join(dir, "logs"), { recursive: true });
+			const shortFile = path.join(dir, "logs", "transcript.jsonl");
+			const fullFile = path.join(dir, "logs", "transcript_full.jsonl");
+			const line0 = `${JSON.stringify({ step_index: 0, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", content: "Grüße 🚀" })}\n`;
+			const bytes = Buffer.from(line0, "utf8");
+			const emojiByteIndex = bytes.indexOf(Buffer.from("🚀", "utf8"));
+			assert.ok(emojiByteIndex > 0);
+			// Split right inside the 4-byte UTF-8 sequence of 🚀.
+			fs.writeFileSync(shortFile, bytes.subarray(0, emojiByteIndex + 2));
+
+			const watcher = new AgyActivityWatcher({
+				agySessionId: CONV,
+				systemDir: dir,
+				isAlive: () => true,
+				onSnapshot: () => {},
+				onTurnFinished: () => {},
+			});
+			watcher.refresh();
+
+			// A 0-byte transcript_full.jsonl must not drop the active transcript.jsonl state.
+			fs.writeFileSync(fullFile, "");
+			fs.appendFileSync(shortFile, bytes.subarray(emojiByteIndex + 2));
+			assert.equal(watcher.refresh().lastUserInputStep, 0);
+
+			// Appending another split German umlaut still decodes cleanly without U+FFFD.
+			const line1 = `${JSON.stringify({ step_index: 1, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "Prüfung überstanden ✅" })}\n`;
+			const bytes1 = Buffer.from(line1, "utf8");
+			const umlautIdx = bytes1.indexOf(Buffer.from("ü", "utf8"));
+			fs.appendFileSync(shortFile, bytes1.subarray(0, umlautIdx + 1));
+			watcher.refresh();
+			fs.appendFileSync(shortFile, bytes1.subarray(umlautIdx + 1));
+			// Now also verify switching once transcript_full.jsonl becomes non-empty.
+			fs.writeFileSync(fullFile, `${line0}${line1}`);
+			const step1 = JSON.stringify({ step_index: 2, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", content: `[Message] timestamp=2026-11-26T10:00:00Z sender=${CONV}/task-1 priority=HIGH content=ok` });
+			const step2 = JSON.stringify({ step_index: 3, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "Prüfung überstanden ✅" });
+			fs.appendFileSync(fullFile, `${step1}\n${step2}\n`);
+			const activity = watcher.refresh();
+			assert.equal(activity.turns[0]?.texts[0], "Prüfung überstanden ✅");
+			assert.doesNotMatch(activity.turns[0]?.texts[0] ?? "", /\uFFFD/);
+
+			// Rewind (file shrunk while holding half a UTF-8 char) must reset decoder cleanly.
+			const partialUtf8 = Buffer.from(`${JSON.stringify({ step_index: 4, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "ä" })}\n`, "utf8");
+			fs.appendFileSync(fullFile, partialUtf8.subarray(0, partialUtf8.indexOf(0xc3) + 1));
+			watcher.refresh();
+			fs.writeFileSync(fullFile, `${line0}`);
+			assert.equal(watcher.refresh().lastUserInputStep, 0);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("waits briefly for transcript_full.jsonl when a newly finished autonomous turn is truncated, then falls back cleanly", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-brain-trunc-"));
+		try {
+			const all = transcriptLines();
+			const answer = `Full answer.\n${"- detail line\n".repeat(250)}End.`;
+			const cut = `${answer.slice(0, 100)}\n<truncated 3000 bytes>\n${answer.slice(-100)}`;
+			const truncStep = JSON.stringify({
+				step_index: 9,
+				source: "MODEL",
+				type: "PLANNER_RESPONSE",
+				status: "DONE",
+				created_at: "2026-11-25T13:55:16Z",
+				content: cut,
+				truncated_fields: ["content"],
+			});
+			const fullStep = JSON.stringify({
+				step_index: 9,
+				source: "MODEL",
+				type: "PLANNER_RESPONSE",
+				status: "DONE",
+				created_at: "2026-11-25T13:55:16Z",
+				content: answer,
+			});
+			assert.equal(parseTranscriptLine(truncStep)?.truncated, true);
+			assert.equal(parseTranscriptLine(fullStep)?.truncated, false);
+
+			// Case 1: transcript_full.jsonl arrives on the next poll -> emits the full answer, never the cut one.
+			writeBrain(dir, all.slice(0, 8), {});
+			let now = Date.parse("2026-11-25T13:55:16Z");
+			const emitted1: AutonomousTurn[] = [];
+			const watcher1 = new AgyActivityWatcher({
+				agySessionId: CONV,
+				systemDir: dir,
+				isAlive: () => true,
+				onSnapshot: () => {},
+				onTurnFinished: (turn) => emitted1.push(turn),
+				now: () => now,
+			});
+			watcher1.poll();
+			fs.appendFileSync(path.join(dir, "logs", "transcript.jsonl"), `${all[8]}\n${truncStep}\n`);
+			watcher1.poll();
+			assert.equal(emitted1.length, 0, "defers truncated turn on first poll");
+			fs.writeFileSync(
+				path.join(dir, "logs", "transcript_full.jsonl"),
+				[...all.slice(0, 9), fullStep].map((l) => `${l}\n`).join(""),
+			);
+			now += 500;
+			watcher1.poll();
+			assert.equal(emitted1.length, 1);
+			assert.equal(emitted1[0].texts[0], answer);
+
+			// Case 2: transcript_full.jsonl never arrives -> emits after 2s / 2 polls anyway.
+			fs.rmSync(path.join(dir, "logs", "transcript_full.jsonl"));
+			writeBrain(dir, all.slice(0, 8), {});
+			let now2 = Date.parse("2026-11-25T13:55:16Z");
+			const emitted2: AutonomousTurn[] = [];
+			const watcher2 = new AgyActivityWatcher({
+				agySessionId: CONV,
+				systemDir: dir,
+				isAlive: () => true,
+				onSnapshot: () => {},
+				onTurnFinished: (turn) => emitted2.push(turn),
+				now: () => now2,
+			});
+			watcher2.poll();
+			fs.appendFileSync(path.join(dir, "logs", "transcript.jsonl"), `${all[8]}\n${truncStep}\n`);
+			watcher2.poll();
+			assert.equal(emitted2.length, 0);
+			now2 += 1_000;
+			watcher2.poll();
+			assert.equal(emitted2.length, 0);
+			now2 += 1_000;
+			watcher2.poll();
+			assert.equal(emitted2.length, 1);
+			assert.equal(emitted2[0].texts[0], cut);
+			watcher2.poll();
+			assert.equal(emitted2.length, 1, "never emits twice");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not replay already-finished autonomous turns on attach while still emitting running and future ones", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-brain-base-"));
+		try {
+			const all = transcriptLines();
+			// Step 8..9 is an already-finished autonomous turn AFTER lastUserInputStep (4);
+			// Step 10..11a is a still-running autonomous turn when the watcher attaches.
+			const runningStep = JSON.stringify({
+				step_index: 11,
+				source: "MODEL",
+				type: "PLANNER_RESPONSE",
+				status: "DONE",
+				created_at: "2026-11-25T13:55:26Z",
+				content: "",
+				tool_calls: [{ name: "manage_task", args: { Action: "\"list\"" } }],
+			});
+			writeBrain(dir, [...all.slice(0, 11), runningStep], messageFiles());
+			const snapshots: ActivitySnapshot[] = [];
+			const finished: number[] = [];
+			const watcher = new AgyActivityWatcher({
+				agySessionId: CONV,
+				systemDir: dir,
+				isAlive: () => true,
+				onSnapshot: (snapshot) => snapshots.push(snapshot),
+				onTurnFinished: (turn) => finished.push(turn.startStep),
+			});
+			watcher.poll();
+			assert.deepEqual(finished, [], "already-finished turn at step 8 is not replayed");
+			assert.equal(snapshots.at(-1)?.runningTurn?.startStep, 10, "still-running turn at step 10 is shown");
+
+			// Now step 10's turn finishes, and a future turn at step 13 runs and finishes.
+			fs.appendFileSync(
+				path.join(dir, "logs", "transcript.jsonl"),
+				[
+					JSON.stringify({ step_index: 12, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "Done 10." }),
+					JSON.stringify({ step_index: 13, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", content: `[Message] timestamp=2026-11-25T13:56:00Z sender=${CONV}/task-9 priority=HIGH content=ok` }),
+					JSON.stringify({ step_index: 14, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "Done 13." }),
+				]
+					.map((l) => `${l}\n`)
+					.join(""),
+			);
+			watcher.poll();
+			assert.deepEqual(finished, [10, 13]);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("re-emits snapshot when transcript_full.jsonl upgrades task summary/kind and filters ancient finished lookups", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-brain-key-"));
+		try {
+			const line = (obj: Record<string, unknown>) => JSON.stringify(obj);
+			const shortLines = [
+				line({ step_index: 1, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T10:00:00Z", tool_calls: [{ name: "run_command", args: { CommandLine: "\"sleep 60\"" } }] }),
+				line({ step_index: 2, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T10:00:01Z", content: `Tool is running as a background task with task id: ${CONV}/task-2\nTask Description: sleep 60` }),
+			];
+			const fullLines = [
+				line({ step_index: 1, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T10:00:00Z", tool_calls: [{ name: "run_command", args: { CommandLine: "\"sleep 60\"", toolSummary: "\"Long sleep\"" } }] }),
+				line({ step_index: 2, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T10:00:01Z", content: `Tool is running as a background task with task id: ${CONV}/task-2\nTask Description: sleep 60` }),
+			];
+			writeBrain(dir, shortLines, {});
+			let now = Date.parse("2026-11-26T10:00:05Z");
+			const snapshots: ActivitySnapshot[] = [];
+			const watcher = new AgyActivityWatcher({
+				agySessionId: CONV,
+				systemDir: dir,
+				isAlive: () => true,
+				onSnapshot: (snapshot) => snapshots.push(snapshot),
+				onTurnFinished: () => {},
+				now: () => now,
+			});
+			watcher.poll();
+			assert.equal(snapshots.length, 1);
+			assert.equal(snapshots[0].tasks[0].summary, undefined);
+
+			fs.writeFileSync(path.join(dir, "logs", "transcript_full.jsonl"), fullLines.map((l) => `${l}\n`).join(""));
+			watcher.poll();
+			assert.equal(snapshots.length, 2, "upgraded task summary triggers snapshot update");
+			assert.equal(snapshots[1].tasks[0].summary, "Long sleep");
+
+			// Add a second identical command that finished long ago; active task-2 is still preferred.
+			fs.appendFileSync(
+				path.join(dir, "logs", "transcript_full.jsonl"),
+				[
+					line({ step_index: 3, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T10:00:02Z", tool_calls: [{ name: "run_command", args: { CommandLine: "\"sleep 60\"" } }, { name: "schedule", args: { DurationSeconds: "10", Prompt: "\"old\"" } }] }),
+					line({ step_index: 4, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T10:00:03Z", content: `Tool is running as a background task with task id: ${CONV}/task-4\nTask Description: sleep 60` }),
+					line({ step_index: 5, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T10:00:03Z", content: `Tool is running as a background task with task id: ${CONV}/task-5\nTask Description: Timer: 10s, Prompt: old` }),
+					line({ step_index: 6, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", created_at: "2026-11-26T10:00:04Z", content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-26T10:00:04Z sender=${CONV}/task-4 priority=HIGH content=Task id "${CONV}/task-4" finished with result:\nCommand exited with code 0.\n[Message] timestamp=2026-11-26T10:00:04Z sender=${CONV}/task-5 priority=HIGH content=old\n</SYSTEM_MESSAGE>` }),
+				]
+					.map((l) => `${l}\n`)
+					.join(""),
+			);
+			assert.equal(watcher.findCommandTask("sleep 60")?.taskId, "task-2", "prefers active command over newer finished one");
+			assert.equal(watcher.latestTimer()?.taskId, "task-5", "returns recently finished timer within linger window");
+
+			// Advance past linger window: finished timer is no longer returned.
+			now = Date.parse("2026-11-26T10:01:00Z");
+			assert.equal(watcher.latestTimer(), undefined, "ignores ancient finished timer");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
 });
 
 /** Parent and subagent files as agy 1.5.13 wrote them for the subagent test prompt (abridged). */
@@ -568,7 +1004,9 @@ describe("agy subagents", () => {
 		assert.equal(deriveSubagentStatus(record, steps(lagging), []).activity, "waiting for timer 10 s");
 		const expired = parseTaskMessage(JSON.stringify({ id: "t", sender: `${SUB}/task-4`, timestamp: "2026-11-25T15:01:58Z", renderDetails: { messageTitle: "10s timer: Timer has expired" }, content: "weiter" }));
 		assert.ok(expired);
-		assert.equal(deriveSubagentStatus(record, steps(own), [], [expired]).state, "idle");
+		const afterExpired = deriveSubagentStatus(record, steps(own), [], [expired]);
+		assert.equal(afterExpired.state, "idle");
+		assert.equal(afterExpired.lastAtMs, Date.parse("2026-11-25T15:01:58Z"), "uses newer terminal ownMessage timestamp so subagent lingers cleanly");
 		const canceled = [
 			...own,
 			line({ step_index: 6, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-25T15:01:50Z", tool_calls: [{ name: "manage_task", args: { Action: "\"kill\"", TaskId: `"${SUB}/task-4"` } }] }),
@@ -635,6 +1073,106 @@ describe("agy subagents", () => {
 				renderActivityLines({ ...snapshot, subagents: idle ? [idle] : [] }, Date.parse("2026-11-25T14:46:43Z"), 0, plainTheme)[1],
 				/✓ 0db6b1dc {2}File Creator Subagent {2}0:13 {2}Gemini 4 Neon · Reasoning high {2}done: Die Datei wurde angelegt/,
 			);
+		} finally {
+			fs.rmSync(brain, { recursive: true, force: true });
+		}
+	});
+
+	it("ignores non-message reminders after a finished subagent turn and resolves Model: inherit cleanly", () => {
+		const record = parseSubagentRecord(SUB_RECORD);
+		assert.ok(record);
+		const line = (obj: Record<string, unknown>) => JSON.stringify(obj);
+
+		// A trailing non-message reminder after the final answer keeps the subagent idle.
+		const withTrailingReminder = [
+			...subagentLines(),
+			line({ step_index: 7, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", created_at: "2026-11-25T14:46:42Z", content: "<SYSTEM_MESSAGE> Reminder: work efficiently. </SYSTEM_MESSAGE>" }),
+		];
+		const stillIdle = deriveSubagentStatus(record, steps(withTrailingReminder), steps(parentSpawnLines()));
+		assert.equal(stillIdle.state, "idle");
+		assert.equal(stillIdle.activity, "Die Datei wurde angelegt und der Parent-Agent benachrichtigt.");
+
+		// A real message delivery after the final answer wakes it back up.
+		const withWakeup = [
+			...withTrailingReminder,
+			line({ step_index: 8, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", created_at: "2026-11-25T14:46:45Z", content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-25T14:46:45Z sender=${CONV} priority=HIGH content=Bitte weiter.\n</SYSTEM_MESSAGE>` }),
+		];
+		const awake = deriveSubagentStatus(record, steps(withWakeup), steps(parentSpawnLines()));
+		assert.deepEqual([awake.state, awake.activity], ["working", "thinking …"]);
+
+		// Model: "inherit" (case-insensitive) resolves parentModel for any subagent type, never "inherit (requested)".
+		const reviewerRecord = parseSubagentRecord(
+			JSON.stringify({
+				conversationId: SUB,
+				subagentDescriptor: { typeName: "reviewer", role: "Code Reviewer" },
+				state: "SUBAGENT_STATE_ALIVE",
+				spawnStepIndex: 2,
+			}),
+		);
+		assert.ok(reviewerRecord);
+		const parentInherit = [
+			line({ step_index: 0, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", content: "review" }),
+			line({ step_index: 1, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", model: "gemini-4-neon-xhigh", tool_calls: [{ name: "invoke_subagent", args: { Prompt: "\"Review PR\"", Role: "\"Code Reviewer\"", TypeName: "\"reviewer\"", Model: "\"INHERIT\"" } }] }),
+			line({ step_index: 2, source: "MODEL", type: "GENERIC", status: "DONE", content: `Created subagent ${SUB}` }),
+		];
+		const startingReviewer = deriveSubagentStatus(reviewerRecord, [], steps(parentInherit));
+		assert.equal(startingReviewer.model, "gemini-4-neon-xhigh");
+		assert.equal(startingReviewer.modelFromParent, true);
+		assert.equal(startingReviewer.requestedModel, undefined);
+		assert.equal(subagentModelLabel(startingReviewer), "Gemini 4 Neon · Reasoning xhigh");
+		assert.equal(
+			subagentModelLabel({ conversationId: SUB, state: "working", toolCalls: 0, requestedModel: "inherit" }),
+			"same model as the main agent",
+		);
+		const startNote = subagentStartNote({ agentRole: "Code Reviewer", agentType: "reviewer", model: "Inherit" }, undefined);
+		assert.match(startNote, /same model as the main agent/);
+		assert.doesNotMatch(startNote, /inherit \(requested\)/i);
+	});
+
+	it("prefers working subagents over finished ones and ignores ancient finished subagents in findSubagent", () => {
+		const brain = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-brain-sub-recency-"));
+		try {
+			const oldSub = "11111111-1111-1111-1111-111111111111";
+			const activeSub = "22222222-2222-2222-2222-222222222222";
+			const parentDir = path.join(brain, CONV, ".system_generated");
+			fs.mkdirSync(path.join(parentDir, "logs"), { recursive: true });
+			fs.mkdirSync(path.join(parentDir, "subagents"), { recursive: true });
+			fs.mkdirSync(path.join(brain, oldSub, ".system_generated", "logs"), { recursive: true });
+			fs.mkdirSync(path.join(brain, activeSub, ".system_generated", "logs"), { recursive: true });
+			fs.writeFileSync(path.join(parentDir, "logs", "transcript.jsonl"), parentSpawnLines().map((l) => `${l}\n`).join(""));
+			fs.writeFileSync(
+				path.join(parentDir, "subagents", `${oldSub}.json`),
+				JSON.stringify({ conversationId: oldSub, subagentDescriptor: { typeName: "self", role: "Worker" }, state: "SUBAGENT_STATE_ALIVE", spawnStepIndex: 2 }),
+			);
+			fs.writeFileSync(
+				path.join(brain, oldSub, ".system_generated", "logs", "transcript.jsonl"),
+				`${JSON.stringify({ step_index: 0, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-25T14:46:41Z", content: "Old done" })}\n`,
+			);
+
+			let now = Date.parse("2026-11-25T14:50:00Z");
+			const watcher = new AgyActivityWatcher({
+				agySessionId: CONV,
+				systemDir: parentDir,
+				isAlive: () => true,
+				onSnapshot: () => {},
+				onTurnFinished: () => {},
+				now: () => now,
+			});
+			assert.equal(watcher.findSubagent("Worker"), undefined, "ancient idle subagent is ignored");
+
+			now = Date.parse("2026-11-25T14:46:45Z");
+			assert.equal(watcher.findSubagent("Worker")?.conversationId, oldSub, "recent idle subagent within linger window is returned");
+
+			// Add a working subagent with an earlier startedAtMs so oldSub sorts after it; findSubagent still prefers working.
+			fs.writeFileSync(
+				path.join(parentDir, "subagents", `${activeSub}.json`),
+				JSON.stringify({ conversationId: activeSub, subagentDescriptor: { typeName: "self", role: "Worker" }, state: "SUBAGENT_STATE_ALIVE", spawnStepIndex: 2 }),
+			);
+			fs.writeFileSync(
+				path.join(brain, activeSub, ".system_generated", "logs", "transcript.jsonl"),
+				`${JSON.stringify({ step_index: 0, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-25T14:46:00Z", tool_calls: [{ name: "write_file", args: { Path: "\"/tmp/x\"" } }] })}\n`,
+			);
+			assert.equal(watcher.findSubagent("Worker")?.conversationId, activeSub, "prefers working subagent over newer idle one");
 		} finally {
 			fs.rmSync(brain, { recursive: true, force: true });
 		}
