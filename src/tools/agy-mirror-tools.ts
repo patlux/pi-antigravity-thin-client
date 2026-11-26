@@ -8,15 +8,19 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import type {
-	AcpElicitationCreateParams,
-	AcpElicitationCreateResult,
-	AcpRequestPermissionParams,
-	AcpRequestPermissionResult,
-	AcpToolCallContentItem,
-	AcpToolCallLocation,
-	AcpToolKind,
-	AcpToolStatus,
+import {
+	type AcpElicitationCreateParams,
+	type AcpElicitationCreateResult,
+	type AcpElicitationPropertySchema,
+	type AcpElicitationTitledOption,
+	type AcpPermissionOption,
+	type AcpRequestPermissionParams,
+	type AcpRequestPermissionResult,
+	type AcpToolCallContentItem,
+	type AcpToolCallLocation,
+	type AcpToolKind,
+	type AcpToolStatus,
+	isAntigravityUserInputRequest,
 } from "../acp/protocol.ts";
 import {
 	AGY_MIRROR_TOOL_NAMES,
@@ -106,6 +110,250 @@ function normalizeMirrorFilePath(rawPath: string | undefined): string | undefine
 	return trimmed;
 }
 
+const MAX_STORED_TEXT_CHARS = 128 * 1024;
+const MAX_STORED_DIFF_CHARS = 512 * 1024;
+const TRUNCATED_OUTPUT_MARKER = "[Earlier output truncated]\n\n";
+const SECURITY_WARNING_META_KEY = "agy.security.warning";
+const WARNING_TEXT_LIMIT = 512;
+const OPTION_LABEL_LIMIT = 512;
+const QUESTION_TEXT_LIMIT = 8_000;
+const APPROVAL_DETAIL_LIMIT = 160;
+const APPROVAL_TITLE_LIMIT = 240;
+
+/** Copies a sliced string so V8 does not retain the much larger backing string. */
+function copyBoundedText(text: string): string {
+	return Buffer.from(text, "utf16le").toString("utf16le");
+}
+
+/** Keeps the tail of long tool outputs and detaches from the original string. */
+function boundTailText(text: string, limit: number): string {
+	if (
+		text.length <= limit ||
+		(text.length <= limit + TRUNCATED_OUTPUT_MARKER.length &&
+			text.startsWith(TRUNCATED_OUTPUT_MARKER))
+	) {
+		return text;
+	}
+	const tail = text.slice(-limit).replace(/^[\uDC00-\uDFFF]/u, "");
+	return copyBoundedText(`${TRUNCATED_OUTPUT_MARKER}${tail}`);
+}
+
+/** Keeps the start of long labels, warnings, or titles without splitting surrogate pairs. */
+function boundHeadText(text: string, limit: number): string {
+	if (text.length <= limit) return text;
+	const prefix = text.slice(0, Math.max(0, limit - 3)).replace(/[\uD800-\uDBFF]$/u, "");
+	return copyBoundedText(`${prefix}...`);
+}
+
+function toSingleLine(text: string): string {
+	return text.replace(/\s+/g, " ").trim();
+}
+
+type NativeSwarmToolName = "swarm" | "post_message" | "read_board" | "swarm_wait";
+
+const NATIVE_SWARM_TOOL_NAMES: ReadonlySet<string> = new Set<NativeSwarmToolName>([
+	"swarm",
+	"post_message",
+	"read_board",
+	"swarm_wait",
+]);
+
+function isNativeSwarmToolName(value: unknown): value is NativeSwarmToolName {
+	return typeof value === "string" && NATIVE_SWARM_TOOL_NAMES.has(value);
+}
+
+const SWARM_TITLE_TO_TOOL: ReadonlyMap<string, NativeSwarmToolName> = new Map([
+	["Running swarm", "swarm"],
+	["Run swarm?", "swarm"],
+	["Run swarm", "swarm"],
+	["Running post_message", "post_message"],
+	["Run post_message?", "post_message"],
+	["Run post_message", "post_message"],
+	["Running read_board", "read_board"],
+	["Run read_board?", "read_board"],
+	["Run read_board", "read_board"],
+	["Running swarm_wait", "swarm_wait"],
+	["Run swarm_wait?", "swarm_wait"],
+	["Run swarm_wait", "swarm_wait"],
+]);
+
+const UPDATE_STEPS_TITLE_PATTERN = /^(?:run|running)\s+update_steps\??$/i;
+
+function cleanHandle(value: unknown): string {
+	return typeof value === "string" ? value.trim().replace(/^@/, "") : "";
+}
+
+function cleanChannel(value: unknown): string {
+	return typeof value === "string" ? value.trim().replace(/^#/, "") : "";
+}
+
+function formatSwarmToolTitle(
+	tool: NativeSwarmToolName,
+	action: string | undefined,
+	rawObj: Record<string, unknown> | undefined,
+): string {
+	switch (tool) {
+		case "swarm": {
+			const name = cleanHandle(rawObj?.name);
+			switch (action?.toLowerCase()) {
+				case "add": {
+					const tasks = Array.isArray(rawObj?.tasks) ? rawObj.tasks.length : 0;
+					const n =
+						typeof rawObj?.n === "number" && Number.isFinite(rawObj.n)
+							? Math.trunc(rawObj.n)
+							: 0;
+					const count = Math.max(tasks, n);
+					if (count > 1 && name.length > 0) {
+						return `Add ${count} swarm workers (@${name}-1..${count})`;
+					}
+					if (count > 1) return `Add ${count} swarm workers`;
+					return name.length > 0 ? `Add swarm worker @${name}` : "Add swarm worker";
+				}
+				case "kill":
+					return name.length > 0 ? `Stop swarm worker @${name}` : "Stop swarm worker";
+				case "status":
+					return "Check swarm status";
+				case "models":
+					return "List swarm models";
+				case "model": {
+					const model = typeof rawObj?.model === "string" ? rawObj.model.trim() : "";
+					if (name.length > 0 && model.length > 0) {
+						return `Switch @${name} model to ${model}`;
+					}
+					if (name.length > 0) return `Switch swarm model for @${name}`;
+					if (model.length > 0) return `Switch swarm model to ${model}`;
+					return "Switch swarm model";
+				}
+				case "title": {
+					const swarmTitle = typeof rawObj?.title === "string" ? rawObj.title.trim() : "";
+					return swarmTitle.length > 0 ? `Set swarm title "${swarmTitle}"` : "Set swarm title";
+				}
+				case "channel": {
+					const op = typeof rawObj?.op === "string" ? rawObj.op.trim() : "";
+					const channel = cleanChannel(rawObj?.channel);
+					if (op.length > 0 && channel.length > 0) {
+						return `Swarm channel ${op} #${channel}`;
+					}
+					return op.length > 0 ? `Swarm channel ${op}` : "Manage swarm channels";
+				}
+				case "join": {
+					const swarmName = typeof rawObj?.swarm === "string" ? rawObj.swarm.trim() : "";
+					return swarmName.length > 0 ? `Join swarm ${swarmName}` : "Join swarm";
+				}
+				default:
+					return "Manage swarm";
+			}
+		}
+		case "post_message": {
+			const channel = cleanChannel(rawObj?.channel);
+			return channel.length > 0 && channel !== "main"
+				? `Post to #${channel}`
+				: "Post to swarm board";
+		}
+		case "read_board": {
+			if (rawObj?.status === true) return "Read swarm status";
+			const channel = cleanChannel(rawObj?.channel);
+			return channel.length > 0 && channel !== "main" && channel !== "*"
+				? `Read #${channel}`
+				: "Read swarm board";
+		}
+		case "swarm_wait":
+			return "Wait for swarm board";
+	}
+}
+
+function identifySwarmToolCall(
+	title: string,
+	kind: string,
+	command: string | undefined,
+	rawObj: Record<string, unknown> | undefined,
+	meta: Record<string, unknown> | undefined,
+): { tool: NativeSwarmToolName; title: string } | undefined {
+	if (command !== undefined) return undefined;
+	if (meta?.is_mcp_tool_call === true) return undefined;
+
+	const antigravityMeta = asRecord(meta?.antigravity);
+	const swarmMeta = asRecord(antigravityMeta?.swarm);
+	const metaTool = isNativeSwarmToolName(swarmMeta?.tool) ? swarmMeta.tool : undefined;
+	const legacyTool = SWARM_TITLE_TO_TOOL.get(title);
+	const tool = metaTool ?? legacyTool;
+	if (!tool) return undefined;
+
+	if ((tool === "swarm" || tool === "post_message") && kind !== "" && kind !== "other") {
+		return undefined;
+	}
+	if (tool === "read_board" && kind !== "" && kind !== "other" && kind !== "read") {
+		return undefined;
+	}
+	if (tool === "swarm_wait" && kind !== "" && kind !== "other" && kind !== "think") {
+		return undefined;
+	}
+
+	const metaAction =
+		typeof swarmMeta?.action === "string" && swarmMeta.action.trim().length > 0
+			? swarmMeta.action.trim()
+			: undefined;
+	const inputAction =
+		typeof rawObj?.action === "string" && rawObj.action.trim().length > 0
+			? rawObj.action.trim()
+			: undefined;
+	const action = metaAction ?? inputAction;
+
+	const formattedTitle =
+		legacyTool !== undefined || title.length === 0
+			? formatSwarmToolTitle(tool, action, rawObj)
+			: title;
+
+	return {
+		tool,
+		title: boundHeadText(toSingleLine(formattedTitle), APPROVAL_TITLE_LIMIT),
+	};
+}
+
+function formatUpdateStepsTitle(rawObj: Record<string, unknown> | undefined): string {
+	const rawSteps = Array.isArray(rawObj?.steps) ? rawObj.steps : [];
+	const steps = rawSteps
+		.map((entry) => asRecord(entry))
+		.filter((entry): entry is Record<string, unknown> => entry !== undefined);
+	if (steps.length === 0) return "Update plan";
+
+	let doneCount = 0;
+	let activeTitle: string | undefined;
+	for (const step of steps) {
+		const status = typeof step.status === "string" ? step.status.toLowerCase() : "";
+		if (status === "done" || status === "completed") {
+			doneCount++;
+		} else if (!activeTitle && (status === "in_progress" || status === "running")) {
+			const candidate = pickFirstString(step, ["title", "content", "step"]);
+			if (candidate) activeTitle = candidate;
+		}
+	}
+
+	if (activeTitle) {
+		return boundHeadText(
+			`Update plan (${doneCount}/${steps.length}): ${toSingleLine(activeTitle)}`,
+			APPROVAL_TITLE_LIMIT,
+		);
+	}
+	if (doneCount > 0) {
+		return `Update plan (${doneCount}/${steps.length} done)`;
+	}
+	return `Update plan (${steps.length} ${steps.length === 1 ? "step" : "steps"})`;
+}
+
+function identifyUpdateStepsCall(
+	title: string,
+	kind: string,
+	command: string | undefined,
+	rawObj: Record<string, unknown> | undefined,
+	isMcp: boolean,
+): string | undefined {
+	if (isMcp || command !== undefined) return undefined;
+	if (kind !== "" && kind !== "other") return undefined;
+	if (!UPDATE_STEPS_TITLE_PATTERN.test(title)) return undefined;
+	return formatUpdateStepsTitle(rawObj);
+}
+
 /**
  * 将 AGY 原生 `tool_call` 事件智能归类为对应的 Pi 语义镜像工具与展示参数。
  */
@@ -115,8 +363,11 @@ export function classifyAgyToolCall(input: {
 	rawInput?: unknown;
 	locations?: AcpToolCallLocation[];
 	content?: AcpToolCallContentItem[];
+	_meta?: Record<string, unknown>;
 }): ClassifiedMirrorCall {
 	const rawObj = asRecord(input.rawInput);
+	const metaObj = asRecord(input._meta);
+	const isMcp = metaObj?.is_mcp_tool_call === true;
 	const title = input.title?.trim() ?? "";
 	const lowerTitle = title.toLowerCase();
 	const kind = (input.kind ?? "").toLowerCase();
@@ -155,15 +406,42 @@ export function classifyAgyToolCall(input: {
 		lowerTitle.includes("swarm") ||
 		lowerTitle.includes("workflow");
 
+	const swarmCall = identifySwarmToolCall(title, kind, command, rawObj, metaObj);
+	const updateStepsTitle =
+		swarmCall === undefined
+			? identifyUpdateStepsCall(title, kind, command, rawObj, isMcp)
+			: undefined;
+
 	let mirrorToolName: AgyMirrorToolName = "agy_tool";
+	let displayTitle = title;
 	// agy reports its own non-shell tools (schedule, manage_task, ...) as kind
 	// "other" titled "Run <tool_name>"; they are not shell commands.
+	const rawInternalTool =
+		kind === "other" && command === undefined
+			? /^run ([a-z][a-z0-9_]*)$/.exec(lowerTitle)?.[1]
+			: undefined;
 	const internalTool =
-		kind === "other" && command === undefined ? /^run ([a-z][a-z0-9_]*)$/.exec(lowerTitle)?.[1] : undefined;
+		isMcp && rawInternalTool && (isNativeSwarmToolName(rawInternalTool) || rawInternalTool === "update_steps")
+			? undefined
+			: rawInternalTool;
 
-	if (internalTool === "invoke_subagent") {
+	let resolvedToolName: string | undefined;
+
+	if (swarmCall) {
+		mirrorToolName = "agy_tool";
+		resolvedToolName = swarmCall.tool;
+		displayTitle = swarmCall.title;
+	} else if (updateStepsTitle !== undefined) {
+		mirrorToolName = "agy_tool";
+		resolvedToolName = "update_steps";
+		displayTitle = updateStepsTitle;
+	} else if (internalTool === "invoke_subagent") {
 		mirrorToolName = "agy_subagent";
+		resolvedToolName = internalTool;
 	} else if (internalTool) {
+		mirrorToolName = "agy_tool";
+		resolvedToolName = internalTool;
+	} else if (isMcp && kind === "other" && command === undefined) {
 		mirrorToolName = "agy_tool";
 	} else if (kind === "execute" || command !== undefined || lowerTitle.startsWith("run ")) {
 		// Shell commands and explicit file/search tools may mention words such as
@@ -189,7 +467,7 @@ export function classifyAgyToolCall(input: {
 	}
 
 	const args: Record<string, string | number> = {};
-	if (title) args.title = title;
+	if (displayTitle) args.title = displayTitle;
 	if (input.kind) args.kind = input.kind;
 	if (filePath) args.path = filePath;
 	if (typeof locLine === "number") args.line = locLine;
@@ -197,8 +475,8 @@ export function classifyAgyToolCall(input: {
 	if (command) args.command = command;
 	if (query) args.query = query;
 	if (agentRole) args.agentRole = agentRole;
-	if (internalTool) args.tool = internalTool;
-	if (internalTool === "invoke_subagent") {
+	if (resolvedToolName) args.tool = resolvedToolName;
+	if (resolvedToolName === "invoke_subagent") {
 		Object.assign(args, subagentSpawnArguments(rawObj));
 	}
 
@@ -284,7 +562,10 @@ function mergeContentItems(
 	for (const item of items) {
 		if (item.type === "content") {
 			if (item.content.type === "text") {
-				blocks.push({ type: "text", text: item.content.text });
+				blocks.push({
+					type: "text",
+					text: boundTailText(item.content.text, MAX_STORED_TEXT_CHARS),
+				});
 			} else if (item.content.type === "image") {
 				blocks.push({
 					type: "image",
@@ -295,8 +576,8 @@ function mergeContentItems(
 		} else if (item.type === "diff") {
 			diffs.push({
 				path: normalizeMirrorFilePath(item.path) ?? item.path,
-				oldText: item.oldText ?? "",
-				newText: item.newText,
+				oldText: boundTailText(item.oldText ?? "", MAX_STORED_DIFF_CHARS),
+				newText: boundTailText(item.newText, MAX_STORED_DIFF_CHARS),
 			});
 		}
 	}
@@ -305,12 +586,360 @@ function mergeContentItems(
 
 function formatRawOutputFallback(rawOutput: unknown): string | undefined {
 	if (rawOutput === undefined || rawOutput === null) return undefined;
-	if (typeof rawOutput === "string") return rawOutput;
-	try {
-		return JSON.stringify(rawOutput, null, 2);
-	} catch {
-		return String(rawOutput);
+	if (typeof rawOutput === "string") {
+		return boundTailText(rawOutput, MAX_STORED_TEXT_CHARS);
 	}
+	try {
+		const serialized = JSON.stringify(
+			rawOutput,
+			(_key, value: unknown) =>
+				typeof value === "string" && value.length > MAX_STORED_TEXT_CHARS
+					? boundTailText(value, MAX_STORED_TEXT_CHARS)
+					: value,
+			2,
+		);
+		return serialized === undefined
+			? undefined
+			: boundTailText(serialized, MAX_STORED_TEXT_CHARS);
+	} catch {
+		return boundTailText(String(rawOutput), MAX_STORED_TEXT_CHARS);
+	}
+}
+
+function disambiguateLabels(
+	entries: ReadonlyArray<{ baseLabel: string; disambiguator: string }>,
+): string[] {
+	const baseCounts = new Map<string, number>();
+	for (const entry of entries) {
+		baseCounts.set(entry.baseLabel, (baseCounts.get(entry.baseLabel) ?? 0) + 1);
+	}
+	const used = new Set<string>();
+	for (const entry of entries) {
+		if ((baseCounts.get(entry.baseLabel) ?? 0) === 1) {
+			used.add(entry.baseLabel);
+		}
+	}
+	const pairCounts = new Map<string, number>();
+	for (const entry of entries) {
+		if ((baseCounts.get(entry.baseLabel) ?? 0) > 1 && entry.disambiguator.length > 0) {
+			const pairKey = `${entry.baseLabel}\u0000${entry.disambiguator}`;
+			pairCounts.set(pairKey, (pairCounts.get(pairKey) ?? 0) + 1);
+		}
+	}
+	return entries.map((entry, index) => {
+		if ((baseCounts.get(entry.baseLabel) ?? 0) === 1) {
+			return entry.baseLabel;
+		}
+		const pairKey = `${entry.baseLabel}\u0000${entry.disambiguator}`;
+		let candidate =
+			entry.disambiguator.length > 0 && pairCounts.get(pairKey) === 1
+				? `${entry.baseLabel} (${entry.disambiguator})`
+				: `${entry.baseLabel} (#${index + 1})`;
+		if (used.has(candidate)) {
+			let suffix = index + 1;
+			candidate = `${entry.baseLabel} (#${suffix})`;
+			while (used.has(candidate)) {
+				suffix++;
+				candidate = `${entry.baseLabel} (#${suffix})`;
+			}
+		}
+		used.add(candidate);
+		return candidate;
+	});
+}
+
+function extractSecurityWarning(option: AcpPermissionOption): string | undefined {
+	const meta = asRecord(option._meta);
+	const warning = asRecord(meta?.[SECURITY_WARNING_META_KEY]);
+	if (!warning) return undefined;
+	const message = typeof warning.message === "string" ? toSingleLine(warning.message) : "";
+	const title = typeof warning.title === "string" ? toSingleLine(warning.title) : "";
+	const text = message || title;
+	if (!text) return undefined;
+	return boundHeadText(text, WARNING_TEXT_LIMIT);
+}
+
+const GENERIC_PLACEHOLDER_TITLES: ReadonlySet<string> = new Set([
+	"antigravity tool",
+	"tool",
+	"other",
+]);
+
+const GENERIC_APPROVAL_TITLES: ReadonlySet<string> = new Set([
+	...GENERIC_PLACEHOLDER_TITLES,
+	"run command",
+	"run command?",
+	"running command",
+	"execute command",
+	"run run_command",
+	"run run_command?",
+	"running run_command",
+	"edit file",
+	"edit file?",
+	"editing file",
+	"run edit_file",
+	"run edit_file?",
+	"running edit_file",
+	"write file",
+	"write file?",
+	"writing file",
+	"write to file",
+	"read file",
+	"read file?",
+	"reading file",
+	"view file",
+	"view file?",
+	"delete file",
+	"delete file?",
+	"execute",
+	"edit",
+	"read",
+	"write",
+	"delete",
+	"move",
+	"search",
+	"fetch",
+]);
+
+function normalizeGenericActionLabel(rawTitle: string): string {
+	const cleaned = toSingleLine(rawTitle).replace(/\?+$/, "").trim();
+	const lower = cleaned.toLowerCase();
+	if (lower === "run run_command" || lower === "running run_command") {
+		return "Run command";
+	}
+	if (lower === "run edit_file" || lower === "running edit_file") {
+		return "Edit file";
+	}
+	return cleaned;
+}
+
+function buildApprovalPromptTitle(
+	params: AcpRequestPermissionParams,
+	callState: TrackedMirrorCallState | undefined,
+): string {
+	const explicitTitle = params.toolCall?.title ? toSingleLine(params.toolCall.title) : "";
+	const trackedTitle = callState?.title ? toSingleLine(callState.title) : "";
+	const kind = params.toolCall?.kind?.trim() || callState?.kind?.trim() || "";
+	const lowerExplicit = explicitTitle.toLowerCase();
+	const isExplicitGeneric = !explicitTitle || GENERIC_APPROVAL_TITLES.has(lowerExplicit);
+
+	if (!isExplicitGeneric) {
+		return boundHeadText(explicitTitle, APPROVAL_TITLE_LIMIT);
+	}
+
+	const rawInputObj = asRecord(params.toolCall?.rawInput);
+	const rawCommand = pickFirstString(rawInputObj, [
+		"CommandLine",
+		"command",
+		"command_line",
+		"commandLine",
+		"cmd",
+	]);
+	const command = callState?.command ?? rawCommand;
+	const rawPath =
+		normalizeMirrorFilePath(params.toolCall?.locations?.[0]?.path) ??
+		normalizeMirrorFilePath(
+			pickFirstString(rawInputObj, [
+				"Path",
+				"path",
+				"TargetFile",
+				"AbsolutePath",
+				"absolute_path",
+				"file_path",
+				"uri",
+			]),
+		);
+	const filePath = callState?.path ?? rawPath;
+
+	const preferPath =
+		kind.toLowerCase() === "edit" ||
+		kind.toLowerCase() === "read" ||
+		kind.toLowerCase() === "delete" ||
+		kind.toLowerCase() === "move" ||
+		lowerExplicit.includes("file");
+	const detailRaw = preferPath ? (filePath ?? command) : (command ?? filePath);
+	const detail = detailRaw ? boundHeadText(toSingleLine(detailRaw), APPROVAL_DETAIL_LIMIT) : "";
+
+	if (detail) {
+		if (!explicitTitle || GENERIC_PLACEHOLDER_TITLES.has(lowerExplicit)) {
+			if (trackedTitle && !GENERIC_APPROVAL_TITLES.has(trackedTitle.toLowerCase())) {
+				return boundHeadText(trackedTitle, APPROVAL_TITLE_LIMIT);
+			}
+			return boundHeadText(detail, APPROVAL_TITLE_LIMIT);
+		}
+		const actionLabel = normalizeGenericActionLabel(explicitTitle);
+		return boundHeadText(`${actionLabel}: ${detail}`, APPROVAL_TITLE_LIMIT);
+	}
+
+	if (trackedTitle && !GENERIC_APPROVAL_TITLES.has(trackedTitle.toLowerCase())) {
+		return boundHeadText(trackedTitle, APPROVAL_TITLE_LIMIT);
+	}
+
+	return boundHeadText(explicitTitle || trackedTitle || kind || "Antigravity Tool", APPROVAL_TITLE_LIMIT);
+}
+
+interface ElicitationChoiceOption {
+	value: string;
+	label: string;
+}
+
+const GENERIC_ELICITATION_COUNT_MESSAGE = /^(?:answer\s+)?\d+\s+questions?$/i;
+
+function formatElicitationPromptTitle(
+	message: string | undefined,
+	key: string,
+	propSchema: AcpElicitationPropertySchema,
+): string {
+	const msg = message?.trim() ?? "";
+	const title = propSchema.title?.trim() ?? "";
+	const description = propSchema.description?.trim() ?? "";
+	const isCountMessage = msg.length > 0 && GENERIC_ELICITATION_COUNT_MESSAGE.test(msg);
+
+	// agy's ask_question puts each question in property.title and a count like "2 questions" in params.message.
+	if (title && !description) {
+		if (!msg || isCountMessage || msg === title) {
+			return title;
+		}
+		return `${msg} — ${title}`;
+	}
+
+	const fieldText =
+		title && description && title !== description
+			? `${title} — ${description}`
+			: title || description || key;
+
+	if (!msg || isCountMessage || msg === fieldText) {
+		return fieldText;
+	}
+	return `${msg} — ${fieldText}`;
+}
+
+function extractTitledOptions(
+	entries: readonly AcpElicitationTitledOption[] | undefined,
+): ElicitationChoiceOption[] | undefined {
+	if (!Array.isArray(entries) || entries.length === 0) return undefined;
+	const rawOptions: Array<{ value: string; baseLabel: string; disambiguator: string }> = [];
+	for (const entry of entries) {
+		if (!entry || typeof entry !== "object" || typeof entry.const !== "string") {
+			return undefined;
+		}
+		const titleText = typeof entry.title === "string" ? toSingleLine(entry.title) : "";
+		const descText = typeof entry.description === "string" ? toSingleLine(entry.description) : "";
+		const valueText = toSingleLine(entry.const);
+		const primary = titleText || valueText || JSON.stringify(entry.const);
+		const fullLabel = descText && descText !== primary ? `${primary} — ${descText}` : primary;
+		rawOptions.push({
+			value: entry.const,
+			baseLabel: boundHeadText(fullLabel, OPTION_LABEL_LIMIT),
+			disambiguator: entry.const,
+		});
+	}
+	const labels = disambiguateLabels(rawOptions);
+	return rawOptions.map((opt, idx) => ({
+		value: opt.value,
+		label: labels[idx],
+	}));
+}
+
+function extractEnumOptions(
+	entries: readonly string[] | undefined,
+	enumNames?: readonly string[],
+): ElicitationChoiceOption[] | undefined {
+	if (
+		!Array.isArray(entries) ||
+		entries.length === 0 ||
+		!entries.every((value) => typeof value === "string")
+	) {
+		return undefined;
+	}
+	if (Array.isArray(enumNames) && enumNames.length === entries.length) {
+		const rawOptions = entries.map((value, idx) => {
+			const name = enumNames[idx];
+			const baseLabel = name.length > 0 ? name : JSON.stringify(value);
+			return { value, baseLabel, disambiguator: value };
+		});
+		const labels = disambiguateLabels(rawOptions);
+		return rawOptions.map((opt, idx) => ({ value: opt.value, label: labels[idx] }));
+	}
+
+	const trimmedCounts = new Map<string, number>();
+	for (const value of entries) {
+		const trimmed = value.trim();
+		trimmedCounts.set(trimmed, (trimmedCounts.get(trimmed) ?? 0) + 1);
+	}
+	const initial = entries.map((value) => {
+		const trimmed = value.trim();
+		const label = trimmed !== "" && trimmedCounts.get(trimmed) === 1 ? trimmed : JSON.stringify(value);
+		return { value, label };
+	});
+	const uniqueLabels = new Set(initial.map((opt) => opt.label)).size === initial.length;
+	const resolved = uniqueLabels
+		? initial
+		: initial.map((opt) => ({ value: opt.value, label: JSON.stringify(opt.value) }));
+	const labels = disambiguateLabels(
+		resolved.map((opt) => ({ baseLabel: opt.label, disambiguator: opt.value })),
+	);
+	return resolved.map((opt, idx) => ({ value: opt.value, label: labels[idx] }));
+}
+
+function extractSingleChoiceOptions(
+	propSchema: AcpElicitationPropertySchema,
+): ElicitationChoiceOption[] | undefined {
+	if (propSchema.type === "array") return undefined;
+	if (Array.isArray(propSchema.oneOf) && propSchema.oneOf.length > 0) {
+		return extractTitledOptions(propSchema.oneOf);
+	}
+	if (Array.isArray(propSchema.enum) && propSchema.enum.length > 0) {
+		return extractEnumOptions(propSchema.enum, propSchema.enumNames);
+	}
+	return undefined;
+}
+
+function extractMultiChoiceOptions(
+	propSchema: AcpElicitationPropertySchema,
+): ElicitationChoiceOption[] | undefined {
+	if (propSchema.type !== "array" || !propSchema.items) return undefined;
+	if (Array.isArray(propSchema.items.anyOf) && propSchema.items.anyOf.length > 0) {
+		return extractTitledOptions(propSchema.items.anyOf);
+	}
+	if (Array.isArray(propSchema.items.enum) && propSchema.items.enum.length > 0) {
+		return extractEnumOptions(propSchema.items.enum);
+	}
+	return undefined;
+}
+
+function isPlainTextField(propSchema: AcpElicitationPropertySchema): boolean {
+	if (propSchema.type !== undefined && propSchema.type !== "string") return false;
+	if (Array.isArray(propSchema.enum) && propSchema.enum.length > 0) return false;
+	if (Array.isArray(propSchema.oneOf) && propSchema.oneOf.length > 0) return false;
+	return true;
+}
+
+function uniqueMenuLabel(desired: string, existing: ReadonlySet<string>): string {
+	if (!existing.has(desired)) return desired;
+	let suffix = 2;
+	let candidate = `${desired} (${suffix})`;
+	while (existing.has(candidate)) {
+		suffix++;
+		candidate = `${desired} (${suffix})`;
+	}
+	return candidate;
+}
+
+function formatMultiSelectHint(minItems: number, maxItems: number): string {
+	const hasMax = Number.isFinite(maxItems);
+	if (minItems > 0 && hasMax) {
+		return minItems === maxItems
+			? ` (select ${minItems})`
+			: ` (select ${minItems}-${maxItems})`;
+	}
+	if (minItems > 0) {
+		return ` (select at least ${minItems})`;
+	}
+	if (hasMax) {
+		return ` (select up to ${maxItems})`;
+	}
+	return "";
 }
 
 /** What a note for a mirror call without output may look at. */
@@ -371,9 +1000,16 @@ export class AgyTurnMirrorBroker {
 			rawOutput?: unknown;
 			content?: AcpToolCallContentItem[];
 			locations?: AcpToolCallLocation[];
+			_meta?: Record<string, unknown>;
 		},
 	): ClassifiedMirrorCall {
 		const classified = classifyAgyToolCall(payload);
+		const classifiedArgs = displayArguments(classified.arguments);
+		const resolvedTitle =
+			typeof classifiedArgs.title === "string" ? classifiedArgs.title : payload.title;
+		const isGenericFallbackTitle =
+			(classifiedArgs.tool === "swarm" && resolvedTitle === "Manage swarm") ||
+			(classifiedArgs.tool === "update_steps" && resolvedTitle === "Update plan");
 		const isTerminal = payload.status === "completed" || payload.status === "failed";
 		let state = this.calls.get(payload.toolCallId);
 		const isStaleNonTerminal = Boolean(state?.completed && !isTerminal);
@@ -382,7 +1018,7 @@ export class AgyTurnMirrorBroker {
 			state = {
 				toolCallId: payload.toolCallId,
 				agySessionId,
-				title: payload.title,
+				title: resolvedTitle,
 				kind: payload.kind,
 				path: typeof classified.arguments.path === "string" ? classified.arguments.path : undefined,
 				line: typeof classified.arguments.line === "number" ? classified.arguments.line : undefined,
@@ -399,7 +1035,7 @@ export class AgyTurnMirrorBroker {
 						? classified.arguments.agentRole
 						: undefined,
 				tool: typeof classified.arguments.tool === "string" ? classified.arguments.tool : undefined,
-				args: displayArguments(classified.arguments),
+				args: classifiedArgs,
 				status: payload.status ?? "pending",
 				contentBlocks: [],
 				diffs: [],
@@ -408,7 +1044,12 @@ export class AgyTurnMirrorBroker {
 			};
 			this.calls.set(payload.toolCallId, state);
 		} else {
-			if (payload.title && (!isStaleNonTerminal || !state.title)) state.title = payload.title;
+			const preserveRichTitle = Boolean(
+				isGenericFallbackTitle && state.title && payload.rawInput === undefined,
+			);
+			if (resolvedTitle && (!isStaleNonTerminal || !state.title) && !preserveRichTitle) {
+				state.title = resolvedTitle;
+			}
 			if (payload.kind && (!isStaleNonTerminal || !state.kind)) state.kind = payload.kind;
 			if (payload.status && !isStaleNonTerminal) state.status = payload.status;
 			if (payload.locations?.[0]?.path && (!isStaleNonTerminal || !state.path)) {
@@ -441,9 +1082,13 @@ export class AgyTurnMirrorBroker {
 			if (typeof classified.arguments.tool === "string" && (!isStaleNonTerminal || !state.tool)) {
 				state.tool = classified.arguments.tool;
 			}
-			state.args = isStaleNonTerminal
-				? { ...displayArguments(classified.arguments), ...state.args }
-				: { ...state.args, ...displayArguments(classified.arguments) };
+			const nextArgs = isStaleNonTerminal
+				? { ...classifiedArgs, ...state.args }
+				: { ...state.args, ...classifiedArgs };
+			if (preserveRichTitle && state.title) {
+				nextArgs.title = state.title;
+			}
+			state.args = nextArgs;
 		}
 
 		if (payload.content && payload.content.length > 0) {
@@ -598,20 +1243,36 @@ export class AgyTurnMirrorBroker {
 				return { outcome: { outcome: "cancelled" } };
 			}
 
-			const toolTitle =
-				params.toolCall?.title || callState?.title || params.toolCall?.kind || "Antigravity Tool";
-			const labels = params.options.map((opt) => opt.name || opt.optionId);
-			const selectedLabel = await uiCtx.ui.select(
-				`Approve: ${toolTitle}`,
-				labels,
-				{ signal },
-			);
+			const isUserInput = isAntigravityUserInputRequest(params);
+			const promptTitle = isUserInput
+				? boundHeadText(
+						params.toolCall?.title?.trim() || "Choose an option",
+						QUESTION_TEXT_LIMIT,
+					)
+				: `Approve: ${buildApprovalPromptTitle(params, callState)}`;
 
+			const optionEntries = params.options.map((opt) => {
+				const rawLabel = opt.name?.trim() || opt.optionId;
+				const boundedBase = boundHeadText(rawLabel, OPTION_LABEL_LIMIT);
+				const warning = isUserInput ? undefined : extractSecurityWarning(opt);
+				const baseLabel = warning ? `${boundedBase} — Warning: ${warning}` : boundedBase;
+				return {
+					baseLabel,
+					disambiguator: opt.optionId?.trim() ?? "",
+				};
+			});
+			const labels = disambiguateLabels(optionEntries);
+			const optionByLabel = new Map<string, AcpPermissionOption>();
+			for (let i = 0; i < params.options.length; i++) {
+				optionByLabel.set(labels[i], params.options[i]);
+			}
+
+			const selectedLabel = await uiCtx.ui.select(promptTitle, labels, { signal });
 			if (!selectedLabel) {
 				return { outcome: { outcome: "cancelled" } };
 			}
 
-			const chosen = params.options[labels.indexOf(selectedLabel)];
+			const chosen = optionByLabel.get(selectedLabel);
 			if (!chosen) return { outcome: { outcome: "cancelled" } };
 			return {
 				outcome: {
@@ -633,6 +1294,9 @@ export class AgyTurnMirrorBroker {
 			}
 
 			const signal = uiCtx.signal;
+			if (signal?.aborted) {
+				return { action: "cancel" };
+			}
 			if (params.mode === "url" && params.url) {
 				const confirmed = await uiCtx.ui.confirm(
 					params.message || "Confirm external authorization",
@@ -654,32 +1318,224 @@ export class AgyTurnMirrorBroker {
 				};
 			}
 
-			const content: Record<string, unknown> = {};
-			for (const [key, propSchema] of Object.entries(props)) {
-				const fieldTitle = propSchema.title || propSchema.description || key;
-				const promptTitle = params.message ? `${params.message} — ${fieldTitle}` : fieldTitle;
+			const required = new Set(
+				Array.isArray(params.requestedSchema?.required)
+					? params.requestedSchema.required.filter((key) => typeof key === "string")
+					: [],
+			);
 
-				if (Array.isArray(propSchema.enum) && propSchema.enum.length > 0) {
-					const displayChoices =
-						Array.isArray(propSchema.enumNames) &&
-						propSchema.enumNames.length === propSchema.enum.length
-							? propSchema.enumNames
-							: propSchema.enum;
-					const picked = await uiCtx.ui.select(promptTitle, displayChoices, { signal });
-					if (picked === undefined) {
+			// Pair optional single-choice `<id>` fields with optional `<id>__other` / `<id>_other` string fields.
+			const companions = new Map<string, string>();
+			const propEntries = Object.entries(props);
+			for (const [key, propSchema] of propEntries) {
+				if (required.has(key)) continue;
+				if (!extractSingleChoiceOptions(propSchema)) continue;
+				const companionId = [`${key}__other`, `${key}_other`].find((candidate) => {
+					if (!Object.hasOwn(props, candidate) || required.has(candidate)) return false;
+					return isPlainTextField(props[candidate]);
+				});
+				if (companionId !== undefined) {
+					companions.set(key, companionId);
+				}
+			}
+			const foldedCompanions = new Set(companions.values());
+			const visibleEntries = propEntries.filter(([key]) => !foldedCompanions.has(key));
+			const isSingleFieldForm = visibleEntries.length === 1;
+
+			const contentEntries: Array<[string, unknown]> = [];
+			for (const [key, propSchema] of visibleEntries) {
+				const isRequired = required.has(key);
+				const promptTitle = formatElicitationPromptTitle(params.message, key, propSchema);
+
+				const multiOptions = extractMultiChoiceOptions(propSchema);
+				if (multiOptions) {
+					const minItems =
+						typeof propSchema.minItems === "number" &&
+						Number.isFinite(propSchema.minItems) &&
+						propSchema.minItems > 0
+							? Math.trunc(propSchema.minItems)
+							: 0;
+					const maxItems =
+						typeof propSchema.maxItems === "number" &&
+						Number.isFinite(propSchema.maxItems) &&
+						propSchema.maxItems >= 0
+							? Math.trunc(propSchema.maxItems)
+							: Infinity;
+
+					if (maxItems === 0 || minItems > maxItems || minItems > multiOptions.length) {
+						if (isRequired) return { action: "cancel" };
+						continue;
+					}
+
+					const selected = new Set<number>();
+					if (Array.isArray(propSchema.default)) {
+						for (const item of propSchema.default) {
+							if (typeof item !== "string" || selected.size >= maxItems) continue;
+							const idx = multiOptions.findIndex((opt) => opt.value === item);
+							if (idx >= 0) selected.add(idx);
+						}
+					}
+
+					const canSkip = !isRequired || minItems === 0;
+					const loopTitle = `${promptTitle}${formatMultiSelectHint(minItems, maxItems)}`;
+					let cancelledForm = false;
+
+					while (true) {
+						type MultiSelectAction =
+							| { kind: "toggle"; index: number }
+							| { kind: "done" }
+							| { kind: "skip" };
+						const actionByLabel = new Map<string, MultiSelectAction>();
+						const menuLabels: string[] = [];
+
+						for (let idx = 0; idx < multiOptions.length; idx++) {
+							const itemLabel = `${selected.has(idx) ? "[x]" : "[ ]"} ${multiOptions[idx].label}`;
+							menuLabels.push(itemLabel);
+							actionByLabel.set(itemLabel, { kind: "toggle", index: idx });
+						}
+
+						const doneLabel = `Done (${selected.size} selected)`;
+						menuLabels.push(doneLabel);
+						actionByLabel.set(doneLabel, { kind: "done" });
+
+						if (canSkip) {
+							menuLabels.push("Skip");
+							actionByLabel.set("Skip", { kind: "skip" });
+						}
+
+						const picked = await uiCtx.ui.select(loopTitle, menuLabels, { signal });
+						if (picked === undefined) {
+							if (signal?.aborted || isRequired || isSingleFieldForm) {
+								cancelledForm = true;
+							}
+							break;
+						}
+
+						const action = actionByLabel.get(picked);
+						if (!action) {
+							if (isRequired || isSingleFieldForm) {
+								cancelledForm = true;
+							}
+							break;
+						}
+
+						if (action.kind === "skip") {
+							if (isRequired && minItems === 0) {
+								contentEntries.push([key, []]);
+							}
+							break;
+						}
+
+						if (action.kind === "done") {
+							if (selected.size < minItems) {
+								uiCtx.ui.notify?.(
+									`Select at least ${minItems} ${minItems === 1 ? "option" : "options"}.`,
+									"warning",
+								);
+								continue;
+							}
+							const values = multiOptions
+								.filter((_, idx) => selected.has(idx))
+								.map((opt) => opt.value);
+							contentEntries.push([key, values]);
+							break;
+						}
+
+						if (selected.has(action.index)) {
+							selected.delete(action.index);
+						} else if (selected.size >= maxItems) {
+							uiCtx.ui.notify?.(
+								`Select at most ${maxItems} ${maxItems === 1 ? "option" : "options"}.`,
+								"warning",
+							);
+						} else {
+							selected.add(action.index);
+						}
+					}
+
+					if (cancelledForm) {
 						return { action: "cancel" };
 					}
-					const choiceIdx = displayChoices.indexOf(picked);
-					content[key] = choiceIdx >= 0 ? propSchema.enum[choiceIdx] : picked;
+					continue;
+				}
+
+				const singleOptions = extractSingleChoiceOptions(propSchema);
+				if (singleOptions) {
+					const companionId = companions.get(key);
+					const optionByLabel = new Map<string, ElicitationChoiceOption>();
+					const displayChoices: string[] = [];
+					const usedLabels = new Set<string>();
+					for (const opt of singleOptions) {
+						displayChoices.push(opt.label);
+						optionByLabel.set(opt.label, opt);
+						usedLabels.add(opt.label);
+					}
+
+					let otherLabel: string | undefined;
+					if (companionId !== undefined) {
+						otherLabel = uniqueMenuLabel("Other (enter custom text)", usedLabels);
+						displayChoices.push(otherLabel);
+						usedLabels.add(otherLabel);
+					}
+
+					let skipLabel: string | undefined;
+					if (!isRequired) {
+						skipLabel = uniqueMenuLabel("(Skip)", usedLabels);
+						displayChoices.push(skipLabel);
+						usedLabels.add(skipLabel);
+					}
+
+					const picked = await uiCtx.ui.select(promptTitle, displayChoices, { signal });
+					if (picked === undefined) {
+						if (signal?.aborted || isRequired || isSingleFieldForm) {
+							return { action: "cancel" };
+						}
+						continue;
+					}
+
+					if (skipLabel !== undefined && picked === skipLabel) {
+						continue;
+					}
+
+					if (companionId !== undefined && otherLabel !== undefined && picked === otherLabel) {
+						const companionSchema = props[companionId];
+						const companionHeading = companionSchema?.title?.trim() || "Other";
+						const otherPrompt = `${promptTitle} — ${companionHeading}`;
+						const customValue = await uiCtx.ui.input(
+							otherPrompt,
+							companionSchema?.default !== undefined ? String(companionSchema.default) : undefined,
+							{ signal },
+						);
+						if (customValue === undefined) {
+							if (signal?.aborted || isSingleFieldForm) {
+								return { action: "cancel" };
+							}
+							continue;
+						}
+						if (customValue.trim().length > 0) {
+							contentEntries.push([companionId, customValue]);
+						}
+						continue;
+					}
+
+					const matched = optionByLabel.get(picked);
+					contentEntries.push([key, matched ? matched.value : picked]);
 					continue;
 				}
 
 				if (propSchema.type === "boolean") {
-					const picked = await uiCtx.ui.select(promptTitle, ["Yes", "No"], { signal });
+					const boolChoices = isRequired ? ["Yes", "No"] : ["Yes", "No", "(Skip)"];
+					const picked = await uiCtx.ui.select(promptTitle, boolChoices, { signal });
 					if (picked === undefined) {
-						return { action: "cancel" };
+						if (signal?.aborted || isRequired || isSingleFieldForm) {
+							return { action: "cancel" };
+						}
+						continue;
 					}
-					content[key] = picked === "Yes";
+					if (!isRequired && picked === "(Skip)") {
+						continue;
+					}
+					contentEntries.push([key, picked === "Yes"]);
 					continue;
 				}
 
@@ -689,20 +1545,33 @@ export class AgyTurnMirrorBroker {
 					{ signal },
 				);
 				if (rawInput === undefined) {
-					return { action: "cancel" };
+					if (signal?.aborted || isRequired || isSingleFieldForm) {
+						return { action: "cancel" };
+					}
+					continue;
 				}
 
 				if (propSchema.type === "number" || propSchema.type === "integer") {
-					const num = Number(rawInput);
-					content[key] = Number.isFinite(num) ? num : rawInput;
+					const trimmed = rawInput.trim();
+					if (trimmed.length === 0) {
+						if (!isRequired) continue;
+						return { action: "cancel" };
+					}
+					const num = Number(trimmed);
+					const validNumber =
+						propSchema.type === "integer" ? Number.isInteger(num) : Number.isFinite(num);
+					contentEntries.push([key, validNumber ? num : rawInput]);
 				} else {
-					content[key] = rawInput;
+					if (!isRequired && rawInput.trim().length === 0) {
+						continue;
+					}
+					contentEntries.push([key, rawInput]);
 				}
 			}
 
 			return {
 				action: "accept",
-				content,
+				content: Object.fromEntries(contentEntries),
 			};
 		});
 	}

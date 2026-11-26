@@ -48,6 +48,17 @@ export interface AgyMirrorToolDetails {
 const COLLAPSED_PREVIEW_LINES = 10;
 const BASH_STREAMING_TAIL_LINES = 8;
 
+const SWARM_TOOL_DEFAULT_TITLES: Readonly<Record<string, string>> = {
+	swarm: "Manage swarm",
+	post_message: "Post to swarm board",
+	read_board: "Read swarm board",
+	swarm_wait: "Wait for swarm board",
+};
+
+const RAW_SWARM_TITLE_PATTERN =
+	/^(?:run|running)\s+(?:swarm|post_message|read_board|swarm_wait)\??$/i;
+const RAW_UPDATE_STEPS_TITLE_PATTERN = /^(?:run|running)\s+update_steps\??$/i;
+
 function formatDisplayPath(rawPath: string | undefined, cwd: string): string {
 	if (!rawPath) return "";
 	try {
@@ -190,6 +201,30 @@ export function getMirrorToolRenderers(toolName: AgyMirrorToolName): ToolRendere
 					}
 					if (internalTool === "manage_task") {
 						return new Text(`${theme.fg("toolTitle", theme.bold("task"))} ${theme.fg("muted", "query or control a background task")}${duration}`, 0, 0);
+					}
+					if (internalTool && Object.hasOwn(SWARM_TOOL_DEFAULT_TITLES, internalTool)) {
+						const cleanTitle = title.trim();
+						const summary =
+							cleanTitle && !RAW_SWARM_TITLE_PATTERN.test(cleanTitle)
+								? cleanTitle
+								: SWARM_TOOL_DEFAULT_TITLES[internalTool];
+						return new Text(
+							`${theme.fg("toolTitle", theme.bold("swarm"))} ${theme.fg("accent", summary)}${duration}`,
+							0,
+							0,
+						);
+					}
+					if (internalTool === "update_steps") {
+						const cleanTitle = title.trim();
+						const summary =
+							cleanTitle && !RAW_UPDATE_STEPS_TITLE_PATTERN.test(cleanTitle)
+								? cleanTitle
+								: "Update plan";
+						return new Text(
+							`${theme.fg("toolTitle", theme.bold("plan"))} ${theme.fg("accent", summary)}${duration}`,
+							0,
+							0,
+						);
 					}
 					if (internalTool) {
 						return new Text(`${theme.fg("toolTitle", theme.bold(internalTool))}${duration}`, 0, 0);
