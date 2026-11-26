@@ -379,12 +379,13 @@ export function parseStepMetadataGenerationUsage(
 				const cacheWriteTokens = fields.get(4) ?? 0;
 				const cacheReadTokens = fields.get(5) ?? 0;
 				const thoughtTokens = fields.get(9);
-				if (inputTokens + rawOutput + cacheWriteTokens + cacheReadTokens > 0) {
+				const responseTokens = fields.get(10);
+				const splitOutput = (thoughtTokens ?? 0) + (responseTokens ?? 0);
+				if (inputTokens + rawOutput + cacheWriteTokens + cacheReadTokens + splitOutput > 0) {
 					return {
 						stepIdx,
 						inputTokens,
-						outputTokens:
-							thoughtTokens !== undefined ? Math.max(rawOutput, thoughtTokens) : rawOutput,
+						outputTokens: Math.max(rawOutput, splitOutput),
 						cacheWriteTokens,
 						cacheReadTokens,
 						thoughtTokens,

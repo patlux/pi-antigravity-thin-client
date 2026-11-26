@@ -32,11 +32,14 @@ import {
 import {
 	type AcpAvailableModel,
 	type AcpConfigOption,
+	type AcpElicitationCreateParams,
+	type AcpElicitationCreateResult,
 	type AcpMcpServerSpec,
 	type AcpPromptBlock,
 	type AcpPromptResponse,
 	type AcpPromptUsage,
 	type AcpRequestPermissionParams,
+	type AcpRequestPermissionResult,
 	type AcpSessionNewResult,
 	type AcpSessionResumeResult,
 	type AcpSessionUpdateNotification,
@@ -45,6 +48,7 @@ import {
 	type AcpTierInfo,
 	findConfigOption,
 	flattenConfigOptionChoices,
+	isAntigravityUserInputRequest,
 } from "../acp/protocol.ts";
 import {
 	ANTIGRAVITY_PROVIDER_ID,
@@ -97,6 +101,12 @@ import {
 	waitForSqliteToolStepsSettled,
 } from "./checkpoint-sync.ts";
 import { checkAgyConversationSinceAnchor } from "./agy-resume.ts";
+import {
+	ANTIGRAVITY_QUOTA_EXCEEDED_PREFIX,
+	classifyAntigravityTurnOutcome,
+	inspectAntigravityTurnOutcome,
+	snapshotTurnStepWatermark,
+} from "./agy-turn-outcome.ts";
 import { prepareCustomizationMount } from "./customization-mounter.ts";
 import {
 	buildDetachedToolResultBlocks,
@@ -118,7 +128,46 @@ import {
  * Error prefix for an exhausted Antigravity quota. "quota exceeded" is in Pi's
  * non-retryable provider-limit pattern, so Pi does not repeat the prompt by itself.
  */
-const QUOTA_EXCEEDED_ERROR = "Antigravity quota exceeded (429)";
+const QUOTA_EXCEEDED_ERROR = ANTIGRAVITY_QUOTA_EXCEEDED_PREFIX;
+const DEFAULT_PROMPT_INACTIVITY_TIMEOUT_MS = 15 * 60 * 1000;
+
+class PromptInactivityTimeoutError extends Error {
+	constructor() {
+		super("Prompt inactivity watchdog elapsed");
+		this.name = "PromptInactivityTimeoutError";
+	}
+}
+
+function formatPromptInactivityMessage(timeoutMs: number): string {
+	let duration: string;
+	if (timeoutMs >= 60_000 && timeoutMs % 60_000 === 0) {
+		const minutes = timeoutMs / 60_000;
+		duration = `${minutes} minute${minutes === 1 ? "" : "s"}`;
+	} else if (timeoutMs >= 1_000 && timeoutMs % 1_000 === 0) {
+		const seconds = timeoutMs / 1_000;
+		duration = `${seconds} second${seconds === 1 ? "" : "s"}`;
+	} else {
+		duration = `${timeoutMs}ms`;
+	}
+	return `Antigravity stopped responding after ${duration} of inactivity; the turn was cancelled. Send a message to continue.`;
+}
+
+function collectAvailableModeIds(
+	availableModes: ReadonlyArray<{ id: string }> | undefined,
+	configOptions: readonly AcpConfigOption[] | undefined,
+): Set<string> {
+	const ids = new Set<string>();
+	if (availableModes) {
+		for (const mode of availableModes) {
+			if (mode.id) ids.add(mode.id);
+		}
+	}
+	const modeOpt = findConfigOption(configOptions, "mode");
+	for (const choice of flattenConfigOptionChoices(modeOpt)) {
+		if (choice.value) ids.add(choice.value);
+	}
+	return ids;
+}
 
 type PumpQueueItem =
 	| { kind: "acp_update"; update: AcpSessionUpdatePayload }
@@ -277,6 +326,10 @@ interface ActiveTurnPump {
 	lastStepProjectionSynced: boolean;
 	/** 本步刚完成的中间步骤是否复用了同一次生成的工具切片池（未向云端发起新请求） */
 	lastStepUsedSlicePool: boolean;
+	/** Read-only SQLite `steps` MAX(idx) watermark captured right before sending `session/prompt`. */
+	turnStartStepIdx: number;
+	/** Wall-clock timestamp of the most recent prompt activity update (for the inactivity watchdog). */
+	lastActivityAtMs: number;
 }
 
 interface PendingGenSlicePool {
@@ -303,6 +356,8 @@ interface ManagedSessionLedger {
 	toolMode: ToolMode;
 	configOptions: AcpConfigOption[];
 	availableModels: AcpAvailableModel[];
+	availableModeIds: Set<string>;
+	warnedUnsupportedModes: Set<string>;
 	appliedModelValue?: string;
 	appliedThoughtLevel?: string;
 	appliedExecMode?: string;
@@ -403,6 +458,8 @@ export class TurnCoordinator {
 	/** Local `session/update` trace, enabled with `PI_AGY_TRACE`. */
 	readonly updateTrace = new AcpUpdateTrace();
 	private outOfTurnListener?: (agySessionId: string, update: AcpSessionUpdatePayload) => void;
+	private promptInactivityTimeoutMs = DEFAULT_PROMPT_INACTIVITY_TIMEOUT_MS;
+	private activeDialogDepth = 0;
 
 	constructor(
 		pi: ExtensionAPI,
@@ -419,7 +476,7 @@ export class TurnCoordinator {
 		this.processManager.setHandlers({
 			onSessionUpdate: (notification) => this.handleSessionUpdate(notification),
 			onRequestPermission: (params) => this.handlePermissionRequest(params),
-			onElicitationCreate: (params) => this.mirrorBroker.handleElicitationRequest(params),
+			onElicitationCreate: (params) => this.handleElicitationRequest(params),
 		});
 	}
 
@@ -500,6 +557,54 @@ export class TurnCoordinator {
 		this.outOfTurnListener = listener;
 	}
 
+	/** Overrides the prompt inactivity watchdog timeout in milliseconds (<= 0 disables it). */
+	setPromptInactivityTimeoutMs(ms: number): void {
+		if (!Number.isFinite(ms) || ms <= 0) {
+			this.promptInactivityTimeoutMs = 0;
+			return;
+		}
+		this.promptInactivityTimeoutMs = Math.floor(ms);
+	}
+
+	private notifyWarning(message: string): void {
+		const ctx = this.activeContext;
+		if (ctx?.hasUI && typeof ctx.ui?.notify === "function") {
+			ctx.ui.notify(message, "warning");
+		}
+	}
+
+	private applyUpdatedConfigOptions(
+		ledger: ManagedSessionLedger,
+		configOptions: AcpConfigOption[],
+		availableModes?: ReadonlyArray<{ id: string }>,
+	): void {
+		ledger.configOptions = configOptions;
+		const updatedModes = collectAvailableModeIds(availableModes, configOptions);
+		if (updatedModes.size > 0) {
+			ledger.availableModeIds = updatedModes;
+		}
+	}
+
+	private resolveEffectiveExecutionMode(
+		ledger: ManagedSessionLedger,
+		requestedMode: string,
+	): string {
+		if (
+			requestedMode === "auto" &&
+			ledger.availableModeIds.size > 0 &&
+			!ledger.availableModeIds.has("auto")
+		) {
+			if (!ledger.warnedUnsupportedModes.has(requestedMode)) {
+				ledger.warnedUnsupportedModes.add(requestedMode);
+				this.notifyWarning(
+					'Antigravity: this session does not advertise "auto" mode; falling back to "default".',
+				);
+			}
+			return "default";
+		}
+		return requestedMode;
+	}
+
 	private notifySteerDeferred(): void {
 		const ctx = this.activeContext;
 		if (ctx?.hasUI) {
@@ -532,26 +637,31 @@ export class TurnCoordinator {
 		this.abortLedgerTurnNonBlocking(ledger);
 	}
 
-	/** 实时切换当前活跃会话的 AGY 原生执行模式（`default` | `accept-edits` | `plan`） */
+	/** 实时切换当前活跃会话的 AGY 原生执行模式（`default` | `accept-edits` | `plan` | `auto`） */
 	async applyExecutionModeLive(mode: string): Promise<void> {
 		const ledger = this.ledgers.get(this.resolveCurrentPiSessionKey());
 		if (!ledger || !ledger.conn.isAlive || ledger.toolMode === "pi-tools") return;
+		const effectiveMode = this.resolveEffectiveExecutionMode(ledger, mode);
+		const modeConfigId = findConfigOption(ledger.configOptions, "mode")?.id ?? "mode";
 		try {
 			const res = await ledger.conn.request<AcpSetConfigOptionResult>(
 				"session/set_config_option",
 				{
 					sessionId: ledger.agySessionId,
-					configId: "mode",
-					value: mode,
+					configId: modeConfigId,
+					value: effectiveMode,
 				},
 				{ timeoutMs: 8_000 },
 			);
 			if (res.configOptions) {
-				ledger.configOptions = res.configOptions;
+				this.applyUpdatedConfigOptions(ledger, res.configOptions);
 			}
-			ledger.appliedExecMode = mode;
-		} catch {
-			// 忽略离线会话设置失败，下一轮请求会自动重新对齐
+			ledger.appliedExecMode = effectiveMode;
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			this.notifyWarning(
+				`Antigravity: failed to set execution mode to "${effectiveMode}" (${detail}).`,
+			);
 		}
 	}
 
@@ -827,6 +937,19 @@ export class TurnCoordinator {
 		const ledger = this.ledgersByAgyId.get(sessionId);
 		if (!ledger) return;
 
+		if (
+			ledger.activePump &&
+			!ledger.activePump.finished &&
+			(update.sessionUpdate === "agent_message_chunk" ||
+				update.sessionUpdate === "agent_thought_chunk" ||
+				update.sessionUpdate === "tool_call" ||
+				update.sessionUpdate === "tool_call_update" ||
+				update.sessionUpdate === "plan" ||
+				update.sessionUpdate === "usage_update")
+		) {
+			ledger.activePump.lastActivityAtMs = Date.now();
+		}
+
 		// agy >= 1.5.10 streams the turns it takes on its own (a background task,
 		// timer or subagent woke it up) right away. No Pi turn consumes them; hand
 		// them to the display instead of dropping them.
@@ -836,7 +959,8 @@ export class TurnCoordinator {
 			(update.sessionUpdate === "agent_message_chunk" ||
 				update.sessionUpdate === "agent_thought_chunk" ||
 				update.sessionUpdate === "tool_call" ||
-				update.sessionUpdate === "tool_call_update")
+				update.sessionUpdate === "tool_call_update" ||
+				update.sessionUpdate === "usage_update")
 		) {
 			try {
 				this.outOfTurnListener(sessionId, update);
@@ -905,7 +1029,25 @@ export class TurnCoordinator {
 		}
 
 		if (update.sessionUpdate === "config_option_update" && update.configOptions) {
-			ledger.configOptions = update.configOptions;
+			this.applyUpdatedConfigOptions(ledger, update.configOptions);
+			return;
+		}
+
+		if (update.sessionUpdate === "current_mode_update") {
+			ledger.appliedExecMode = update.currentModeId;
+			const modeOpt = findConfigOption(ledger.configOptions, "mode");
+			if (modeOpt) {
+				ledger.configOptions = ledger.configOptions.map((opt) =>
+					opt === modeOpt ? { ...opt, currentValue: update.currentModeId } : opt,
+				);
+			}
+			if (ledger.piSessionKey === this.resolveCurrentPiSessionKey()) {
+				updateAntigravityStatusBar(
+					this.activeContext,
+					this.currentConfig,
+					this.getTelemetrySnapshot(ledger.piSessionKey),
+				);
+			}
 			return;
 		}
 
@@ -1164,7 +1306,7 @@ export class TurnCoordinator {
 			idleCandidate.toolMode === this.currentConfig.toolMode &&
 			idleCandidate.mountDigest === mountInfo.mountDigest
 		) {
-			const idleOk = await this.waitForInFlightPrompt(idleCandidate, 2_500, options?.signal);
+			const idleOk = await this.waitForInFlightPrompt(idleCandidate, 5_000, options?.signal);
 			if (!idleOk) {
 				if (options?.signal?.aborted) {
 					writer.fail("aborted", "Request aborted by user");
@@ -1519,7 +1661,12 @@ export class TurnCoordinator {
 				this.httpMcpBridge.updateBindingSessionId(ledger.mcpToken, resumed.sessionId);
 			}
 			if (resumed.configOptions) {
-				ledger.configOptions = resumed.configOptions;
+				this.applyUpdatedConfigOptions(ledger, resumed.configOptions, resumed.modes?.availableModes);
+			} else if (resumed.modes?.availableModes) {
+				const resumedModes = collectAvailableModeIds(resumed.modes.availableModes, ledger.configOptions);
+				if (resumedModes.size > 0) {
+					ledger.availableModeIds = resumedModes;
+				}
 			}
 			if (resumed.models?.availableModels) {
 				ledger.availableModels = resumed.models.availableModels;
@@ -1606,7 +1753,12 @@ export class TurnCoordinator {
 			);
 			ledger.conn.trackSession(resumed.sessionId);
 			if (resumed.configOptions) {
-				ledger.configOptions = resumed.configOptions;
+				this.applyUpdatedConfigOptions(ledger, resumed.configOptions, resumed.modes?.availableModes);
+			} else if (resumed.modes?.availableModes) {
+				const resumedModes = collectAvailableModeIds(resumed.modes.availableModes, ledger.configOptions);
+				if (resumedModes.size > 0) {
+					ledger.availableModeIds = resumedModes;
+				}
 			}
 			if (resumed.models?.availableModels) {
 				ledger.availableModels = resumed.models.availableModels;
@@ -2735,6 +2887,11 @@ export class TurnCoordinator {
 				toolMode: this.currentConfig.toolMode,
 				configOptions: sessionInfo.configOptions ?? [],
 				availableModels: sessionInfo.models?.availableModels ?? [],
+				availableModeIds: collectAvailableModeIds(
+					sessionInfo.modes?.availableModes,
+					sessionInfo.configOptions,
+				),
+				warnedUnsupportedModes: new Set<string>(),
 				pendingPreloadedTurns: appliedPreloadedTurns,
 				initialReplayPending: priorHistory.length > 0 && !priorHistoryRestored,
 				syncedMessageCount: priorHistory.length,
@@ -2781,31 +2938,38 @@ export class TurnCoordinator {
 		);
 
 		if (ledger.appliedModelValue !== resolved.configModelValue) {
+			const modelConfigId = findConfigOption(ledger.configOptions, "model")?.id ?? "model";
 			try {
 				const res = await ledger.conn.request<AcpSetConfigOptionResult>(
 					"session/set_config_option",
 					{
 						sessionId: ledger.agySessionId,
-						configId: "model",
+						configId: modelConfigId,
 						value: resolved.configModelValue,
 					},
 					{ timeoutMs: 10_000, signal: options?.signal },
 				);
 				if (res.configOptions) {
-					ledger.configOptions = res.configOptions;
+					this.applyUpdatedConfigOptions(ledger, res.configOptions);
 				}
 				ledger.appliedModelValue = resolved.configModelValue;
 				// 切换模型后服务端可能重置 thought_level 为新模型默认值，同步刷新本地缓存以触发精确重对齐
 				const refreshedThought = findConfigOption(ledger.configOptions, "thought_level");
 				ledger.appliedThoughtLevel = refreshedThought?.currentValue;
-			} catch {
-				// 若特定渠道不支持切换配置项则保持服务端默认选择
+			} catch (error) {
+				if (!options?.signal?.aborted) {
+					const detail = error instanceof Error ? error.message : String(error);
+					this.notifyWarning(
+						`Antigravity: failed to switch model to "${resolved.configModelValue}" (${detail}).`,
+					);
+				}
 			}
 		}
 
 		if (resolved.configThoughtLevel && ledger.appliedThoughtLevel !== resolved.configThoughtLevel) {
 			// 校验切换模型后最新通告的 thought_level 候选集
 			const thoughtOpt = findConfigOption(ledger.configOptions, "thought_level");
+			const thoughtConfigId = thoughtOpt?.id ?? "thought_level";
 			const supportedSet = new Set(flattenConfigOptionChoices(thoughtOpt).map((c) => c.value));
 			const targetEffort =
 				supportedSet.size === 0 || supportedSet.has(resolved.configThoughtLevel)
@@ -2818,13 +2982,13 @@ export class TurnCoordinator {
 						"session/set_config_option",
 						{
 							sessionId: ledger.agySessionId,
-							configId: "thought_level",
+							configId: thoughtConfigId,
 							value: targetEffort,
 						},
 						{ timeoutMs: 10_000, signal: options?.signal },
 					);
 					if (res.configOptions) {
-						ledger.configOptions = res.configOptions;
+						this.applyUpdatedConfigOptions(ledger, res.configOptions);
 					}
 					ledger.appliedThoughtLevel = targetEffort;
 				} catch {
@@ -2835,26 +2999,35 @@ export class TurnCoordinator {
 			ledger.appliedThoughtLevel = resolved.effectiveEffort;
 		}
 
-		if (
-			ledger.toolMode !== "pi-tools" &&
-			ledger.appliedExecMode !== this.currentConfig.agyExecutionMode
-		) {
-			try {
-				const res = await ledger.conn.request<AcpSetConfigOptionResult>(
-					"session/set_config_option",
-					{
-						sessionId: ledger.agySessionId,
-						configId: "mode",
-						value: this.currentConfig.agyExecutionMode,
-					},
-					{ timeoutMs: 8_000, signal: options?.signal },
-				);
-				if (res.configOptions) {
-					ledger.configOptions = res.configOptions;
+		if (ledger.toolMode !== "pi-tools") {
+			const effectiveMode = this.resolveEffectiveExecutionMode(
+				ledger,
+				this.currentConfig.agyExecutionMode,
+			);
+			if (ledger.appliedExecMode !== effectiveMode) {
+				const modeConfigId = findConfigOption(ledger.configOptions, "mode")?.id ?? "mode";
+				try {
+					const res = await ledger.conn.request<AcpSetConfigOptionResult>(
+						"session/set_config_option",
+						{
+							sessionId: ledger.agySessionId,
+							configId: modeConfigId,
+							value: effectiveMode,
+						},
+						{ timeoutMs: 8_000, signal: options?.signal },
+					);
+					if (res.configOptions) {
+						this.applyUpdatedConfigOptions(ledger, res.configOptions);
+					}
+					ledger.appliedExecMode = effectiveMode;
+				} catch (error) {
+					if (!options?.signal?.aborted) {
+						const detail = error instanceof Error ? error.message : String(error);
+						this.notifyWarning(
+							`Antigravity: failed to set execution mode to "${effectiveMode}" (${detail}).`,
+						);
+					}
 				}
-				ledger.appliedExecMode = this.currentConfig.agyExecutionMode;
-			} catch {
-				// 忽略不支持模式的 Agent
 			}
 		}
 	}
@@ -2866,6 +3039,8 @@ export class TurnCoordinator {
 	): void {
 		this.httpMcpBridge.clearSessionCancelled(ledger.agySessionId);
 		pump.finished = false;
+		pump.turnStartStepIdx = snapshotTurnStepWatermark(this.currentConfig, ledger.agySessionId);
+		pump.lastActivityAtMs = Date.now();
 
 		let trackedRef: Promise<void> | undefined;
 		const tracked = ledger.conn
@@ -2909,7 +3084,7 @@ export class TurnCoordinator {
 		if (promptBlocks.length === 0) {
 			throw new ThinClientPolicyError(NO_NEW_PROMPT_REFUSED);
 		}
-		const idleOk = await this.waitForInFlightPrompt(ledger, 2_500, options?.signal);
+		const idleOk = await this.waitForInFlightPrompt(ledger, 5_000, options?.signal);
 		if (options?.signal?.aborted) {
 			writer.fail("aborted", "Request aborted by user");
 			return;
@@ -2962,6 +3137,8 @@ export class TurnCoordinator {
 			awaitingUpstreamTelemetry: false,
 			lastStepProjectionSynced: isProjectionSynced,
 			lastStepUsedSlicePool: false,
+			turnStartStepIdx: -1,
+			lastActivityAtMs: Date.now(),
 		};
 		if (!(await this.startObservedSessionPrompt(ledger, pump, outboundPayload, writer, model, options))) return;
 
@@ -2974,22 +3151,127 @@ export class TurnCoordinator {
 		}
 	}
 
-	private async handlePermissionRequest(params: AcpRequestPermissionParams) {
-		const pump = this.ledgersByAgyId.get(params.sessionId)?.activePump;
+	private async handlePermissionRequest(
+		params: AcpRequestPermissionParams,
+	): Promise<AcpRequestPermissionResult> {
+		const ledger = this.ledgersByAgyId.get(params.sessionId);
+		const pump = ledger?.activePump;
 		const canPrompt = this.activeContext?.hasUI ?? false;
-		const result = await this.mirrorBroker.handlePermissionRequest(params);
-		const selection = result.outcome;
-		const rejected = selection.outcome === "cancelled" || params.options.some(
-			(option) => option.optionId === selection.optionId &&
-				(option.kind === "reject_once" || option.kind === "reject_always"),
-		);
-		if (pump && rejected) {
-			const title = params.toolCall?.title ?? "Antigravity tool";
-			pump.permissionDeclined = canPrompt
-				? `Tool not approved: ${title}`
-				: `"${title}" needs approval. Try again in an interactive Pi session and approve it.`;
+		this.activeDialogDepth++;
+		try {
+			const result = await this.mirrorBroker.handlePermissionRequest(params);
+			const selection = result.outcome;
+			const isUserInput = isAntigravityUserInputRequest(params);
+			const rejected =
+				selection.outcome === "cancelled" ||
+				(!isUserInput &&
+					params.options.some(
+						(option) =>
+							option.optionId === selection.optionId &&
+							(option.kind === "reject_once" || option.kind === "reject_always"),
+					));
+			if (pump && rejected) {
+				const title = params.toolCall?.title ?? "Antigravity tool";
+				pump.permissionDeclined = canPrompt
+					? `Tool not approved: ${title}`
+					: `"${title}" needs approval. Try again in an interactive Pi session and approve it.`;
+			}
+			return result;
+		} finally {
+			this.activeDialogDepth = Math.max(0, this.activeDialogDepth - 1);
+			const activePump = ledger?.activePump;
+			if (activePump && !activePump.finished) {
+				activePump.lastActivityAtMs = Date.now();
+			}
 		}
-		return result;
+	}
+
+	private async handleElicitationRequest(
+		params: AcpElicitationCreateParams,
+	): Promise<AcpElicitationCreateResult> {
+		this.activeDialogDepth++;
+		try {
+			return await this.mirrorBroker.handleElicitationRequest(params);
+		} finally {
+			this.activeDialogDepth = Math.max(0, this.activeDialogDepth - 1);
+			const now = Date.now();
+			if (params.sessionId) {
+				const activePump = this.ledgersByAgyId.get(params.sessionId)?.activePump;
+				if (activePump && !activePump.finished) {
+					activePump.lastActivityAtMs = now;
+				}
+			} else {
+				for (const ledger of this.ledgers.values()) {
+					if (ledger.activePump && !ledger.activePump.finished) {
+						ledger.activePump.lastActivityAtMs = now;
+					}
+				}
+			}
+		}
+	}
+
+	private async shiftPumpItemWithWatchdog(
+		pump: ActiveTurnPump,
+		signal?: AbortSignal,
+	): Promise<PumpQueueItem> {
+		if (pump.queue.peek() !== undefined || this.promptInactivityTimeoutMs <= 0) {
+			return pump.queue.shift(signal);
+		}
+		if (signal?.aborted) {
+			return Promise.reject(signal.reason ?? new Error("Aborted"));
+		}
+
+		const waitController = new AbortController();
+		let onUserAbort: (() => void) | undefined;
+		if (signal) {
+			onUserAbort = () => {
+				waitController.abort(signal.reason ?? new Error("Aborted"));
+			};
+			signal.addEventListener("abort", onUserAbort, { once: true });
+		}
+
+		const timeoutMs = this.promptInactivityTimeoutMs;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let timedOut = false;
+
+		const scheduleCheck = () => {
+			if (waitController.signal.aborted) return;
+			const delay =
+				this.activeDialogDepth > 0
+					? timeoutMs
+					: Math.max(1, timeoutMs - (Date.now() - pump.lastActivityAtMs));
+			timer = setTimeout(() => {
+				if (waitController.signal.aborted) return;
+				if (this.activeDialogDepth > 0) {
+					scheduleCheck();
+					return;
+				}
+				const quietMs = Date.now() - pump.lastActivityAtMs;
+				if (quietMs < timeoutMs) {
+					scheduleCheck();
+					return;
+				}
+				timedOut = true;
+				waitController.abort(new PromptInactivityTimeoutError());
+			}, delay);
+		};
+		scheduleCheck();
+
+		try {
+			return await pump.queue.shift(waitController.signal);
+		} catch (error) {
+			if (timedOut && !signal?.aborted) {
+				throw new PromptInactivityTimeoutError();
+			}
+			throw error;
+		} finally {
+			if (timer !== undefined) {
+				clearTimeout(timer);
+			}
+			if (onUserAbort && signal) {
+				signal.removeEventListener("abort", onUserAbort);
+			}
+		}
 	}
 
 	private async startObservedSessionPrompt(
@@ -3034,6 +3316,7 @@ export class TurnCoordinator {
 		options?: SimpleStreamOptions,
 	): Promise<void> {
 		const signal = options?.signal;
+		pump.lastActivityAtMs = Date.now();
 
 		const abortCurrentTurnSync = () => {
 			this.abortLedgerTurnNonBlocking(ledger);
@@ -3048,8 +3331,25 @@ export class TurnCoordinator {
 
 			let item: PumpQueueItem;
 			try {
-				item = await pump.queue.shift(signal);
-			} catch {
+				item = await this.shiftPumpItemWithWatchdog(pump, signal);
+			} catch (error) {
+				if (error instanceof PromptInactivityTimeoutError && !signal?.aborted) {
+					const turnOutcome = inspectAntigravityTurnOutcome({
+						config: this.currentConfig,
+						sessionId: ledger.agySessionId,
+						startStepIdx: pump.turnStartStepIdx,
+						stopReason: "end_turn",
+					});
+					await this.emitUpstreamTelemetryForStep(ledger, pump, model, options, {
+						status: turnOutcome?.httpStatus ?? 504,
+					});
+					abortCurrentTurnSync();
+					writer.fail(
+						"error",
+						turnOutcome?.message ?? formatPromptInactivityMessage(this.promptInactivityTimeoutMs),
+					);
+					return;
+				}
 				abortCurrentTurnSync();
 				writer.fail("aborted", "Request aborted by user");
 				return;
@@ -3231,13 +3531,20 @@ export class TurnCoordinator {
 					return;
 				}
 				if (item.response.stopReason === "refusal") {
+					const refusalOutcome =
+						inspectAntigravityTurnOutcome({
+							config: this.currentConfig,
+							sessionId: ledger.agySessionId,
+							startStepIdx: pump.turnStartStepIdx,
+							stopReason: item.response.stopReason,
+						}) ?? classifyAntigravityTurnOutcome("refusal", undefined);
 					await this.emitUpstreamTelemetryForStep(ledger, pump, model, options, {
-						status: 400,
+						status: refusalOutcome?.httpStatus ?? 429,
 					});
 					this.dropDeferredSteer(ledger);
 					ledger.announcedMirrorCallIds.clear();
 					ledger.activePump = undefined;
-					writer.fail("error", "Model refused the request");
+					writer.fail("error", refusalOutcome?.message ?? `${QUOTA_EXCEEDED_ERROR}.`);
 					return;
 				}
 
@@ -3248,6 +3555,25 @@ export class TurnCoordinator {
 					ledger.activePump = undefined;
 					writer.fail("error", pump.permissionDeclined);
 					return;
+				}
+
+				if (item.response.stopReason === "end_turn") {
+					const turnOutcome = inspectAntigravityTurnOutcome({
+						config: this.currentConfig,
+						sessionId: ledger.agySessionId,
+						startStepIdx: pump.turnStartStepIdx,
+						stopReason: item.response.stopReason,
+					});
+					if (turnOutcome) {
+						await this.emitUpstreamTelemetryForStep(ledger, pump, model, options, {
+							status: turnOutcome.httpStatus,
+						});
+						this.dropDeferredSteer(ledger);
+						ledger.announcedMirrorCallIds.clear();
+						ledger.activePump = undefined;
+						writer.fail("error", turnOutcome.message);
+						return;
+					}
 				}
 
 				// 当单次连续工具循环触及 agy 单轮最大生成次数限制（max_turn_requests）时，在同一热会话上自动无感续接
@@ -4067,7 +4393,7 @@ export class TurnCoordinator {
 					let status = 200;
 					if (detectedQuotaErr) status = 429;
 					else if (promptRes.stopReason === "cancelled") status = 499;
-					else if (promptRes.stopReason === "refusal") status = 400;
+					else if (promptRes.stopReason === "refusal") status = 429;
 					await reportAuxiliaryUpstream(status, [20, 40]);
 
 					if (detectedQuotaErr) {
@@ -4079,7 +4405,8 @@ export class TurnCoordinator {
 						return;
 					}
 					if (promptRes.stopReason === "refusal") {
-						writer.fail("error", "Model refused the request");
+						const refusalOutcome = classifyAntigravityTurnOutcome("refusal", undefined);
+						writer.fail("error", refusalOutcome?.message ?? `${QUOTA_EXCEEDED_ERROR}.`);
 						return;
 					}
 					// 成功结果交回 Pi 前收好临时会话，避免下一次压缩看到尚未清理的快照。
