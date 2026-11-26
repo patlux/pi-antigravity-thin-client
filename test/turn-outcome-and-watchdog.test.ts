@@ -541,6 +541,11 @@ rl.on("line", async (line) => {
 `;
 
 	fs.writeFileSync(binPath, source, { mode: 0o755 });
+	if (process.platform === "win32") {
+		const cmdWrapper = path.join(dir, "mock-agy-scenario.cmd");
+		fs.writeFileSync(cmdWrapper, `@node "${binPath}" %*\r\n`);
+		return { binPath: cmdWrapper, logPath };
+	}
 	return { binPath, logPath };
 }
 
