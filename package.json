@@ -1,6 +1,6 @@
 {
   "name": "pi-antigravity-thin-client",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "Use Google Antigravity (agy acp) in Pi as a thin client: Antigravity stays the agent, Pi shows its work, and only prompts you type reach it",
   "license": "MIT",
   "author": "Patrick Wozniak",
