@@ -7,7 +7,7 @@ version + changelog on main → green CI → push vX.Y.Z on that commit
 → release checks → npm → registry check → GitHub Release
 ```
 
-Both stable releases and prereleases must reference commits already in `main`. Never move a release tag to another commit. Maintainers choose version numbers; they are not generated from commit messages.
+Both stable releases and prereleases must reference commits already in `main`. Never move a release tag to another commit. Stable `X.Y.Z` versions and changelog sections are generated from `.changeset/` via `make version` (see [CONTRIBUTING.md](CONTRIBUTING.md)); prerelease `-next.N` versions are chosen explicitly by maintainers.
 
 ## Authorization
 
@@ -53,19 +53,19 @@ git ls-remote origin refs/tags/v<version>
 
 An unused version returns `E404` while the package lookup succeeds; authentication, network and other registry errors do not prove that a version is unused. If the version or tag exists, investigate recovery or choose another version; never overwrite it.
 
-Set the version without a tag:
+Preview the pending changesets and prepare the stable version on clean `main`:
 
 ```sh
-npm version 0.2.0 --no-git-tag-version
-# or a prerelease: npm version 0.2.0-next.0 --no-git-tag-version
+make changeset-status
+make version
 ```
 
-Move the `Unreleased` entries of `CHANGELOG.md` into a dated section such as `## 0.2.0 - YYYY-MM-DD`. The section must contain the line `Upstream base: pi-antigravity-bridge X.Y.Z.` with the upstream version the release is based on.
+`make version` selects the highest pending SemVer bump, reads `Upstream base: pi-antigravity-bridge X.Y.Z.` from `docs/upstream/CHANGELOG.md`, updates `package.json` and `package-lock.json`, prepends the dated section `## X.Y.Z - YYYY-MM-DD` to `CHANGELOG.md`, and removes all consumed changesets. It does not commit, tag or push.
 
-Run the local checks:
+Review the diff and run the local checks:
 
 ```sh
-npm run check
+make verify
 npm audit --audit-level=moderate
 npm pack --dry-run
 dir="$(mktemp -d)" && npm pack --ignore-scripts --pack-destination "$dir" && node .github/scripts/package-smoke.mjs "$dir"/pi-antigravity-thin-client-<version>.tgz
@@ -74,7 +74,16 @@ git diff --check
 
 The package smoke test needs `pi` on `PATH` (or `PI_BIN`). It loads the installed tarball with a temporary home and a stub `agy`, so it never reaches Antigravity.
 
-Commit `package.json`, `package-lock.json` and `CHANGELOG.md` as `chore: release <version>`, push `main` and wait for CI on that exact commit.
+Commit only the generated release files (`package.json`, `package-lock.json`, `CHANGELOG.md` and the deleted `.changeset/*.md` files) as `chore: release <version>`, run `make release-check`, then push `main` and wait for CI on that exact commit.
+
+```sh
+git add package.json package-lock.json CHANGELOG.md
+git add -u .changeset
+git commit -m "chore: release <version>"
+make release-check
+```
+
+(For an explicit `-next.N` prerelease, which is outside `make version`'s stable SemVer flow, set the prerelease version and dated changelog section manually with `Upstream base: pi-antigravity-bridge X.Y.Z.`.)
 
 ## Tag the release commit
 
@@ -143,9 +152,9 @@ git fetch upstream
 git merge upstream/main
 ```
 
-- `README.md` and `CHANGELOG.md` belong to the fork. Take the upstream changes to them into `docs/upstream/README.zh-CN.md` and `docs/upstream/CHANGELOG.md`.
+- `README.md` and `CHANGELOG.md` belong to the fork. Take the upstream changes to them into `docs/upstream/README.zh-CN.md` and `docs/upstream/CHANGELOG.md` (which `make version` reads for the `Upstream base:` line).
 - Review every upstream change for anything that sends Antigravity content the user did not type, and neutralize it: prompts made up by the bridge ("Continue."), automatic retries or continuations, replayed or preloaded history, auxiliary requests, Pi MCP/skill/`AGENTS.md` bridges, writes to Antigravity's databases, other tool modes than `agy-tools`.
 - Translate new Chinese interface texts from upstream to English; `test/interface-language.test.ts` fails until every string literal in `src/` is English. Comments may stay Chinese.
 - New upstream tests for disabled features get `{ skip: THIN_CLIENT_DISABLED }`; tests for features the fork keeps run with typed input (`test/human-input.ts`).
-- `npm run check` must pass with the thin-client tests unchanged. Add a regression test when an upstream change opens a new path to Antigravity.
-- Release the merge as a new fork version and name the new upstream base in the changelog.
+- `make verify` must pass with the thin-client tests unchanged. Add a regression test when an upstream change opens a new path to Antigravity.
+- Add a changeset for the upstream merge, then cut the new fork version with `make version` (which records the new upstream base from `docs/upstream/CHANGELOG.md`).

@@ -1,39 +1,6 @@
 # Changelog
 
-Fork releases of pi-antigravity-thin-client. The upstream changelog of pi-antigravity-bridge is in [docs/upstream/CHANGELOG.md](docs/upstream/CHANGELOG.md).
-
-## Unreleased
-
-### Added
-
-- Native Antigravity `swarm` visibility: the background widget now reads `.system_generated/swarm/members.json` read-only to display active, parked, and recently finished swarm workers (deduplicated against subagents), and mirror tool cards render `swarm`, `post_message`, `read_board`, `swarm_wait`, and `update_steps` with concise summaries.
-- Complete ACP `elicitation/create` (plus v1 `session/elicitation` and `_session/elicitation`) form support: titled `oneOf` choices, `array` multi-select with `minItems`/`maxItems`, optional `<id>__other` / `<id>_other` free-text companion folding, skippable optional fields, and `ask_question` field titles.
-- Support for Antigravity's `auto` execution mode in configuration and `/agy agent-mode` (falling back to `default` with a warning when a session does not advertise `auto`), plus `current_mode_update` synchronization and a version hint in `/agy status` when `agy` is older than `1.5.1`.
-- Per-model `thought_level` discovery via zero-quota `session/set_config_option` probing during catalog refresh, along with grouped `configOptions` and category-based option matching.
-- Read-only SQLite turn outcome inspection (`step_type = 17`) on `end_turn` and `refusal` to surface silent upstream failures — quota exhaustion with reset timestamps/delays, `INVALID_THINKING_SIGNATURE`, 403 `VALIDATION_REQUIRED` links, `SUBSCRIPTION_REQUIRED`, and API errors — cleanly as non-retryable errors.
-- A 15-minute prompt inactivity watchdog (paused while permission or elicitation dialogs are open or mirror tools are executing) so stalled `agy` turns fail cleanly instead of hanging indefinitely.
-
-### Fixed
-
-- Interactive `interaction_*` questions sent over `session/request_permission` now render as questions instead of `"Approve: …"` prompts and no longer fail the turn when a chosen option carries a `reject_*` kind; normal approval prompts surface `_meta["agy.security.warning"]` warnings and enrich generic titles with command or file details.
-- `/agy logout` now calls ACP v1 `"logout"` first and falls back to `"auth/logout"` on `-32601` (Method not found).
-- Spawned `agy acp` processes now set `AGY_CLI_DISABLE_AUTO_UPDATE="true"` by default, allow 90 seconds for cold `initialize` unpacking, clean up `.meta`, `brain/<id>/`, and `annotations/<id>.pbtxt` for empty probe and orphaned sessions, and tolerate up to 5 seconds for post-cancel prompt settling.
-- Out-of-turn `usage_update` notifications now trigger an immediate background poll when live autonomous activity is showing so the finished card replaces the live line promptly; SQLite step usage parsing also accounts for protobuf field 10 (`responseTokens`), and mirror broker payloads cap huge outputs and diffs in memory.
-- Failed `session/set_config_option` switches for `model` or `mode` now warn via UI notification instead of failing silently.
-- Long answers in the "Antigravity · on its own" card showed `<truncated N bytes>` and lost their middle part. `agy` cuts fields of more than about 4 KB in `transcript.jsonl` and writes them whole only to `transcript_full.jsonl`; the package now reads `transcript_full.jsonl` and falls back to `transcript.jsonl` only when the full file is missing or empty, waiting briefly for the full transcript on newly truncated turns and decoding multi-byte UTF-8 safely across incremental reads. Cards recorded before this fix keep their cut text.
-- Shell commands, file operations (`read`, `edit`, `write`), and searches whose path, query, or command line contains `workflow`, `subagent`, or `swarm` were shown as subagent cards. Explicit command, file, and search classifications now run before subagent title heuristics.
-- Switching sessions (`/new`, `/resume`, `/fork`, `/agy sessions`), compacting, logging out, or switching away from an Antigravity model could leave the previous background watcher and live widget active and append autonomous turn cards or titles into the wrong Pi session. Watchers and previous-session ledgers are now stopped on transitions, and live out-of-turn activity clears when the user starts a new turn.
-- Headless Pi runs (`pi -p`, subagents, workflows) no longer spawn `agy acp` during `session_start` to refresh a stale model catalog.
-- Large prompts (> 110 KB / ~42k estimated tokens) on follow-up or resumed turns, and `pi-traffic-optimization` projections, no longer tear down the live session or fail with a bogus replay refusal in thin-client mode.
-- Resuming a session (`pi --continue` / `/resume`) after a refused, failed, or aborted turn no longer locks the conversation out permanently, and SQLite checkpoint capture retries briefly across WAL flush lag.
-- `/agy sessions` now records a SQLite checkpoint on imported anchors (enabling divergence checks), drops trailing unanswered user messages that would trip the prompt gate, extracts inline `tool_call` outputs, tears down an active ledger before re-importing the same conversation, and reports command errors via UI notifications.
-- Background activity parsing now handles multiple `[Message]` blocks per `SYSTEM_MESSAGE`, cron schedules, anchored cancellation checks (ignoring `"was cancelled"` in command stdout), turn-state recovery after cancelled/errored turns, `manage_task status` non-terminal states, `baselineStep` replay prevention on attach, `Model: "inherit"` subagents without duplicate reasoning suffixes, trailing reminders on idle subagents, OSC escape sequences in task logs, and active/recent lookup filtering for empty tool result notes.
-- Out-of-order `tool_call` updates can no longer downgrade a completed mirror tool's status, stray `tool_call_update` events no longer leak orphaned broker entries, permission and elicitation dialogs share one FIFO mutex, `agy_read`/`agy_write` errors render as error text, and `HumanPromptGate` accepts trimmed whitespace while restricting slash-command fallback to recent non-`/agy` commands.
-
-### Changed
-
-- The answer of a turn Antigravity took on its own now stands below the "Antigravity · on its own" card, padded like any other answer, instead of inside the card's background. The card keeps the header, what woke Antigravity, the tool calls and the interruption note.
-- Command and generic tool cards no longer show agy's `Created At:` / `Completed At:` lines; the run time is in the card header, and partial cards with only timestamp lines show `Running...`. The tool result itself is unchanged.
+Fork releases of pi-antigravity-thin-client. Versions follow SemVer; entries come from the Markdown changesets in `.changeset/`. See [CONTRIBUTING.md](CONTRIBUTING.md) for the release workflow. The upstream changelog of pi-antigravity-bridge is in [docs/upstream/CHANGELOG.md](docs/upstream/CHANGELOG.md).
 
 ## 0.2.3 - 2026-11-26
 

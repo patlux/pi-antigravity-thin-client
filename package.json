@@ -48,7 +48,13 @@
     "check": "npm run typecheck && npm test",
     "test:release": "node --test test/release.test.mjs",
     "test:release-package": "node .github/scripts/package-smoke.mjs",
-    "test:e2e-resume": "node scripts/e2e/resume.mjs"
+    "test:e2e-resume": "node scripts/e2e/resume.mjs",
+    "changeset": "python3 -B scripts/changeset.py add",
+    "changeset:status": "python3 -B scripts/changeset.py status",
+    "changeset:test": "python3 -B scripts/test_changeset.py -v",
+    "hooks:install": "python3 -B scripts/changeset.py install-hook",
+    "version:prepare": "python3 -B scripts/changeset.py version",
+    "release:check": "python3 -B scripts/changeset.py release-ready && npm run check && npm run test:release"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",

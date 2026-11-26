@@ -11,13 +11,21 @@ pi-antigravity-thin-client is a Pi extension that connects Pi to Google Antigrav
 - Keep upstream code close to upstream so merges stay small; put fork features in their own modules (`src/background/`, `src/ui/background-activity.ts`).
 - All interface texts (notifications, errors, widget, cards, command help) are English. Translate Chinese texts that upstream merges bring in.
 - TypeScript: no `any`, no `as unknown as`, no `void`-prefixed calls in new code.
+- Changesets: read [CONTRIBUTING.md](CONTRIBUTING.md) before committing. Every non-merge, non-release commit adds a new Markdown note in `.changeset/` (or an explicit empty note via `python3 -B scripts/changeset.py add --empty` for docs, tests, or tooling). Install the hook once per clone with `make hooks-install`; never bypass it.
+- Versions: prepare versions only on clean `main` through `make version` after an explicit release request, never by hand-editing `package.json` or `CHANGELOG.md`. Commit generated release files separately (`chore: release <version>`).
 
 ## Commands
 
 ```sh
 npm ci
-npm run check          # typecheck and all tests
-npm run test:release   # release-rule tests only
+make hooks-install      # install the changeset pre-commit hook once per clone
+make verify             # changeset tests/status, typecheck, and all Node tests
+make changeset          # add a release note or empty changeset
+make changeset-status   # validate pending notes and preview the next SemVer
+make version            # prepare package.json, package-lock.json, and CHANGELOG.md
+make release-check      # read-only local release gate before pushing/tagging
+npm run check           # typecheck and all Node tests
+npm run test:release    # release-rule tests only
 npm run test:e2e-resume # real Pi in tmux against a mock agy: continuing conversations
 ```
 
@@ -25,4 +33,4 @@ Run `npm run test:e2e-resume` after changes to session restore (`src/session/`),
 
 ## Releases and upstream merges
 
-Follow [RELEASE.md](RELEASE.md). Publication runs only through the tag-triggered GitHub Actions workflow with npm Trusted Publishing.
+Follow [CONTRIBUTING.md](CONTRIBUTING.md) and [RELEASE.md](RELEASE.md). Publication runs only through the tag-triggered GitHub Actions workflow with npm Trusted Publishing.

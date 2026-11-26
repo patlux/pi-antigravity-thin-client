@@ -57,6 +57,21 @@ jobs:
           npm pack --ignore-scripts --pack-destination "$dir"
           node .github/scripts/package-smoke.mjs "$dir"/pi-antigravity-thin-client-*.tgz
 
+  changesets:
+    name: Changesets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python3 -B scripts/test_changeset.py -v
+      - run: python3 -B scripts/changeset.py status
+      - name: Changeset checks leave the repository unchanged
+        shell: bash
+        run: test -z "$(git status --porcelain --untracked-files=all)"
+
   workflows:
     name: Workflow syntax
     runs-on: ubuntu-latest
