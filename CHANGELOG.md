@@ -2,7 +2,9 @@
 
 Fork releases of pi-antigravity-thin-client. The upstream changelog of pi-antigravity-bridge is in [docs/upstream/CHANGELOG.md](docs/upstream/CHANGELOG.md).
 
-## Unreleased
+## 0.2.2 - 2026-11-26
+
+Upstream base: pi-antigravity-bridge 0.1.16.
 
 ### Added
 
