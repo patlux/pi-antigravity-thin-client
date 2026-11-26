@@ -20,6 +20,7 @@ import {
 	type TranscriptStep,
 } from "../src/background/agy-activity.ts";
 import { AgyTurnMirrorBroker, classifyAgyToolCall } from "../src/tools/agy-mirror-tools.ts";
+import { withoutTimestampHeader } from "../src/tools/agy-renderers.ts";
 import {
 	describeTrigger,
 	LIVE_STALE_MS,
@@ -799,6 +800,22 @@ describe("mirror tool cards for agy's own tools", () => {
 			classifyAgyToolCall({ title: "sleep 60", kind: "execute", rawInput: { CommandLine: "sleep 60" } }).mirrorToolName,
 			"agy_bash",
 		);
+	});
+
+	it("keeps a shell command a command when its line mentions a workflow or subagent", () => {
+		// The run_command agy 1.5.13 sent on 2026-11-26; it was shown as a subagent.
+		const cmd = `RUN_ID=$(gh run list --workflow="Cargo Deny" --limit 1 --json databaseId --jq '.[0].databaseId')\necho "Cargo Deny run: $RUN_ID"\ngh run view "$RUN_ID" --log-failed | tail -n 45`;
+		assert.equal(classifyAgyToolCall({ title: cmd, kind: "execute", rawInput: { CommandLine: cmd } }).mirrorToolName, "agy_bash");
+		assert.equal(classifyAgyToolCall({ title: "pi-subagents --list", kind: "execute" }).mirrorToolName, "agy_bash");
+		assert.equal(classifyAgyToolCall({ title: "Start subagent", kind: "other" }).mirrorToolName, "agy_subagent");
+	});
+
+	it("drops agy's timestamp lines from a command card", () => {
+		assert.equal(
+			withoutTimestampHeader("Created At: 2026-11-26T20:59:02+01:00\nCompleted At: 2026-11-26T20:59:07+01:00\nCommand exited with code 0.\n\nCommand output:\nok"),
+			"Command exited with code 0.\n\nCommand output:\nok",
+		);
+		assert.equal(withoutTimestampHeader("plain output\nCreated At: x"), "plain output\nCreated At: x");
 	});
 
 	it("explains a call that agy finished without output", async () => {

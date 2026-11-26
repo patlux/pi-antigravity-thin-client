@@ -7,10 +7,12 @@ Fork releases of pi-antigravity-thin-client. The upstream changelog of pi-antigr
 ### Fixed
 
 - Long answers in the "Antigravity · on its own" card showed `<truncated N bytes>` and lost their middle part. `agy` cuts fields of more than about 4 KB in `transcript.jsonl` and writes them whole only to `transcript_full.jsonl`; the package now reads `transcript_full.jsonl` and falls back to `transcript.jsonl` only when the full file is missing. This also keeps long command lines of background tasks whole. Cards recorded before this fix keep their cut text.
+- Shell commands whose command line contains `workflow`, `subagent` or `swarm` (for example `gh run list --workflow=…`) were shown as a subagent card with the command as its role. Commands are now recognized before those title words, so they get the normal `$ <command>` card.
 
 ### Changed
 
 - The answer of a turn Antigravity took on its own now stands below the "Antigravity · on its own" card, padded like any other answer, instead of inside the card's background. The card keeps the header, what woke Antigravity, the tool calls and the interruption note.
+- Command cards no longer show agy's `Created At:` / `Completed At:` lines; the run time is in the card header. The tool result itself is unchanged.
 
 ## 0.2.3 - 2026-11-26
 

@@ -165,9 +165,13 @@ export function classifyAgyToolCall(input: {
 		mirrorToolName = "agy_subagent";
 	} else if (internalTool) {
 		mirrorToolName = "agy_tool";
+	} else if (kind === "execute" || command !== undefined) {
+		// A shell command's title is its command line; words such as `--workflow=`
+		// in it do not make it a subagent.
+		mirrorToolName = "agy_bash";
 	} else if (isExplicitSubagentTitle) {
 		mirrorToolName = "agy_subagent";
-	} else if (kind === "execute" || command !== undefined || lowerTitle.startsWith("run ")) {
+	} else if (lowerTitle.startsWith("run ")) {
 		mirrorToolName = "agy_bash";
 	} else if (hasDiffBlock || kind === "edit" || lowerTitle.startsWith("edit")) {
 		mirrorToolName = "agy_edit";

@@ -70,6 +70,18 @@ function extractResultText(result: AgentToolResult<AgyMirrorToolDetails>): strin
 		.trimEnd();
 }
 
+/**
+ * agy starts a command's result with `Created At:` / `Completed At:` lines; the card
+ * shows the run time in its header already. Display only: the tool result itself
+ * stays unchanged.
+ */
+export function withoutTimestampHeader(text: string): string {
+	const lines = text.split("\n");
+	let start = 0;
+	while (start < lines.length && /^(?:Created|Completed) At:\s*\S/.test(lines[start].trim())) start++;
+	return start === 0 ? text : lines.slice(start).join("\n").replace(/^\s*\n/, "");
+}
+
 function formatDurationSuffix(durationMs: number | undefined, theme: Theme): string {
 	if (typeof durationMs !== "number" || !Number.isFinite(durationMs) || durationMs < 100) {
 		return "";
@@ -232,7 +244,7 @@ export function getMirrorToolRenderers(toolName: AgyMirrorToolName): ToolRendere
 
 			// 2. 终端执行工具：流式阶段滚动展示尾部输出，报错时高亮
 			if (toolName === "agy_bash") {
-				const lines = rawText.split("\n");
+				const lines = withoutTimestampHeader(rawText).split("\n");
 				if (!options.expanded && options.isPartial && lines.length > BASH_STREAMING_TAIL_LINES) {
 					const tail = lines.slice(-BASH_STREAMING_TAIL_LINES);
 					const skipped = lines.length - tail.length;
