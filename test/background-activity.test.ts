@@ -419,6 +419,40 @@ describe("AgyActivityWatcher", () => {
 		}
 	});
 
+	it("takes agy's answer whole from transcript_full.jsonl, not cut from transcript.jsonl", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-brain-"));
+		try {
+			const answer = `Alle Punkte sind umgesetzt.\n\n${"- Prüfung & Rollout: ok\n".repeat(300)}Ende der Antwort.`;
+			const cut = `${answer.slice(0, 2000)}\n<truncated ${answer.length - 4000} bytes>\n${answer.slice(-2000)}`;
+			const all = transcriptLines();
+			const last = (content: string, truncated: boolean) =>
+				JSON.stringify({ step_index: 11, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-25T13:55:26Z", content, ...(truncated ? { truncated_fields: ["content"] } : {}) });
+			// As agy writes them: the short transcript first, the full one a moment later.
+			writeBrain(dir, [...all.slice(0, 11), last(cut, true)], messageFiles());
+			const finished: AutonomousTurn[] = [];
+			const watcher = new AgyActivityWatcher({
+				agySessionId: CONV,
+				systemDir: dir,
+				isAlive: () => true,
+				onSnapshot: () => {},
+				onTurnFinished: (turn) => finished.push(turn),
+			});
+			// Falls back to transcript.jsonl while transcript_full.jsonl is missing.
+			assert.equal(watcher.refresh().turns.at(-1)?.texts[0], cut);
+
+			fs.writeFileSync(
+				path.join(dir, "logs", "transcript_full.jsonl"),
+				[...all.slice(0, 11), last(answer, false)].map((l) => `${l}\n`).join(""),
+			);
+			const turn = watcher.refresh().turns.at(-1);
+			assert.equal(turn?.texts[0], answer);
+			assert.doesNotMatch(turn?.texts[0] ?? "", /<truncated \d+ bytes>/);
+			assert.deepEqual(watcher.refresh().turns.map((t) => t.startStep), [8, 10], "switching files keeps each turn once");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("hides a killed timer after the linger window even without a message file", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-brain-"));
 		try {

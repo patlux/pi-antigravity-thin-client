@@ -2,6 +2,12 @@
 
 Fork releases of pi-antigravity-thin-client. The upstream changelog of pi-antigravity-bridge is in [docs/upstream/CHANGELOG.md](docs/upstream/CHANGELOG.md).
 
+## Unreleased
+
+### Fixed
+
+- Long answers in the "Antigravity · on its own" card showed `<truncated N bytes>` and lost their middle part. `agy` cuts fields of more than about 4 KB in `transcript.jsonl` and writes them whole only to `transcript_full.jsonl`; the package now reads `transcript_full.jsonl` and falls back to `transcript.jsonl` only when the full file is missing. This also keeps long command lines of background tasks whole. Cards recorded before this fix keep their cut text.
+
 ## 0.2.3 - 2026-11-26
 
 Upstream base: pi-antigravity-bridge 0.1.16.

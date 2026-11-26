@@ -21,23 +21,45 @@ const FINISHED_TASK_LINGER_MS = 8_000;
 const LOG_TAIL_BYTES = 4_096;
 const DEFAULT_POLL_MS = 1_000;
 
-/** Reads a growing `transcript.jsonl` incrementally; tolerates a partial last line. */
+/**
+ * Reads a conversation's growing transcript incrementally; tolerates a partial last
+ * line. agy writes each step twice: `transcript.jsonl` shortens long fields in the
+ * middle (`<truncated N bytes>`, listed in `truncated_fields`), and
+ * `transcript_full.jsonl` keeps them whole. The reader prefers the full file and
+ * falls back to the short one while the full file does not exist.
+ */
 class TranscriptReader {
 	readonly steps = new Map<number, TranscriptStep>();
 	private offset = 0;
 	private partialLine = "";
-	private readonly file: string;
+	private readonly logsDir: string;
+	private file: string | undefined;
 
-	constructor(file: string) {
-		this.file = file;
+	/** `logsDir`: `<conversation>/.system_generated/logs` */
+	constructor(logsDir: string) {
+		this.logsDir = logsDir;
 	}
 
 	read(): void {
-		let size: number;
-		try {
-			size = fs.statSync(this.file).size;
-		} catch {
-			return;
+		let file: string | undefined;
+		let size = 0;
+		for (const name of ["transcript_full.jsonl", "transcript.jsonl"]) {
+			const candidate = path.join(this.logsDir, name);
+			try {
+				size = fs.statSync(candidate).size;
+				file = candidate;
+				break;
+			} catch {
+				// Not there (yet): try the next file.
+			}
+		}
+		if (!file) return;
+		if (file !== this.file) {
+			// First read, or the full transcript appeared: read it from the start.
+			this.file = file;
+			this.offset = 0;
+			this.partialLine = "";
+			this.steps.clear();
 		}
 		if (size < this.offset) {
 			// agy rewrote the file: start over.
@@ -48,7 +70,7 @@ class TranscriptReader {
 		if (size === this.offset) return;
 		const length = size - this.offset;
 		const buffer = Buffer.alloc(length);
-		const fd = fs.openSync(this.file, "r");
+		const fd = fs.openSync(file, "r");
 		try {
 			fs.readSync(fd, buffer, 0, length, this.offset);
 		} finally {
@@ -132,7 +154,7 @@ export class AgyActivityWatcher {
 	constructor(options: ActivityWatcherOptions) {
 		this.options = options;
 		this.agySessionId = options.agySessionId;
-		this.transcript = new TranscriptReader(path.join(options.systemDir, "logs", "transcript.jsonl"));
+		this.transcript = new TranscriptReader(path.join(options.systemDir, "logs"));
 	}
 
 	start(): void {
@@ -178,9 +200,7 @@ export class AgyActivityWatcher {
 		for (const record of this.subagentRecords.values()) {
 			let reader = this.subagentReaders.get(record.conversationId);
 			if (!reader) {
-				reader = new TranscriptReader(
-					path.join(brainDir, record.conversationId, ".system_generated", "logs", "transcript.jsonl"),
-				);
+				reader = new TranscriptReader(path.join(brainDir, record.conversationId, ".system_generated", "logs"));
 				this.subagentReaders.set(record.conversationId, reader);
 			}
 			let messages = this.subagentMessages.get(record.conversationId);

@@ -5,7 +5,8 @@
  * agy gets a message and starts a turn by itself, without a prompt from the client.
  * ACP clients see nothing of that turn, so the bridge reads agy's per-conversation
  * files below `<app data>/brain/<conversation>/.system_generated/`:
- * `logs/transcript.jsonl` (one JSON object per step), `messages/*.json` (task
+ * `logs/transcript_full.jsonl` (one JSON object per step; `transcript.jsonl` holds the
+ * same steps with long fields cut in the middle), `messages/*.json` (task
  * results) and `tasks/task-N.log` (live output). The format is agy-internal; every
  * parser here is defensive and returns nothing it cannot read.
  *
