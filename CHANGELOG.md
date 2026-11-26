@@ -2,6 +2,13 @@
 
 Fork releases of pi-antigravity-thin-client. The upstream changelog of pi-antigravity-bridge is in [docs/upstream/CHANGELOG.md](docs/upstream/CHANGELOG.md).
 
+## Unreleased
+
+### Fixed
+
+- Background timers cancelled with `manage_task` (`kill`) — or cancelled early by a `TimerCondition` message — stayed listed as running in the widget above the editor because `agy` does not write a `messages/*.json` file for a cancelled timer. Task state now also reads `manage_task` results (`kill`, `status`, `list`) and message deliveries from `transcript.jsonl`.
+- Timers of a minute or longer (`Timer: 35m`, `Timer: 2m 30s`, `Timer: 1h 5m`, ...) were shown as shell commands with their full prompt because the parser only matched durations in seconds (`30s`). Multi-unit durations are now recognized as timers and displayed compactly with their remaining time.
+
 ## 0.2.2 - 2026-11-26
 
 Upstream base: pi-antigravity-bridge 0.1.16.

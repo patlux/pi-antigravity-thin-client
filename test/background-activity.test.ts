@@ -10,7 +10,9 @@ import {
 	deriveAgyActivity,
 	deriveSubagentStatus,
 	firstLine,
+	formatDuration,
 	lastLogLine,
+	parseDurationSeconds,
 	parseSubagentRecord,
 	parseTaskMessage,
 	parseTranscriptLine,
@@ -191,6 +193,120 @@ describe("agy activity from local files", () => {
 		assert.equal(lastLogLine("Compiling a\r\nBuilding 1/6\r\u001b[32mBuilding 5/6\u001b[0m\r\n\r\n"), "Building 5/6");
 		assert.equal(lastLogLine(""), undefined);
 	});
+
+	it("parses multi-unit timer durations and formats them compactly", () => {
+		assert.equal(parseDurationSeconds("30s"), 30);
+		assert.equal(parseDurationSeconds("35m"), 2100);
+		assert.equal(parseDurationSeconds("2m 30s"), 150);
+		assert.equal(parseDurationSeconds("1h 5m 10s"), 3910);
+		assert.equal(parseDurationSeconds("1d 2h"), 93_600);
+		assert.equal(parseDurationSeconds("30s extra"), undefined);
+		assert.equal(parseDurationSeconds(""), undefined);
+
+		assert.equal(formatDuration(30), "30 s");
+		assert.equal(formatDuration(150), "2m 30s");
+		assert.equal(formatDuration(2100), "35m");
+		assert.equal(formatDuration(3910), "1h 5m 10s");
+
+		const line = (obj: Record<string, unknown>) => JSON.stringify(obj);
+		const lines = [
+			line({ step_index: 1, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T12:04:03Z", tool_calls: [{ name: "schedule", args: { DurationSeconds: "2100", Prompt: "\"Check probe progress, download results.\"" } }] }),
+			line({ step_index: 2, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T12:04:19Z", content: `Created At: 2026-11-26T13:04:19+01:00\nTool is running as a background task with task id: ${CONV}/task-2\nTask Description: Timer: 35m, Prompt: Check probe progress, download results.\nTask logs are available at: file://${BRAIN}/${CONV}/.system_generated/tasks/task-2.log` }),
+			line({ step_index: 3, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T12:05:00Z", tool_calls: [{ name: "schedule", args: { DurationSeconds: "150", Prompt: "\"Check VM start\"" } }] }),
+			line({ step_index: 4, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T12:05:02Z", content: `Created At: 2026-11-26T13:05:02+01:00\nTool is running as a background task with task id: ${CONV}/task-4\nTask Description: Timer: 2m 30s, Prompt: Check VM start\nTask logs are available at: file://${BRAIN}/${CONV}/.system_generated/tasks/task-4.log` }),
+		];
+		const activity = deriveAgyActivity(steps(lines), []);
+		assert.deepEqual(
+			activity.tasks.map((task) => [task.taskId, task.kind, task.timerSeconds, task.description]),
+			[
+				["task-2", "timer", 2100, "Check probe progress, download results."],
+				["task-4", "timer", 150, "Check VM start"],
+			],
+		);
+	});
+
+	it("marks a timer finished when manage_task kill cancels it without a message file", () => {
+		const line = (obj: Record<string, unknown>) => JSON.stringify(obj);
+		const lines = [
+			line({ step_index: 1, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T12:04:03Z", tool_calls: [{ name: "schedule", args: { DurationSeconds: "2100", Prompt: "\"Check probe progress\"" } }] }),
+			line({ step_index: 2, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T12:04:19Z", content: `Created At: 2026-11-26T13:04:19+01:00\nTool is running as a background task with task id: ${CONV}/task-2\nTask Description: Timer: 35m, Prompt: Check probe progress\nTask logs are available at: file://${BRAIN}/${CONV}/.system_generated/tasks/task-2.log` }),
+			line({ step_index: 3, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T12:27:26Z", tool_calls: [{ name: "manage_task", args: { Action: "\"kill\"", TaskId: `"${CONV}/task-2"` } }, { name: "run_command", args: { CommandLine: "\"sleep 60\"", toolSummary: "\"Restart job\"" } }] }),
+			line({ step_index: 4, source: "MODEL", type: "GENERIC", status: "DONE", created_at: "2026-11-26T12:27:38Z", content: `Created At: 2026-11-26T13:27:38+01:00\nCompleted At: 2026-11-26T13:27:50+01:00\nTask "${CONV}/task-2" cancelled.` }),
+			line({ step_index: 5, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T12:27:48Z", content: `Created At: 2026-11-26T13:27:48+01:00\nTool is running as a background task with task id: ${CONV}/task-5\nTask Description: sleep 60\nTask logs are available at: file://${BRAIN}/${CONV}/.system_generated/tasks/task-5.log` }),
+		];
+		const activity = deriveAgyActivity(steps(lines), []);
+		assert.equal(activity.tasks[0].kind, "timer");
+		assert.deepEqual(activity.tasks[0].finished, {
+			outcome: "canceled",
+			exitCode: undefined,
+			atMs: Date.parse("2026-11-26T13:27:50+01:00"),
+		});
+		assert.equal(activity.tasks[1].taskId, "task-5");
+		assert.equal(activity.tasks[1].finished, undefined);
+	});
+
+	it("reconciles finished tasks from manage_task status, kill errors and list", () => {
+		const line = (obj: Record<string, unknown>) => JSON.stringify(obj);
+		const lines = [
+			line({ step_index: 1, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T10:00:00Z", tool_calls: [{ name: "run_command", args: { CommandLine: "\"job-a\"" } }, { name: "run_command", args: { CommandLine: "\"job-b\"" } }, { name: "run_command", args: { CommandLine: "\"job-c\"" } }] }),
+			line({ step_index: 2, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T10:00:01Z", content: `Tool is running as a background task with task id: ${CONV}/task-2\nTask Description: job-a` }),
+			line({ step_index: 3, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T10:00:01Z", content: `Tool is running as a background task with task id: ${CONV}/task-3\nTask Description: job-b` }),
+			line({ step_index: 4, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T10:00:01Z", content: `Tool is running as a background task with task id: ${CONV}/task-4\nTask Description: job-c` }),
+			// A plain run_command outputting the list text must not clear running tasks.
+			line({ step_index: 5, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T10:00:05Z", tool_calls: [{ name: "run_command", args: { CommandLine: "\"echo No background tasks are currently running.\"" } }] }),
+			line({ step_index: 6, source: "MODEL", type: "GENERIC", status: "DONE", created_at: "2026-11-26T10:00:05Z", content: "No background tasks are currently running." }),
+			// manage_task status DONE finishes task-2, while RUNNING leaves task-3 open.
+			line({ step_index: 7, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T10:01:00Z", tool_calls: [{ name: "manage_task", args: { Action: "\"status\"", TaskId: `"${CONV}/task-2"` } }, { name: "manage_task", args: { Action: "\"status\"", TaskId: `"${CONV}/task-3"` } }] }),
+			line({ step_index: 8, source: "MODEL", type: "GENERIC", status: "DONE", created_at: "2026-11-26T10:01:01Z", content: `Task: ${CONV}/task-2\nStatus: DONE\nLog: file:///x` }),
+			line({ step_index: 9, source: "MODEL", type: "GENERIC", status: "DONE", created_at: "2026-11-26T10:01:01Z", content: `Task: ${CONV}/task-3\nStatus: RUNNING\nLog: file:///x` }),
+			// manage_task kill on an already-finished task marks task-3 finished.
+			line({ step_index: 10, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T10:02:00Z", tool_calls: [{ name: "manage_task", args: { Action: "\"kill\"", TaskId: `"${CONV}/task-3"` } }] }),
+			line({ step_index: 11, source: "MODEL", type: "GENERIC", status: "ERROR", created_at: "2026-11-26T10:02:01Z", content: `Encountered error in step execution: cannot kill task "${CONV}/task-3": task is not running (status: DONE)` }),
+		];
+		const mid = deriveAgyActivity(steps(lines), []);
+		assert.equal(mid.tasks[0].finished?.outcome, "ok");
+		assert.equal(mid.tasks[1].finished?.outcome, "ok");
+		assert.equal(mid.tasks[2].finished, undefined);
+
+		// manage_task list returning empty clears earlier task-4, but not task-13 started in the same planner turn.
+		lines.push(
+			line({ step_index: 12, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T10:03:00Z", tool_calls: [{ name: "manage_task", args: { Action: "\"list\"" } }, { name: "run_command", args: { CommandLine: "\"job-d\"" } }] }),
+			line({ step_index: 13, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T10:03:01Z", content: `Tool is running as a background task with task id: ${CONV}/task-13\nTask Description: job-d` }),
+			line({ step_index: 14, source: "MODEL", type: "GENERIC", status: "DONE", created_at: "2026-11-26T10:03:02Z", content: "Created At: 2026-11-26T10:03:01Z\nCompleted At: 2026-11-26T10:03:02Z\nNo background tasks are currently running." }),
+		);
+		const afterList = deriveAgyActivity(steps(lines), []);
+		assert.equal(afterList.tasks[2].finished?.outcome, "ok");
+		assert.equal(afterList.tasks[3].taskId, "task-13");
+		assert.equal(afterList.tasks[3].finished, undefined);
+
+		// A truncated list JSON must be ignored rather than dropping running tasks.
+		lines.push(
+			line({ step_index: 15, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T10:04:00Z", tool_calls: [{ name: "manage_task", args: { Action: "\"list\"" } }] }),
+			line({ step_index: 16, source: "MODEL", type: "GENERIC", status: "DONE", created_at: "2026-11-26T10:04:01Z", content: `You have 1 background task(s) currently running:\n[{"taskId":"${CONV}/task-13","description":"trun` }),
+		);
+		assert.equal(deriveAgyActivity(steps(lines), []).tasks[3].finished, undefined);
+	});
+
+	it("marks a conditional timer canceled early when a matching message arrives", () => {
+		const line = (obj: Record<string, unknown>) => JSON.stringify(obj);
+		const lines = [
+			line({ step_index: 1, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T10:00:00Z", tool_calls: [{ name: "run_command", args: { CommandLine: "\"build\"" } }] }),
+			line({ step_index: 2, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T10:00:01Z", content: `Tool is running as a background task with task id: ${CONV}/task-2\nTask Description: build` }),
+			line({ step_index: 3, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T10:00:02Z", tool_calls: [{ name: "schedule", args: { DurationSeconds: "240", Prompt: "\"Check build\"", TimerCondition: `"${CONV}/task-2"` } }] }),
+			line({ step_index: 4, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T10:00:03Z", content: `Tool is running as a background task with task id: ${CONV}/task-4\nTask Description: Timer: 4m, Prompt: Check build` }),
+			// User prompts do not cancel TimerCondition timers.
+			line({ step_index: 5, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", created_at: "2026-11-26T10:00:30Z", content: "status?" }),
+		];
+		assert.equal(deriveAgyActivity(steps(lines), []).tasks[1].finished, undefined);
+
+		// A message from task-2 cancels task-4 early.
+		lines.push(
+			line({ step_index: 6, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", created_at: "2026-11-26T10:01:00Z", content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-26T10:01:00Z sender=${CONV}/task-2 priority=MESSAGE_PRIORITY_HIGH content=Task id "${CONV}/task-2" finished with result:\nCommand exited with code 0.\n</SYSTEM_MESSAGE>` }),
+		);
+		const after = deriveAgyActivity(steps(lines), []);
+		assert.equal(after.tasks[0].finished?.outcome, "ok");
+		assert.equal(after.tasks[1].finished?.outcome, "canceled");
+	});
 });
 
 describe("AgyActivityWatcher", () => {
@@ -302,6 +418,37 @@ describe("AgyActivityWatcher", () => {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
+
+	it("hides a killed timer after the linger window even without a message file", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-brain-"));
+		try {
+			const line = (obj: Record<string, unknown>) => JSON.stringify(obj);
+			const lines = [
+				line({ step_index: 1, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T12:04:03Z", tool_calls: [{ name: "schedule", args: { DurationSeconds: "2100", Prompt: "\"Check job\"" } }] }),
+				line({ step_index: 2, source: "MODEL", type: "GENERIC", status: "RUNNING", created_at: "2026-11-26T12:04:19Z", content: `Created At: 2026-11-26T13:04:19+01:00\nTool is running as a background task with task id: ${CONV}/task-2\nTask Description: Timer: 35m, Prompt: Check job` }),
+				line({ step_index: 3, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T12:27:26Z", tool_calls: [{ name: "manage_task", args: { Action: "\"kill\"", TaskId: `"${CONV}/task-2"` } }] }),
+				line({ step_index: 4, source: "MODEL", type: "GENERIC", status: "DONE", created_at: "2026-11-26T12:27:38Z", content: `Created At: 2026-11-26T13:27:38+01:00\nCompleted At: 2026-11-26T13:27:50+01:00\nTask "${CONV}/task-2" cancelled.` }),
+			];
+			writeBrain(dir, lines, {});
+			let now = Date.parse("2026-11-26T13:27:53+01:00");
+			const snapshots: ActivitySnapshot[] = [];
+			const watcher = new AgyActivityWatcher({
+				agySessionId: CONV,
+				systemDir: dir,
+				isAlive: () => true,
+				onSnapshot: (snapshot) => snapshots.push(snapshot),
+				onTurnFinished: () => {},
+				now: () => now,
+			});
+			watcher.poll();
+			assert.deepEqual(snapshots.at(-1)?.tasks.map((t) => [t.taskId, t.finished?.outcome]), [["task-2", "canceled"]]);
+			now = Date.parse("2026-11-26T13:28:05+01:00");
+			watcher.poll();
+			assert.deepEqual(snapshots.at(-1)?.tasks, []);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
 });
 
 /** Parent and subagent files as agy 1.5.13 wrote them for the subagent test prompt (abridged). */
@@ -387,6 +534,13 @@ describe("agy subagents", () => {
 		const expired = parseTaskMessage(JSON.stringify({ id: "t", sender: `${SUB}/task-4`, timestamp: "2026-11-25T15:01:58Z", renderDetails: { messageTitle: "10s timer: Timer has expired" }, content: "weiter" }));
 		assert.ok(expired);
 		assert.equal(deriveSubagentStatus(record, steps(own), [], [expired]).state, "idle");
+		const canceled = [
+			...own,
+			line({ step_index: 6, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-25T15:01:50Z", tool_calls: [{ name: "manage_task", args: { Action: "\"kill\"", TaskId: `"${SUB}/task-4"` } }] }),
+			line({ step_index: 7, source: "MODEL", type: "GENERIC", status: "DONE", created_at: "2026-11-25T15:01:51Z", content: `Task "${SUB}/task-4" cancelled.` }),
+			line({ step_index: 8, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-25T15:01:52Z", content: "Timer abgebrochen." }),
+		];
+		assert.equal(deriveSubagentStatus(record, steps(canceled), []).state, "idle");
 	});
 
 	it("writes the invoke_subagent card: who, which model, which task", () => {
@@ -472,6 +626,25 @@ describe("background activity display", () => {
 			" ⠋ task-2  Background sleep task  0:40  step 2",
 			" ⠋ task-6  Timer 30 s  0:19  11 s left",
 			" ⠋ working on its own  0:03  1 tool call",
+		]);
+		const longTimerNow = Date.parse("2026-11-26T12:04:38Z");
+		const longTimerLines = renderActivityLines(
+			{
+				agySessionId: CONV,
+				tasks: [
+					{ taskId: "task-456", stepIndex: 456, kind: "timer", description: "Check job progress", timerSeconds: 2100, startedAtMs: Date.parse("2026-11-26T12:04:19Z") },
+					{ taskId: "task-457", stepIndex: 457, kind: "timer", description: "Check job progress", timerSeconds: 2100, startedAtMs: Date.parse("2026-11-26T12:04:19Z"), finished: { outcome: "canceled", atMs: longTimerNow } },
+				],
+				logTails: new Map(),
+			},
+			longTimerNow,
+			0,
+			plainTheme,
+		);
+		assert.deepEqual(longTimerLines, [
+			"Antigravity · 1 background task",
+			" ⠋ task-456  Timer 35m  0:19  34m 41s left",
+			" ⊘ task-457  Timer 35m  0:19  canceled",
 		]);
 	});
 

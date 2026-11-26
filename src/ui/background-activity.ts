@@ -6,6 +6,7 @@ import {
 	type AutonomousTrigger,
 	type AutonomousTurn,
 	type BackgroundTask,
+	formatDuration,
 	type SubagentStatus,
 	singleLine,
 	splitAgyModel,
@@ -233,7 +234,7 @@ export function renderAutonomousEntry(
 
 function taskLabel(task: BackgroundTask): string {
 	if (task.kind === "timer") {
-		return `Timer ${task.timerSeconds ?? "?"} s`;
+		return `Timer ${task.timerSeconds !== undefined ? formatDuration(task.timerSeconds) : "?"}`;
 	}
 	return task.summary ?? task.description;
 }
@@ -323,10 +324,15 @@ export function renderActivityLines(
 		const elapsed = task.startedAtMs !== undefined ? formatElapsed((task.finished?.atMs ?? now) - task.startedAtMs) : "";
 		let detail = "";
 		if (task.finished) {
-			detail = task.finished.exitCode !== undefined && task.kind === "command" ? `Exit ${task.finished.exitCode}` : "done";
+			detail =
+				task.finished.outcome === "canceled"
+					? "canceled"
+					: task.finished.exitCode !== undefined && task.kind === "command"
+						? `Exit ${task.finished.exitCode}`
+						: "done";
 		} else if (task.kind === "timer" && task.startedAtMs !== undefined && task.timerSeconds !== undefined) {
 			const left = task.startedAtMs + task.timerSeconds * 1000 - now;
-			detail = left > 0 ? `${Math.ceil(left / 1000)} s left` : "expiring";
+			detail = left > 0 ? `${formatDuration(Math.ceil(left / 1000))} left` : "expiring";
 		} else {
 			detail = snapshot.logTails.get(task.taskId) ?? "no output yet";
 		}

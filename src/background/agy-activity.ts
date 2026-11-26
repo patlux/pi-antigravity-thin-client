@@ -225,10 +225,125 @@ export function isTerminalNote(title: string | undefined, content: string): bool
 
 const BACKGROUND_TASK_PATTERN = /background task with task id:\s*(\S+)/;
 const TASK_DESCRIPTION_PATTERN = /Task Description:\s*([\s\S]*?)(?:\n\s*Task logs are available at:|$)/;
-const TIMER_PATTERN = /^Timer:\s*(\d+)\s*s(?:,\s*Prompt:\s*([\s\S]*))?$/;
+const TIMER_PATTERN = /^Timer:\s*([^,\n]+?)(?:,\s*Prompt:\s*([\s\S]*))?$/;
+const TASK_CANCELLED_PATTERN = /^Task "([^"]+)" cancell?ed\.?$/i;
+const TASK_NOT_RUNNING_PATTERN = /cannot kill task "([^"]+)": task is not running \(status:\s*([^)]+)\)/i;
+const TASK_STATUS_PATTERN = /^Task:\s*(\S+)\r?\nStatus:\s*(\S+)/;
+const NO_RUNNING_TASKS_PATTERN = /^No background tasks are currently running\.?$/;
+const RUNNING_TASKS_LIST_PATTERN = /^You have (\d+) background task\(s\) currently running:\r?\n([\s\S]+)$/;
 const EXIT_CODE_PATTERN = /Command exited with code (-?\d+)/;
 const MESSAGE_HEADER_PATTERN = /\[Message\][^\n]*?\btimestamp=(\S+)[^\n]*?\bsender=(\S+)[^\n]*?\bcontent=([\s\S]*?)(?:\n<\/SYSTEM_MESSAGE>|$)/;
 const MESSAGE_SENDER_PATTERN = /\[Message\][^\n]*?\bsender=(\S+)/;
+
+const DURATION_UNIT_SECONDS: Record<string, number> = {
+	d: 86_400,
+	h: 3_600,
+	m: 60,
+	s: 1,
+};
+
+/** Parses agy timer durations such as `30s`, `35m`, `2m 30s`, `1h 5m`. */
+export function parseDurationSeconds(text: string): number | undefined {
+	const trimmed = text.trim();
+	if (!trimmed) return undefined;
+	const tokenPattern = /(\d+)\s*([dhms])/gi;
+	let total = 0;
+	let cursor = 0;
+	for (const match of trimmed.matchAll(tokenPattern)) {
+		if (match.index === undefined) return undefined;
+		if (trimmed.slice(cursor, match.index).trim().length > 0) return undefined;
+		const value = Number.parseInt(match[1], 10);
+		const unit = DURATION_UNIT_SECONDS[match[2].toLowerCase()];
+		if (!Number.isFinite(value) || unit === undefined) return undefined;
+		total += value * unit;
+		cursor = match.index + match[0].length;
+	}
+	if (cursor === 0 || trimmed.slice(cursor).trim().length > 0) return undefined;
+	return total;
+}
+
+/** Compact duration: `30 s`, `2m 30s`, `35m`, `1h 5m`. */
+export function formatDuration(totalSeconds: number): string {
+	const total = Math.max(0, Math.floor(totalSeconds));
+	if (total < 60) return `${total} s`;
+	const days = Math.floor(total / 86_400);
+	const hours = Math.floor((total % 86_400) / 3_600);
+	const minutes = Math.floor((total % 3_600) / 60);
+	const seconds = total % 60;
+	const parts: string[] = [];
+	if (days > 0) parts.push(`${days}d`);
+	if (hours > 0) parts.push(`${hours}h`);
+	if (minutes > 0) parts.push(`${minutes}m`);
+	if (seconds > 0) parts.push(`${seconds}s`);
+	return parts.join(" ");
+}
+
+function outcomeFromTaskStatus(status: string, kind: BackgroundTask["kind"]): TaskOutcome {
+	const upper = status.trim().toUpperCase();
+	if (upper.includes("CANCEL") || upper.includes("KILL")) return "canceled";
+	if (upper.includes("FAIL") || upper.includes("ERROR")) return "failed";
+	if (kind === "timer") return "expired";
+	return "ok";
+}
+
+function parseStepBody(content: string): { body: string; completedAtMs?: number } {
+	let completedAtMs: number | undefined;
+	const lines = content.split(/\r?\n/);
+	let start = 0;
+	while (start < lines.length) {
+		const line = lines[start].trim();
+		const completed = /^Completed At:\s*(.+)$/.exec(line);
+		if (completed) {
+			completedAtMs = parseTimeMs(completed[1].trim()) ?? completedAtMs;
+			start++;
+			continue;
+		}
+		if (/^Created At:\s*.+$/.test(line)) {
+			start++;
+			continue;
+		}
+		break;
+	}
+	return { body: lines.slice(start).join("\n").trim(), completedAtMs };
+}
+
+function parseRunningTaskList(body: string): Set<string> | undefined {
+	if (NO_RUNNING_TASKS_PATTERN.test(body)) {
+		return new Set();
+	}
+	const match = RUNNING_TASKS_LIST_PATTERN.exec(body);
+	if (!match) return undefined;
+	const expectedCount = Number.parseInt(match[1], 10);
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(match[2].trim());
+	} catch {
+		return undefined;
+	}
+	if (!Array.isArray(parsed) || parsed.length !== expectedCount) return undefined;
+	const running = new Set<string>();
+	for (const entry of parsed) {
+		const rawId = asString(asRecord(entry)?.taskId);
+		const id = rawId ? shortTaskId(rawId) : undefined;
+		if (!id) return undefined;
+		running.add(id);
+	}
+	return running;
+}
+
+function findScheduleCall(
+	calls: readonly TranscriptToolCall[],
+	prompt: string | undefined,
+): TranscriptToolCall | undefined {
+	const schedules = calls.filter((call) => call.name === "schedule");
+	if (schedules.length === 0) return undefined;
+	if (prompt !== undefined) {
+		const trimmed = prompt.trim();
+		const exact = schedules.find((call) => call.args.Prompt?.trim() === trimmed);
+		if (exact) return exact;
+	}
+	return schedules.length === 1 ? schedules[0] : undefined;
+}
 
 function outcomeOf(title: string | undefined, content: string, kind: BackgroundTask["kind"] | undefined) {
 	const exitMatch = EXIT_CODE_PATTERN.exec(content);
@@ -325,39 +440,141 @@ export function deriveAgyActivity(
 					?.find((note) => note.timestampMs !== undefined && Math.abs(note.timestampMs - atMs) < 1_000);
 
 	const tasks: BackgroundTask[] = [];
+	const tasksById = new Map<string, BackgroundTask>();
 	const taskKinds = new Map<string, BackgroundTask["kind"]>();
+	const timerConditions = new Map<string, string>();
+	const finishTask = (
+		task: BackgroundTask | undefined,
+		outcome: TaskOutcome,
+		atMs: number | undefined,
+		exitCode?: number,
+	) => {
+		if (!task || task.finished) return;
+		task.finished = { outcome, exitCode, atMs };
+	};
 	let lastPlannerCalls: TranscriptToolCall[] = [];
+	let lastPlannerStepIndex: number | undefined;
 	for (const step of ordered) {
-		if (step.type === "PLANNER_RESPONSE") {
-			lastPlannerCalls = step.toolCalls;
+		if (step.type === "USER_INPUT") {
+			lastPlannerCalls = [];
+			lastPlannerStepIndex = undefined;
 			continue;
 		}
-		if (step.status !== "RUNNING") continue;
-		const idMatch = BACKGROUND_TASK_PATTERN.exec(step.content);
-		const taskId = idMatch ? shortTaskId(idMatch[1]) : undefined;
-		if (!taskId) continue;
-		const description = (TASK_DESCRIPTION_PATTERN.exec(step.content)?.[1] ?? "").trim();
-		const timer = TIMER_PATTERN.exec(description);
-		const kind: BackgroundTask["kind"] = timer ? "timer" : "command";
-		const summary = lastPlannerCalls.find(
-			(call) => call.name === "run_command" && call.args.CommandLine?.trim() === description,
-		)?.args.toolSummary;
-		const task: BackgroundTask = {
-			taskId,
-			stepIndex: step.index,
-			kind,
-			description: timer ? (timer[2] ?? "").trim() : description,
-			summary,
-			timerSeconds: timer ? Number.parseInt(timer[1], 10) : undefined,
-			startedAtMs: step.createdAtMs,
-		};
-		const end = endOf(taskId);
-		if (end) {
-			const { outcome, exitCode } = outcomeOf(end.title, end.content, kind);
-			task.finished = { outcome, title: end.title, exitCode, atMs: end.timestampMs };
+		if (step.type === "PLANNER_RESPONSE") {
+			lastPlannerCalls = step.toolCalls;
+			lastPlannerStepIndex = step.index;
+			continue;
 		}
-		taskKinds.set(taskId, kind);
-		tasks.push(task);
+		if (isMessageDelivery(step)) {
+			const header = MESSAGE_HEADER_PATTERN.exec(step.content);
+			const sender = header?.[2] ?? MESSAGE_SENDER_PATTERN.exec(step.content)?.[1];
+			if (sender) {
+				const atMs = parseTimeMs(header?.[1]) ?? step.createdAtMs;
+				const senderTaskId = shortTaskId(sender);
+				if (senderTaskId) {
+					const task = tasksById.get(senderTaskId);
+					const deliveredContent = (header?.[3] ?? "").trim();
+					if (task && !task.finished && (isTerminalNote(undefined, deliveredContent) || task.kind === "timer")) {
+						const { outcome, exitCode } = outcomeOf(undefined, deliveredContent, task.kind);
+						finishTask(task, outcome, atMs, exitCode);
+					}
+				}
+				for (const [timerId, condition] of timerConditions) {
+					if (timerId === senderTaskId) continue;
+					const timerTask = tasksById.get(timerId);
+					if (!timerTask || timerTask.finished || timerTask.stepIndex >= step.index) continue;
+					const conditionTaskId = shortTaskId(condition);
+					const matches =
+						condition === "any" ||
+						sender === condition ||
+						(conditionTaskId !== undefined && senderTaskId === conditionTaskId);
+					if (matches) {
+						finishTask(timerTask, "canceled", atMs);
+					}
+				}
+			}
+			continue;
+		}
+		if (step.status === "RUNNING") {
+			const idMatch = BACKGROUND_TASK_PATTERN.exec(step.content);
+			const taskId = idMatch ? shortTaskId(idMatch[1]) : undefined;
+			if (!taskId) continue;
+			const description = (TASK_DESCRIPTION_PATTERN.exec(step.content)?.[1] ?? "").trim();
+			const timerMatch = TIMER_PATTERN.exec(description);
+			const parsedTimerSeconds = timerMatch ? parseDurationSeconds(timerMatch[1]) : undefined;
+			const scheduleCall = timerMatch ? findScheduleCall(lastPlannerCalls, timerMatch[2]) : undefined;
+			const argSeconds = scheduleCall?.args.DurationSeconds
+				? Number.parseInt(scheduleCall.args.DurationSeconds, 10)
+				: undefined;
+			const timerSeconds =
+				parsedTimerSeconds ??
+				(argSeconds !== undefined && Number.isFinite(argSeconds) ? argSeconds : undefined);
+			const kind: BackgroundTask["kind"] = timerMatch && timerSeconds !== undefined ? "timer" : "command";
+			const summary = lastPlannerCalls.find(
+				(call) => call.name === "run_command" && call.args.CommandLine?.trim() === description,
+			)?.args.toolSummary;
+			const task: BackgroundTask = {
+				taskId,
+				stepIndex: step.index,
+				kind,
+				description: kind === "timer" ? (timerMatch?.[2] ?? "").trim() : description,
+				summary,
+				timerSeconds,
+				startedAtMs: step.createdAtMs,
+			};
+			const end = endOf(taskId);
+			if (end) {
+				const { outcome, exitCode } = outcomeOf(end.title, end.content, kind);
+				task.finished = { outcome, title: end.title, exitCode, atMs: end.timestampMs };
+			}
+			if (kind === "timer") {
+				const condition = scheduleCall?.args.TimerCondition?.trim();
+				if (condition && condition.toLowerCase() !== "never") {
+					timerConditions.set(taskId, condition);
+				}
+			}
+			taskKinds.set(taskId, kind);
+			tasksById.set(taskId, task);
+			tasks.push(task);
+			continue;
+		}
+		if (step.type !== "GENERIC") continue;
+		const manageCalls = lastPlannerCalls.filter((call) => call.name === "manage_task");
+		if (manageCalls.length === 0) continue;
+		const { body, completedAtMs } = parseStepBody(step.content);
+		const atMs = completedAtMs ?? step.createdAtMs;
+
+		const cancelled = TASK_CANCELLED_PATTERN.exec(body);
+		if (cancelled) {
+			const id = shortTaskId(cancelled[1]);
+			if (id) finishTask(tasksById.get(id), "canceled", atMs);
+			continue;
+		}
+		const notRunning = TASK_NOT_RUNNING_PATTERN.exec(body);
+		if (notRunning) {
+			const id = shortTaskId(notRunning[1]);
+			const task = id ? tasksById.get(id) : undefined;
+			if (task) finishTask(task, outcomeFromTaskStatus(notRunning[2], task.kind), atMs);
+			continue;
+		}
+		const statusMatch = TASK_STATUS_PATTERN.exec(body);
+		if (statusMatch && statusMatch[2].trim().toUpperCase() !== "RUNNING") {
+			const id = shortTaskId(statusMatch[1]);
+			const task = id ? tasksById.get(id) : undefined;
+			if (task) finishTask(task, outcomeFromTaskStatus(statusMatch[2], task.kind), atMs);
+			continue;
+		}
+		if (lastPlannerStepIndex !== undefined && manageCalls.some((call) => call.args.Action === "list")) {
+			const running = parseRunningTaskList(body);
+			if (running) {
+				for (const task of tasks) {
+					if (task.finished || task.stepIndex >= lastPlannerStepIndex) continue;
+					if (!running.has(task.taskId)) {
+						finishTask(task, task.kind === "timer" ? "canceled" : "ok", atMs);
+					}
+				}
+			}
+		}
 	}
 
 	const turns: AutonomousTurn[] = [];
@@ -541,7 +758,7 @@ export function deriveSubagentStatus(
 	const waitingFor = pending.at(-1);
 	const waitingText = waitingFor
 		? waitingFor.kind === "timer"
-			? `waiting for timer ${waitingFor.timerSeconds ?? "?"} s`
+			? `waiting for timer ${waitingFor.timerSeconds !== undefined ? formatDuration(waitingFor.timerSeconds) : "?"}`
 			: `waiting for ${waitingFor.summary ?? waitingFor.description}`
 		: undefined;
 	if (record.state === "SUBAGENT_STATE_KILLED") {

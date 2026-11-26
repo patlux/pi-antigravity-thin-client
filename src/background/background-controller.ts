@@ -15,7 +15,7 @@ import {
 	toAutonomousEntryData,
 } from "../ui/background-activity.ts";
 import { type ActivitySnapshot, AgyActivityWatcher } from "./activity-watcher.ts";
-import { type AutonomousTurn, singleLine } from "./agy-activity.ts";
+import { type AutonomousTurn, formatDuration, singleLine } from "./agy-activity.ts";
 
 function recordedStartSteps(ctx: ExtensionContext | undefined, agySessionId: string): Set<number> {
 	const steps = new Set<number>();
@@ -143,7 +143,8 @@ export class BackgroundActivityController {
 		if (context.toolName === "schedule") {
 			const timer = watcher.latestTimer();
 			if (timer) {
-				return `⏰ Timer set for ${timer.timerSeconds ?? "?"} s (${timer.taskId}). When it expires, Antigravity continues on its own.`;
+				const duration = timer.timerSeconds !== undefined ? formatDuration(timer.timerSeconds) : "?";
+				return `⏰ Timer set for ${duration} (${timer.taskId}). When it expires, Antigravity continues on its own.`;
 			}
 		}
 		return undefined;
