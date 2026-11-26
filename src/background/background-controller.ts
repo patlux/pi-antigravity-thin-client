@@ -2,8 +2,7 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AcpSessionUpdatePayload } from "../acp/protocol.ts";
 import { ANTIGRAVITY_PROVIDER_ID } from "../catalog/model-discovery.ts";
-import { resolveAgyAppDataDir } from "../config.ts";
-import type { TurnCoordinator } from "../session/turn-coordinator.ts";
+import { type BridgeConfig, resolveAgyAppDataDir } from "../config.ts";
 import type { EmptyResultContext } from "../tools/agy-mirror-tools.ts";
 import {
 	AUTONOMOUS_ENTRY_TYPE,
@@ -17,6 +16,15 @@ import {
 } from "../ui/background-activity.ts";
 import { type ActivitySnapshot, AgyActivityWatcher } from "./activity-watcher.ts";
 import { type AutonomousTurn, formatDuration, singleLine } from "./agy-activity.ts";
+
+const USAGE_FOLLOWUP_POLL_MS = 150;
+
+export interface BackgroundCoordinatorLike {
+	readonly config: BridgeConfig;
+	getActiveContext(): ExtensionContext | undefined;
+	getTelemetrySnapshot(piSessionId: string): { agySessionId?: string };
+	isAgySessionAlive(agySessionId: string): boolean;
+}
 
 function recordedStartSteps(ctx: ExtensionContext | undefined, agySessionId: string): Set<number> {
 	const steps = new Set<number>();
@@ -40,17 +48,23 @@ function recordedStartSteps(ctx: ExtensionContext | undefined, agySessionId: str
  * here is local display; nothing is sent to agy or the model.
  */
 export class BackgroundActivityController {
-	private readonly pi: ExtensionAPI;
-	private readonly coordinator: TurnCoordinator;
+	private readonly pi: Pick<ExtensionAPI, "appendEntry">;
+	private readonly coordinator: BackgroundCoordinatorLike;
 	private readonly view = new BackgroundActivityView();
 	private watcher: AgyActivityWatcher | undefined;
 	private snapshot: ActivitySnapshot | undefined;
 	private live: LiveActivity | undefined;
 	private liveExpiry: NodeJS.Timeout | undefined;
+	private usagePollTimer: NodeJS.Timeout | undefined;
 
-	constructor(pi: ExtensionAPI, coordinator: TurnCoordinator) {
+	constructor(pi: Pick<ExtensionAPI, "appendEntry">, coordinator: BackgroundCoordinatorLike) {
 		this.pi = pi;
 		this.coordinator = coordinator;
+	}
+
+	private clearUsagePollTimer(): void {
+		if (this.usagePollTimer) clearTimeout(this.usagePollTimer);
+		this.usagePollTimer = undefined;
 	}
 
 	/**
@@ -61,8 +75,22 @@ export class BackgroundActivityController {
 	 */
 	onOutOfTurnUpdate(agySessionId: string, update: AcpSessionUpdatePayload): void {
 		this.sync();
-		if (this.watcher?.agySessionId !== agySessionId) return;
+		const watcher = this.watcher;
+		if (!watcher || watcher.agySessionId !== agySessionId) return;
 		const now = Date.now();
+		if (update.sessionUpdate === "usage_update") {
+			if (!isLiveFresh(this.live, now)) return;
+			watcher.poll();
+			if (!this.live || this.watcher !== watcher) return;
+			this.clearUsagePollTimer();
+			this.usagePollTimer = setTimeout(() => {
+				this.usagePollTimer = undefined;
+				if (this.watcher !== watcher || !this.live) return;
+				watcher.poll();
+			}, USAGE_FOLLOWUP_POLL_MS);
+			this.usagePollTimer.unref?.();
+			return;
+		}
 		const live: LiveActivity = isLiveFresh(this.live, now)
 			? this.live
 			: { startedAtMs: now, lastAtMs: now, text: "", toolCalls: 0, thinking: false };
@@ -103,6 +131,7 @@ export class BackgroundActivityController {
 		this.live = undefined;
 		if (this.liveExpiry) clearTimeout(this.liveExpiry);
 		this.liveExpiry = undefined;
+		this.clearUsagePollTimer();
 		this.render();
 	}
 
@@ -187,6 +216,7 @@ export class BackgroundActivityController {
 		this.live = undefined;
 		if (this.liveExpiry) clearTimeout(this.liveExpiry);
 		this.liveExpiry = undefined;
+		this.clearUsagePollTimer();
 		this.view.clear();
 	}
 
@@ -224,6 +254,7 @@ export class BackgroundActivityController {
 			this.live = undefined;
 			if (this.liveExpiry) clearTimeout(this.liveExpiry);
 			this.liveExpiry = undefined;
+			this.clearUsagePollTimer();
 			this.render();
 		}
 		this.pi.appendEntry(AUTONOMOUS_ENTRY_TYPE, toAutonomousEntryData(agySessionId, turn));

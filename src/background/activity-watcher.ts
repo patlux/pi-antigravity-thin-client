@@ -7,12 +7,16 @@ import {
 	type BackgroundTask,
 	deriveAgyActivity,
 	deriveSubagentStatus,
+	deriveSwarmMemberStatus,
 	lastLogLine,
 	parseSubagentRecord,
+	parseSwarmMembersFile,
 	parseTaskMessage,
 	parseTranscriptLine,
 	type SubagentRecord,
 	type SubagentStatus,
+	type SwarmMemberRecord,
+	type SwarmMemberStatus,
 	type TaskMessage,
 	type TranscriptStep,
 } from "./agy-activity.ts";
@@ -20,6 +24,7 @@ import {
 /** How long a finished task stays in the snapshot so the widget can show its result. */
 const FINISHED_TASK_LINGER_MS = 8_000;
 const LOG_TAIL_BYTES = 4_096;
+const MAX_SWARM_MEMBERS_BYTES = 1024 * 1024;
 const DEFAULT_POLL_MS = 1_000;
 /** How long to wait for `transcript_full.jsonl` when a newly finished turn was truncated in `transcript.jsonl`. */
 const TRUNCATED_FULL_WAIT_MS = 2_000;
@@ -140,6 +145,8 @@ export interface ActivitySnapshot {
 	tasks: BackgroundTask[];
 	/** Working subagents and subagents that went idle or were stopped a few seconds ago. */
 	subagents?: SubagentStatus[];
+	/** Active swarm workers and workers that finished or were stopped a few seconds ago. */
+	swarmMembers?: SwarmMemberStatus[];
 	/** Last output line per running command task. */
 	logTails: Map<string, string>;
 	/** A turn agy is taking on its own right now. */
@@ -171,8 +178,9 @@ export class AgyActivityWatcher {
 	private readonly transcript: TranscriptReader;
 	private readonly messages = new Map<string, TaskMessage>();
 	private readonly subagentRecords = new Map<string, SubagentRecord>();
-	private readonly subagentReaders = new Map<string, TranscriptReader>();
-	private readonly subagentMessages = new Map<string, Map<string, TaskMessage>>();
+	private swarmRecords: SwarmMemberRecord[] = [];
+	private readonly childReaders = new Map<string, TranscriptReader>();
+	private readonly childMessages = new Map<string, Map<string, TaskMessage>>();
 	private readonly emittedTurns = new Set<number>();
 	private readonly truncatedTurnWait = new Map<number, { firstSeenAtMs: number; polls: number }>();
 	private baselineStep: number | undefined;
@@ -241,35 +249,63 @@ export class AgyActivityWatcher {
 		return this.pickRecentTask(tasks);
 	}
 
+	private readChildData(conversationId: string): { steps: TranscriptStep[]; messages: TaskMessage[] } {
+		const brainDir = path.dirname(path.dirname(this.options.systemDir));
+		let reader = this.childReaders.get(conversationId);
+		if (!reader) {
+			reader = new TranscriptReader(path.join(brainDir, conversationId, ".system_generated", "logs"));
+			this.childReaders.set(conversationId, reader);
+		}
+		let messages = this.childMessages.get(conversationId);
+		if (!messages) {
+			messages = new Map();
+			this.childMessages.set(conversationId, messages);
+		}
+		try {
+			reader.read();
+			readTaskMessages(path.join(brainDir, conversationId, ".system_generated", "messages"), messages);
+		} catch {
+			// Read again on the next poll.
+		}
+		return {
+			steps: [...reader.steps.values()],
+			messages: [...messages.values()],
+		};
+	}
+
 	/** Subagents agy started in this conversation, newest last. */
 	subagents(): SubagentStatus[] {
 		this.transcript.read();
 		this.readSubagentRecords();
 		const parentSteps = [...this.transcript.steps.values()];
-		const brainDir = path.dirname(path.dirname(this.options.systemDir));
 		const result: SubagentStatus[] = [];
 		for (const record of this.subagentRecords.values()) {
-			let reader = this.subagentReaders.get(record.conversationId);
-			if (!reader) {
-				reader = new TranscriptReader(path.join(brainDir, record.conversationId, ".system_generated", "logs"));
-				this.subagentReaders.set(record.conversationId, reader);
-			}
-			let messages = this.subagentMessages.get(record.conversationId);
-			if (!messages) {
-				messages = new Map();
-				this.subagentMessages.set(record.conversationId, messages);
-			}
-			try {
-				reader.read();
-				readTaskMessages(path.join(brainDir, record.conversationId, ".system_generated", "messages"), messages);
-			} catch {
-				// Read again on the next poll.
-			}
-			result.push(
-				deriveSubagentStatus(record, [...reader.steps.values()], parentSteps, [...messages.values()]),
-			);
+			const { steps, messages } = this.readChildData(record.conversationId);
+			result.push(deriveSubagentStatus(record, steps, parentSteps, messages));
 		}
 		return result.sort((a, b) => (a.startedAtMs ?? 0) - (b.startedAtMs ?? 0));
+	}
+
+	private deriveSwarmMembers(records: readonly SwarmMemberRecord[]): SwarmMemberStatus[] {
+		const result: SwarmMemberStatus[] = [];
+		for (const record of records) {
+			const { steps, messages } = this.readChildData(record.conversationId);
+			result.push(deriveSwarmMemberStatus(record, steps, messages));
+		}
+		return result.sort((a, b) => {
+			const rank = (state: SwarmMemberStatus["state"]): number =>
+				state === "working" ? 0 : state === "parked" ? 1 : 2;
+			const byRank = rank(a.state) - rank(b.state);
+			if (byRank !== 0) return byRank;
+			const byStart = (a.startedAtMs ?? 0) - (b.startedAtMs ?? 0);
+			if (byStart !== 0) return byStart;
+			return a.name.localeCompare(b.name);
+		});
+	}
+
+	/** Swarm workers agy started in this conversation (excluding the coordinator). */
+	swarmMembers(): SwarmMemberStatus[] {
+		return this.deriveSwarmMembers(this.readSwarmMemberRecords());
 	}
 
 	/** The subagent started for this role, newest first. */
@@ -356,9 +392,40 @@ export class AgyActivityWatcher {
 			if (!task.finished) return alive;
 			return now - (task.finished.atMs ?? 0) < FINISHED_TASK_LINGER_MS;
 		});
+		let swarmRecords: SwarmMemberRecord[] = [];
+		let swarmMembers: SwarmMemberStatus[] = [];
+		try {
+			swarmRecords = this.readSwarmMemberRecords();
+			for (const status of this.deriveSwarmMembers(swarmRecords)) {
+				const recent = status.lastAtMs !== undefined && now - status.lastAtMs < FINISHED_TASK_LINGER_MS;
+				if (status.state === "working" || status.state === "parked") {
+					if (alive) {
+						swarmMembers.push(status);
+					} else if (recent) {
+						swarmMembers.push({
+							name: status.name,
+							conversationId: status.conversationId,
+							role: status.role,
+							state: "idle",
+							...(status.model ? { model: status.model } : {}),
+							...(status.requestedModel ? { requestedModel: status.requestedModel } : {}),
+							...(status.startedAtMs !== undefined ? { startedAtMs: status.startedAtMs } : {}),
+							...(status.lastAtMs !== undefined ? { lastAtMs: status.lastAtMs } : {}),
+						});
+					}
+				} else if (recent) {
+					swarmMembers.push(status);
+				}
+			}
+		} catch {
+			swarmRecords = [];
+			swarmMembers = [];
+		}
+		const swarmConversationIds = new Set(swarmRecords.map((record) => record.conversationId));
 		let subagents: SubagentStatus[] = [];
 		try {
 			subagents = this.subagents().filter((status) => {
+				if (swarmConversationIds.has(status.conversationId)) return false;
 				if (status.state === "working") return alive;
 				return now - (status.lastAtMs ?? 0) < FINISHED_TASK_LINGER_MS;
 			});
@@ -380,6 +447,7 @@ export class AgyActivityWatcher {
 			agySessionId: this.agySessionId,
 			tasks,
 			subagents,
+			swarmMembers,
 			logTails,
 			runningTurn,
 		};
@@ -394,6 +462,15 @@ export class AgyActivityWatcher {
 				task.finished?.exitCode,
 			]),
 			subagents: subagents.map((status) => [status.conversationId, status.state, status.activity, status.model]),
+			swarmMembers: swarmMembers.map((status) => [
+				status.conversationId,
+				status.name,
+				status.role,
+				status.state,
+				status.activity,
+				status.model,
+				status.requestedModel,
+			]),
 			tails: [...logTails.entries()],
 			turn: runningTurn ? [runningTurn.startStep, runningTurn.actions.length] : undefined,
 		});
@@ -401,6 +478,35 @@ export class AgyActivityWatcher {
 		if (key === this.lastSnapshotKey) return;
 		this.lastSnapshotKey = key;
 		this.options.onSnapshot(snapshot);
+	}
+
+	private readSwarmMemberRecords(): SwarmMemberRecord[] {
+		const file = path.join(this.options.systemDir, "swarm", "members.json");
+		let stat: fs.Stats;
+		try {
+			stat = fs.statSync(file);
+		} catch {
+			this.swarmRecords = [];
+			return this.swarmRecords;
+		}
+		if (!stat.isFile() || stat.size > MAX_SWARM_MEMBERS_BYTES) {
+			this.swarmRecords = [];
+			return this.swarmRecords;
+		}
+		let raw: string;
+		try {
+			raw = fs.readFileSync(file, "utf8");
+		} catch {
+			return this.swarmRecords;
+		}
+		try {
+			JSON.parse(raw);
+		} catch {
+			// Tolerate transient partial or corrupt writes without dropping the last good roster.
+			return this.swarmRecords;
+		}
+		this.swarmRecords = parseSwarmMembersFile(raw);
+		return this.swarmRecords;
 	}
 
 	private readSubagentRecords(): void {

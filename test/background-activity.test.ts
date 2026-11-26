@@ -3,34 +3,46 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { type ActivitySnapshot, AgyActivityWatcher } from "../src/background/activity-watcher.ts";
 import {
 	type AutonomousTurn,
 	deriveAgyActivity,
 	deriveSubagentStatus,
+	deriveSwarmMemberStatus,
 	firstLine,
 	formatDuration,
 	lastLogLine,
 	parseDurationSeconds,
 	parseSubagentRecord,
+	parseSwarmMembersFile,
 	parseTaskMessage,
 	parseTranscriptLine,
 	splitAgyModel,
+	type SwarmMemberStatus,
 	type TranscriptStep,
 } from "../src/background/agy-activity.ts";
+import {
+	BackgroundActivityController,
+	type BackgroundCoordinatorLike,
+} from "../src/background/background-controller.ts";
+import { DEFAULT_BRIDGE_CONFIG } from "../src/config.ts";
 import { AgyTurnMirrorBroker, classifyAgyToolCall } from "../src/tools/agy-mirror-tools.ts";
 import { withoutTimestampHeader } from "../src/tools/agy-renderers.ts";
 import {
+	AUTONOMOUS_ENTRY_TYPE,
+	BackgroundActivityView,
 	describeTrigger,
-	LIVE_STALE_MS,
 	formatAgyModel,
+	isAutonomousEntryData,
+	LIVE_STALE_MS,
+	renderActivityLines,
+	renderAutonomousEntry,
 	senderRole,
 	setAgyModelNames,
 	subagentModelLabel,
 	subagentStartNote,
-	renderActivityLines,
-	renderAutonomousEntry,
 	type ThemeLike,
 	toAutonomousEntryData,
 } from "../src/ui/background-activity.ts";
@@ -1384,5 +1396,663 @@ describe("mirror tool cards for agy's own tools", () => {
 			},
 		]);
 		assert.equal(broker.isTracking("call_1"), false);
+	});
+});
+
+function isTestExtensionContext(value: object): value is ExtensionContext {
+	return "hasUI" in value && "cwd" in value && "ui" in value && "sessionManager" in value;
+}
+
+function createControllerUiContext(cwd: string, piSessionId: string) {
+	const widgets: Array<{ key: string; active: boolean }> = [];
+	const statuses: Array<{ key: string; text: string | undefined }> = [];
+	const notifications: Array<{ text: string; level: string }> = [];
+	const stub = {
+		hasUI: true,
+		cwd,
+		model: { provider: "antigravity", id: "gemini-4-neon" },
+		sessionManager: {
+			getSessionId: () => piSessionId,
+			getEntries: () => [],
+		},
+		ui: {
+			setWidget: (key: string, factory: unknown) => {
+				widgets.push({ key, active: factory !== undefined });
+			},
+			setStatus: (key: string, text: string | undefined) => {
+				statuses.push({ key, text });
+			},
+			notify: (text: string, level: string) => {
+				notifications.push({ text, level });
+			},
+		},
+	};
+	if (!isTestExtensionContext(stub)) {
+		throw new Error("controller UI stub incomplete");
+	}
+	return { ctx: stub, widgets, statuses, notifications };
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+describe("native agy swarm member tracking", () => {
+	it("parses members.json defensively, skipping coordinator, invalid IDs and malformed payloads", () => {
+		const raw = JSON.stringify({
+			title: "Parallel audit",
+			members: {
+				coordinator: { conversation_id: CONV, role: "coordinator", wake_mode: "mentions" },
+				"shard-1": {
+					conversation_id: "11111111-1111-1111-1111-111111111111",
+					role: "worker",
+					desired_state: "ALIVE",
+					phase: "RUNNING",
+					wake_mode: "working",
+					model: "gemini-4-neon-high",
+				},
+				verifier: {
+					conversation_id: "worker_2-abc",
+					role: "verifier",
+					wake_mode: "mentions",
+				},
+				"default-role": {
+					conversation_id: "33333333-3333-3333-3333-333333333333",
+				},
+				"bad-traversal": { conversation_id: "../escape", role: "worker" },
+				"bad-slash": { conversation_id: "foo/bar", role: "worker" },
+				"bad-space": { conversation_id: "has space", role: "worker" },
+				"missing-id": { role: "worker" },
+				"non-object": "broken",
+				"   ": { conversation_id: "44444444-4444-4444-4444-444444444444", role: "worker" },
+			},
+		});
+		assert.deepEqual(parseSwarmMembersFile(raw), [
+			{
+				name: "shard-1",
+				conversationId: "11111111-1111-1111-1111-111111111111",
+				role: "worker",
+				desiredState: "ALIVE",
+				phase: "RUNNING",
+				wakeMode: "working",
+				requestedModel: "gemini-4-neon-high",
+			},
+			{
+				name: "verifier",
+				conversationId: "worker_2-abc",
+				role: "verifier",
+				wakeMode: "mentions",
+			},
+			{
+				name: "default-role",
+				conversationId: "33333333-3333-3333-3333-333333333333",
+				role: "worker",
+			},
+		]);
+
+		assert.deepEqual(parseSwarmMembersFile(""), []);
+		assert.deepEqual(parseSwarmMembersFile("{broken json"), []);
+		assert.deepEqual(parseSwarmMembersFile("null"), []);
+		assert.deepEqual(parseSwarmMembersFile("[]"), []);
+		assert.deepEqual(parseSwarmMembersFile('"string"'), []);
+		assert.deepEqual(parseSwarmMembersFile("{}"), []);
+		assert.deepEqual(parseSwarmMembersFile(JSON.stringify({ members: [] })), []);
+	});
+
+	it("derives working, parked, idle and killed swarm member states with model, activity and timestamps", () => {
+		const line = (obj: Record<string, unknown>) => JSON.stringify(obj);
+		const workerId = "aaaa1111-1111-1111-1111-111111111111";
+		const workingSteps = steps([
+			line({
+				step_index: 0,
+				source: "SYSTEM",
+				type: "SYSTEM_MESSAGE",
+				status: "DONE",
+				created_at: "2026-11-26T21:00:00Z",
+				content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-26T21:00:00Z sender=${CONV} priority=MESSAGE_PRIORITY_HIGH content=Inspect widget\n</SYSTEM_MESSAGE>`,
+			}),
+			line({
+				step_index: 1,
+				source: "MODEL",
+				type: "PLANNER_RESPONSE",
+				status: "DONE",
+				created_at: "2026-11-26T21:00:05Z",
+				model: "gemini-4-neon-high",
+				tool_calls: [{ name: "read_file", args: { Path: "\"src/ui/background-activity.ts\"" } }],
+			}),
+		]);
+
+		const working = deriveSwarmMemberStatus(
+			{ name: "widget", conversationId: workerId, role: "worker", wakeMode: "working" },
+			workingSteps,
+			[],
+		);
+		assert.deepEqual(working, {
+			name: "widget",
+			conversationId: workerId,
+			role: "worker",
+			state: "working",
+			model: "gemini-4-neon-high",
+			activity: "→ read_file src/ui/background-activity.ts",
+			startedAtMs: Date.parse("2026-11-26T21:00:00Z"),
+			lastAtMs: Date.parse("2026-11-26T21:00:05Z"),
+		});
+
+		// Parked on mentions/anything after calling swarm_wait shows concise "waiting on board".
+		const parkedWaitSteps = steps([
+			...workingSteps.map((step) => JSON.stringify({
+				step_index: step.index,
+				source: step.source,
+				type: step.type,
+				status: step.status,
+				created_at: step.createdAtMs ? new Date(step.createdAtMs).toISOString() : undefined,
+				content: step.content,
+				model: step.model,
+			})),
+			line({
+				step_index: 2,
+				source: "MODEL",
+				type: "PLANNER_RESPONSE",
+				status: "DONE",
+				created_at: "2026-11-26T21:00:12Z",
+				model: "gemini-4-neon-high",
+				tool_calls: [
+					{ name: "post_message", args: { text: "\"@coordinator [done]\"" } },
+					{ name: "swarm_wait", args: { since: "13" } },
+				],
+			}),
+		]);
+		const parkedMentions = deriveSwarmMemberStatus(
+			{ name: "widget", conversationId: workerId, role: "worker", wakeMode: "mentions", requestedModel: "gemini-4-neon-high" },
+			parkedWaitSteps,
+			[],
+		);
+		assert.equal(parkedMentions.state, "parked");
+		assert.equal(parkedMentions.activity, "waiting on board");
+		assert.equal(parkedMentions.model, "gemini-4-neon-high");
+		assert.equal(parkedMentions.lastAtMs, Date.parse("2026-11-26T21:00:12Z"));
+
+		const parkedAnything = deriveSwarmMemberStatus(
+			{ name: "hunter", conversationId: workerId, role: "worker", wakeMode: "anything" },
+			[],
+			[],
+		);
+		assert.equal(parkedAnything.state, "parked");
+		assert.equal(parkedAnything.activity, "waiting on board");
+
+		// Completed turn without tool calls and without wake_mode is idle.
+		const doneSteps = steps([
+			line({
+				step_index: 0,
+				source: "SYSTEM",
+				type: "SYSTEM_MESSAGE",
+				status: "DONE",
+				created_at: "2026-11-26T21:00:00Z",
+				content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-26T21:00:00Z sender=${CONV} priority=HIGH content=Go\n</SYSTEM_MESSAGE>`,
+			}),
+			line({
+				step_index: 1,
+				source: "MODEL",
+				type: "PLANNER_RESPONSE",
+				status: "DONE",
+				created_at: "2026-11-26T21:00:20Z",
+				model: "gemini-3.8-flash-low",
+				content: "All checks passed.\nDetails below.",
+			}),
+		]);
+		const idle = deriveSwarmMemberStatus(
+			{ name: "checker", conversationId: workerId, role: "verifier" },
+			doneSteps,
+			[],
+		);
+		assert.equal(idle.state, "idle");
+		assert.equal(idle.model, "gemini-3.8-flash-low");
+		assert.equal(idle.activity, "All checks passed.");
+
+		// Unhandled newer inbox message wakes an idle worker back to working.
+		const wakeMsg = parseTaskMessage(
+			JSON.stringify({
+				id: "wake-1",
+				sender: CONV,
+				timestamp: "2026-11-26T21:00:25Z",
+				content: "@checker please re-check",
+			}),
+		);
+		assert.ok(wakeMsg);
+		const woken = deriveSwarmMemberStatus(
+			{ name: "checker", conversationId: workerId, role: "verifier" },
+			doneSteps,
+			[wakeMsg],
+		);
+		assert.equal(woken.state, "working");
+		assert.equal(woken.activity, "thinking …");
+		assert.equal(woken.lastAtMs, Date.parse("2026-11-26T21:00:25Z"));
+
+		// Killed has highest priority over wake_mode and running steps.
+		const killedByDesired = deriveSwarmMemberStatus(
+			{
+				name: "retired",
+				conversationId: workerId,
+				role: "worker",
+				desiredState: "KILLED",
+				wakeMode: "working",
+			},
+			workingSteps,
+			[],
+		);
+		assert.equal(killedByDesired.state, "killed");
+		assert.equal(killedByDesired.activity, "stopped");
+		assert.equal(killedByDesired.model, "gemini-4-neon-high");
+
+		const killedByPhase = deriveSwarmMemberStatus(
+			{
+				name: "retired-2",
+				conversationId: workerId,
+				role: "worker",
+				phase: "KILLED",
+				wakeMode: "mentions",
+			},
+			workingSteps,
+			[],
+		);
+		assert.equal(killedByPhase.state, "killed");
+		assert.equal(killedByPhase.activity, "stopped");
+	});
+
+	it("tracks swarm/members.json in AgyActivityWatcher, deduplicates subagents, handles !isAlive() and linger", () => {
+		const brain = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-brain-swarm-"));
+		try {
+			const wWorking = "11111111-aaaa-bbbb-cccc-000000000001";
+			const wParked = "22222222-aaaa-bbbb-cccc-000000000002";
+			const wKilled = "33333333-aaaa-bbbb-cccc-000000000003";
+			const plainSub = "44444444-aaaa-bbbb-cccc-000000000004";
+
+			const parentDir = path.join(brain, CONV, ".system_generated");
+			fs.mkdirSync(path.join(parentDir, "logs"), { recursive: true });
+			fs.mkdirSync(path.join(parentDir, "swarm"), { recursive: true });
+			fs.mkdirSync(path.join(parentDir, "subagents"), { recursive: true });
+
+			const writeChildTranscript = (id: string, lines: Record<string, unknown>[]) => {
+				const dir = path.join(brain, id, ".system_generated", "logs");
+				fs.mkdirSync(dir, { recursive: true });
+				fs.writeFileSync(path.join(dir, "transcript.jsonl"), `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`);
+			};
+
+			// Both wWorking and plainSub exist under subagents/; only plainSub should stay in snapshot.subagents.
+			fs.writeFileSync(
+				path.join(parentDir, "subagents", `${wWorking}.json`),
+				JSON.stringify({ conversationId: wWorking, subagentDescriptor: { typeName: "self", role: "Swarm Worker (builder)" }, state: "SUBAGENT_STATE_ALIVE" }),
+			);
+			fs.writeFileSync(
+				path.join(parentDir, "subagents", `${plainSub}.json`),
+				JSON.stringify({ conversationId: plainSub, subagentDescriptor: { typeName: "self", role: "Helper Subagent" }, state: "SUBAGENT_STATE_ALIVE" }),
+			);
+
+			writeChildTranscript(wWorking, [
+				{ step_index: 0, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", created_at: "2026-11-26T21:00:00Z", content: `[Message] timestamp=2026-11-26T21:00:00Z sender=${CONV} priority=HIGH content=build` },
+				{ step_index: 1, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T21:00:05Z", model: "gemini-4-neon-high", tool_calls: [{ name: "run_command", args: { CommandLine: "\"npm test\"", toolSummary: "\"Run tests\"" } }] },
+			]);
+			writeChildTranscript(wParked, [
+				{ step_index: 0, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", created_at: "2026-11-26T21:00:01Z", content: `[Message] timestamp=2026-11-26T21:00:01Z sender=${CONV} priority=HIGH content=verify` },
+				{ step_index: 1, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T21:00:04Z", model: "gemini-3.8-flash-low", tool_calls: [{ name: "swarm_wait", args: { since: "1" } }] },
+			]);
+			writeChildTranscript(wKilled, [
+				{ step_index: 0, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T21:00:02Z", content: "Stopping." },
+			]);
+			writeChildTranscript(plainSub, [
+				{ step_index: 0, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T21:00:03Z", tool_calls: [{ name: "read_file", args: { Path: "\"README.md\"" } }] },
+			]);
+
+			const membersFile = path.join(parentDir, "swarm", "members.json");
+			const writeMembers = (payload: string) => fs.writeFileSync(membersFile, payload);
+			writeMembers(
+				JSON.stringify({
+					members: {
+						coordinator: { conversation_id: CONV, role: "coordinator", wake_mode: "mentions" },
+						builder: { conversation_id: wWorking, role: "worker", wake_mode: "working" },
+						verifier: { conversation_id: wParked, role: "verifier", wake_mode: "mentions" },
+						retired: { conversation_id: wKilled, role: "worker", desired_state: "KILLED", phase: "KILLED" },
+					},
+				}),
+			);
+
+			let alive = true;
+			let now = Date.parse("2026-11-26T21:00:06Z");
+			const snapshots: ActivitySnapshot[] = [];
+			const watcher = new AgyActivityWatcher({
+				agySessionId: CONV,
+				systemDir: parentDir,
+				isAlive: () => alive,
+				onSnapshot: (snapshot) => snapshots.push(snapshot),
+				onTurnFinished: () => {},
+				now: () => now,
+			});
+
+			watcher.poll();
+			const first = snapshots.at(-1);
+			assert.ok(first);
+			assert.deepEqual(
+				first.swarmMembers?.map((m) => [m.name, m.state, m.activity]),
+				[
+					["builder", "working", "→ run_command Run tests"],
+					["verifier", "parked", "waiting on board"],
+					["retired", "killed", "stopped"],
+				],
+			);
+			assert.deepEqual(
+				first.subagents?.map((s) => s.conversationId),
+				[plainSub],
+				"swarm worker conversationId must be deduplicated out of subagents",
+			);
+
+			// Partial/corrupt write during active swarm is tolerated without losing roster.
+			writeMembers('{"members":{"builder":');
+			watcher.poll();
+			assert.equal(snapshots.length, 1, "corrupt partial write does not flap snapshot");
+
+			// Restore valid members.json and advance past linger window: killed member drops, active ones stay.
+			writeMembers(
+				JSON.stringify({
+					members: {
+						builder: { conversation_id: wWorking, role: "worker", wake_mode: "working" },
+						verifier: { conversation_id: wParked, role: "verifier", wake_mode: "mentions" },
+						retired: { conversation_id: wKilled, role: "worker", desired_state: "KILLED", phase: "KILLED" },
+					},
+				}),
+			);
+			now = Date.parse("2026-11-26T21:00:15Z");
+			watcher.poll();
+			assert.deepEqual(
+				snapshots.at(-1)?.swarmMembers?.map((m) => [m.name, m.state]),
+				[
+					["builder", "working"],
+					["verifier", "parked"],
+				],
+				"killed member drops once linger window expires",
+			);
+
+			// When !isAlive(), recent working/parked transition to idle (never stay working/parked).
+			alive = false;
+			now = Date.parse("2026-11-26T21:00:08Z");
+			watcher.poll();
+			assert.deepEqual(
+				snapshots.at(-1)?.swarmMembers?.map((m) => [m.name, m.state, m.activity]),
+				[
+					["builder", "idle", undefined],
+					["verifier", "idle", undefined],
+					["retired", "killed", "stopped"],
+				],
+			);
+
+			// Once !isAlive() AND past linger window, all stale swarm members disappear.
+			now = Date.parse("2026-11-26T21:00:25Z");
+			watcher.poll();
+			assert.deepEqual(snapshots.at(-1)?.swarmMembers, []);
+
+			// Oversized (> 1 MiB) members.json is ignored safely.
+			alive = true;
+			writeMembers(`${" ".repeat(1024 * 1024 + 16)}`);
+			assert.deepEqual(watcher.swarmMembers(), []);
+		} finally {
+			fs.rmSync(brain, { recursive: true, force: true });
+		}
+	});
+
+	it("renders swarm workers in renderActivityLines with icons, roles, single-line invariant, overflow cap and empty state", () => {
+		const now = Date.parse("2026-11-26T21:01:00Z");
+		const empty = renderActivityLines(
+			{ agySessionId: CONV, tasks: [], subagents: [], swarmMembers: [], logTails: new Map() },
+			now,
+			0,
+			plainTheme,
+		);
+		assert.deepEqual(empty, []);
+
+		const members: SwarmMemberStatus[] = [
+			{
+				name: "builder",
+				conversationId: "w-1",
+				role: "worker",
+				state: "working",
+				model: "gemini-4-neon-high",
+				activity: "→ run_command\nnpm\ttest",
+				startedAtMs: now - 15_000,
+				lastAtMs: now - 1_000,
+			},
+			{
+				name: "verifier",
+				conversationId: "w-2",
+				role: "reviewer",
+				state: "parked",
+				requestedModel: "gemini-3.8-flash-low",
+				activity: "waiting on board",
+				startedAtMs: now - 30_000,
+				lastAtMs: now - 5_000,
+			},
+			{
+				name: "finisher",
+				conversationId: "w-3",
+				role: "worker",
+				state: "idle",
+				requestedModel: "inherit",
+				activity: "All checks green",
+				startedAtMs: now - 20_000,
+				lastAtMs: now - 2_000,
+			},
+			{
+				name: "old-worker",
+				conversationId: "w-4",
+				role: "worker",
+				state: "killed",
+				startedAtMs: now - 40_000,
+				lastAtMs: now - 3_000,
+			},
+		];
+
+		const lines = renderActivityLines(
+			{ agySessionId: CONV, tasks: [], swarmMembers: members, logTails: new Map() },
+			now,
+			0,
+			plainTheme,
+		);
+		for (const line of lines) {
+			assert.doesNotMatch(line, /[\r\n\t]/, `every widget line must be a single terminal row: ${JSON.stringify(line)}`);
+		}
+		assert.deepEqual(lines, [
+			"Antigravity · 2 swarm workers",
+			" ⠋ @builder  0:15  Gemini 4 Neon · Reasoning high  → run_command npm test",
+			" ⏸ @verifier  reviewer  0:30  Gemini 3.8 Flash · Reasoning low  waiting on board",
+			" ✓ @finisher  0:18  done: All checks green",
+			" ✗ @old-worker  0:37  stopped",
+		]);
+
+		// Singular header for 1 active worker, and overflow cap at 6 lines.
+		const oneActive = renderActivityLines(
+			{ agySessionId: CONV, tasks: [], swarmMembers: [members[0]], logTails: new Map() },
+			now,
+			0,
+			plainTheme,
+		);
+		assert.equal(oneActive[0], "Antigravity · 1 swarm worker");
+
+		const eightWorkers: SwarmMemberStatus[] = Array.from({ length: 8 }, (_, idx) => ({
+			name: `shard-${idx + 1}`,
+			conversationId: `c-${idx + 1}`,
+			role: "worker",
+			state: "working",
+			activity: `task ${idx + 1}`,
+			startedAtMs: now - 10_000,
+		}));
+		const capped = renderActivityLines(
+			{ agySessionId: CONV, tasks: [], swarmMembers: eightWorkers, logTails: new Map() },
+			now,
+			0,
+			plainTheme,
+		);
+		assert.equal(capped.length, 8, "header + 6 workers + overflow line");
+		assert.equal(capped[0], "Antigravity · 8 swarm workers");
+		assert.equal(capped.at(-1), "   … 2 more swarm workers");
+
+		// BackgroundActivityView shows widget and status badge for swarm-only snapshots and clears when empty.
+		const ui = createControllerUiContext(os.tmpdir(), "pi-swarm-view");
+		const view = new BackgroundActivityView();
+		view.show(ui.ctx, { agySessionId: CONV, tasks: [], swarmMembers: [members[0], members[1]], logTails: new Map() });
+		assert.equal(ui.widgets.at(-1)?.active, true);
+		assert.equal(ui.statuses.at(-1)?.text, "agy ⏳ 2");
+		view.show(ui.ctx, { agySessionId: CONV, tasks: [], swarmMembers: [], logTails: new Map() });
+		assert.equal(ui.widgets.at(-1)?.active, false);
+		assert.equal(ui.statuses.at(-1)?.text, undefined);
+	});
+});
+
+describe("BackgroundActivityController usage_update handling", () => {
+	function setupController(root: string, agySessionId: string) {
+		const geminiDir = path.join(root, ".gemini");
+		const logsDir = path.join(geminiDir, "antigravity-cli", "brain", agySessionId, ".system_generated", "logs");
+		fs.mkdirSync(logsDir, { recursive: true });
+		const transcriptFile = path.join(logsDir, "transcript_full.jsonl");
+		const initial = [
+			{ step_index: 0, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", created_at: "2026-11-26T20:00:00Z", content: "start" },
+			{ step_index: 1, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", created_at: "2026-11-26T20:00:01Z", content: "started" },
+		];
+		fs.writeFileSync(transcriptFile, `${initial.map((l) => JSON.stringify(l)).join("\n")}\n`);
+
+		const ui = createControllerUiContext(root, "pi-usage-test");
+		const appended: Array<{ customType: string; data: unknown }> = [];
+		const pi = {
+			appendEntry: (customType: string, data?: unknown) => {
+				appended.push({ customType, data });
+			},
+		};
+		const coordinator: BackgroundCoordinatorLike = {
+			config: { ...DEFAULT_BRIDGE_CONFIG, geminiDir },
+			getActiveContext: () => ui.ctx,
+			getTelemetrySnapshot: () => ({ agySessionId }),
+			isAgySessionAlive: () => true,
+		};
+		const controller = new BackgroundActivityController(pi, coordinator);
+		return { controller, transcriptFile, ui, appended };
+	}
+
+	function appendAutonomousTurn(transcriptFile: string, agySessionId: string, startStep: number, answer: string): void {
+		const nowIso = new Date().toISOString();
+		const lines = [
+			JSON.stringify({
+				step_index: startStep,
+				source: "SYSTEM",
+				type: "SYSTEM_MESSAGE",
+				status: "DONE",
+				created_at: nowIso,
+				content: `<SYSTEM_MESSAGE>\n[Message] timestamp=${nowIso} sender=${agySessionId}/task-1 priority=MESSAGE_PRIORITY_HIGH content=done\n</SYSTEM_MESSAGE>`,
+			}),
+			JSON.stringify({
+				step_index: startStep + 1,
+				source: "MODEL",
+				type: "PLANNER_RESPONSE",
+				status: "DONE",
+				created_at: nowIso,
+				content: answer,
+			}),
+		];
+		fs.appendFileSync(transcriptFile, `${lines.join("\n")}\n`);
+	}
+
+	it("ignores idle usage_update without creating live activity", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-usage-idle-"));
+		const { controller, ui } = setupController(root, CONV);
+		try {
+			controller.sync();
+			controller.onOutOfTurnUpdate(CONV, { sessionUpdate: "usage_update", used: 1000, size: 100000 });
+			assert.equal(ui.widgets.some((entry) => entry.active), false, "idle usage_update must never open the widget");
+			assert.equal(
+				ui.statuses.some((entry) => entry.text !== undefined),
+				false,
+				"idle usage_update must never set working status badge",
+			);
+		} finally {
+			controller.stop();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("accelerates completion via immediate and 150ms follow-up poll when usage_update arrives during live activity", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-usage-fast-"));
+		const { controller, transcriptFile, ui, appended } = setupController(root, CONV);
+		try {
+			controller.sync();
+			// Case 1: transcript already flushed when usage_update arrives -> immediate poll records turn synchronously.
+			controller.onOutOfTurnUpdate(CONV, {
+				sessionUpdate: "agent_message_chunk",
+				content: { type: "text", text: "Finished first job." },
+			});
+			assert.equal(ui.statuses.at(-1)?.text, "agy ⚙ on its own");
+			appendAutonomousTurn(transcriptFile, CONV, 2, "Finished first job.");
+			controller.onOutOfTurnUpdate(CONV, { sessionUpdate: "usage_update", used: 2000, size: 100000 });
+			assert.equal(appended.length, 1, "immediate poll records flushed turn right away");
+			assert.equal(appended[0].customType, AUTONOMOUS_ENTRY_TYPE);
+			assert.ok(isAutonomousEntryData(appended[0].data));
+			assert.equal(appended[0].data.text, "Finished first job.");
+			assert.equal(ui.widgets.at(-1)?.active, false, "live widget clears immediately once card is recorded");
+
+			// Case 2: transcript flushes 40ms AFTER usage_update -> 150ms follow-up poll catches it well before 1s interval.
+			controller.onOutOfTurnUpdate(CONV, {
+				sessionUpdate: "agent_message_chunk",
+				content: { type: "text", text: "Finished second job." },
+			});
+			assert.equal(ui.statuses.at(-1)?.text, "agy ⚙ on its own");
+			controller.onOutOfTurnUpdate(CONV, { sessionUpdate: "usage_update", used: 2500, size: 100000 });
+			assert.equal(appended.length, 1, "turn not flushed yet during immediate poll");
+			await sleep(40);
+			appendAutonomousTurn(transcriptFile, CONV, 4, "Finished second job.");
+			await sleep(200);
+			assert.equal(appended.length, 2, "150ms follow-up poll records delayed flush promptly");
+			assert.ok(isAutonomousEntryData(appended[1].data));
+			assert.equal(appended[1].data.text, "Finished second job.");
+			assert.equal(ui.widgets.at(-1)?.active, false, "live widget clears after follow-up poll");
+		} finally {
+			controller.stop();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("cancels pending usage_update follow-up poll on clearLive() and stop() without leaking timers", async () => {
+		const root1 = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-usage-clear-"));
+		const first = setupController(root1, CONV);
+		try {
+			first.controller.sync();
+			// clearLive() must cancel the pending 150ms follow-up poll.
+			first.controller.onOutOfTurnUpdate(CONV, {
+				sessionUpdate: "agent_message_chunk",
+				content: { type: "text", text: "Streaming before clearLive..." },
+			});
+			first.controller.onOutOfTurnUpdate(CONV, { sessionUpdate: "usage_update", used: 2900, size: 100000 });
+			first.controller.clearLive();
+			appendAutonomousTurn(first.transcriptFile, CONV, 2, "Flushed after clearLive");
+			await sleep(250);
+			assert.equal(first.appended.length, 0, "clearLive() must cancel the 150ms follow-up poll");
+		} finally {
+			first.controller.stop();
+			fs.rmSync(root1, { recursive: true, force: true });
+		}
+
+		const root2 = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-usage-stop-"));
+		const second = setupController(root2, CONV);
+		try {
+			second.controller.sync();
+			// Re-scheduling and calling stop() must cancel the follow-up poll and stop the watcher cleanly.
+			second.controller.onOutOfTurnUpdate(CONV, {
+				sessionUpdate: "agent_message_chunk",
+				content: { type: "text", text: "Streaming..." },
+			});
+			second.controller.onOutOfTurnUpdate(CONV, { sessionUpdate: "usage_update", used: 3000, size: 100000 });
+			second.controller.onOutOfTurnUpdate(CONV, { sessionUpdate: "usage_update", used: 3100, size: 100000 });
+			second.controller.stop();
+			appendAutonomousTurn(second.transcriptFile, CONV, 2, "Flushed after stop");
+			await sleep(250);
+			assert.equal(second.appended.length, 0, "stopped controller must never poll after stop()");
+		} finally {
+			second.controller.stop();
+			fs.rmSync(root2, { recursive: true, force: true });
+		}
 	});
 });

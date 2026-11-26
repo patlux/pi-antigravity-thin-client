@@ -926,6 +926,72 @@ export interface SubagentStatus {
 	lastAtMs?: number;
 }
 
+function describePendingTask(task: BackgroundTask): string {
+	if (task.kind === "timer") {
+		return `waiting for timer ${task.timerSeconds !== undefined ? formatDuration(task.timerSeconds) : "?"}`;
+	}
+	if (task.kind === "cron") {
+		return `waiting for cron ${task.summary ?? task.description}`;
+	}
+	return `waiting for ${task.summary ?? task.description}`;
+}
+
+function summarizeToolCallsActivity(calls: readonly TranscriptToolCall[]): string {
+	const action = summarizeAction(calls[0]);
+	const more = calls.length > 1 ? ` (+${calls.length - 1})` : "";
+	return `→ ${action.name}${action.summary ? ` ${action.summary}` : ""}${more}`;
+}
+
+function latestStepModel(planners: readonly TranscriptStep[]): string | undefined {
+	return [...planners].reverse().find((step) => step.model)?.model;
+}
+
+function maxTime(a: number | undefined, b: number | undefined): number | undefined {
+	if (a === undefined) return b;
+	if (b === undefined) return a;
+	return Math.max(a, b);
+}
+
+function earliestMessageTime(messages: readonly TaskMessage[]): number | undefined {
+	let earliest: number | undefined;
+	for (const message of messages) {
+		if (message.timestampMs === undefined) continue;
+		if (earliest === undefined || message.timestampMs < earliest) {
+			earliest = message.timestampMs;
+		}
+	}
+	return earliest;
+}
+
+function latestMessageTime(messages: readonly TaskMessage[], terminalOnly = false): number | undefined {
+	let latest: number | undefined;
+	for (const message of messages) {
+		if (terminalOnly && !message.terminal) continue;
+		if (message.timestampMs === undefined) continue;
+		if (latest === undefined || message.timestampMs > latest) {
+			latest = message.timestampMs;
+		}
+	}
+	return latest;
+}
+
+function hasTrailingMessageOrInput(ordered: readonly TranscriptStep[], afterIndex: number): boolean {
+	return ordered.some(
+		(step) => step.index > afterIndex && (isMessageDelivery(step) || step.type === "USER_INPUT"),
+	);
+}
+
+function hasRunningStepFrom(ordered: readonly TranscriptStep[], fromIndex: number): boolean {
+	return ordered.some((step) => step.index >= fromIndex && step.status === "RUNNING");
+}
+
+function hasNewerNonTaskMessage(messages: readonly TaskMessage[], referenceMs: number | undefined): boolean {
+	if (referenceMs === undefined) return false;
+	return messages.some(
+		(message) => !message.taskId && message.timestampMs !== undefined && message.timestampMs > referenceMs + 1_000,
+	);
+}
+
 /**
  * Status of one subagent from its own transcript. The spawn arguments come from
  * the parent's `invoke_subagent` call, matched by role (a call may start several).
@@ -945,13 +1011,7 @@ export function deriveSubagentStatus(
 	// A timer or command it moved to the background wakes it up again later.
 	const pending = deriveAgyActivity(ordered, ownMessages).tasks.filter((task) => !task.finished);
 	const waitingFor = pending.at(-1);
-	const waitingText = waitingFor
-		? waitingFor.kind === "timer"
-			? `waiting for timer ${waitingFor.timerSeconds !== undefined ? formatDuration(waitingFor.timerSeconds) : "?"}`
-			: waitingFor.kind === "cron"
-				? `waiting for cron ${waitingFor.summary ?? waitingFor.description}`
-				: `waiting for ${waitingFor.summary ?? waitingFor.description}`
-		: undefined;
+	const waitingText = waitingFor ? describePendingTask(waitingFor) : undefined;
 	if (record.state === "SUBAGENT_STATE_KILLED") {
 		state = "killed";
 		activity = "stopped";
@@ -967,15 +1027,9 @@ export function deriveSubagentStatus(
 		} else if (last && last.index > lastPlanner.index && last.type !== "GENERIC") {
 			activity = "thinking …";
 		} else {
-			const action = summarizeAction(lastPlanner.toolCalls[0]);
-			const more = lastPlanner.toolCalls.length > 1 ? ` (+${lastPlanner.toolCalls.length - 1})` : "";
-			activity = `→ ${action.name}${action.summary ? ` ${action.summary}` : ""}${more}`;
+			activity = summarizeToolCallsActivity(lastPlanner.toolCalls);
 		}
-	} else if (
-		ordered.some(
-			(step) => step.index > lastPlanner.index && (isMessageDelivery(step) || step.type === "USER_INPUT"),
-		)
-	) {
+	} else if (hasTrailingMessageOrInput(ordered, lastPlanner.index)) {
 		// A message or prompt arrived after its last answer: it works again.
 		state = "working";
 		activity = "thinking …";
@@ -994,24 +1048,15 @@ export function deriveSubagentStatus(
 	const rawRequestedModel = spawn?.Model?.trim();
 	const inheritsParentModel = isInheritModel(rawRequestedModel);
 	const requestedModel = rawRequestedModel && !inheritsParentModel ? rawRequestedModel : undefined;
-	const ownModel = [...planners].reverse().find((step) => step.model)?.model;
+	const ownModel = latestStepModel(planners);
 	const parentModel =
 		!ownModel && (inheritsParentModel || (typeName === "self" && !rawRequestedModel))
 			? [...parentSteps]
 					.filter((step) => step.type === "PLANNER_RESPONSE" && step.model)
 					.sort((a, b) => b.index - a.index)[0]?.model
 			: undefined;
-	let latestOwnMessageMs: number | undefined;
-	for (const message of ownMessages) {
-		if (!message.terminal || message.timestampMs === undefined) continue;
-		if (latestOwnMessageMs === undefined || message.timestampMs > latestOwnMessageMs) {
-			latestOwnMessageMs = message.timestampMs;
-		}
-	}
-	const lastAtMs =
-		last?.createdAtMs !== undefined || latestOwnMessageMs !== undefined
-			? Math.max(last?.createdAtMs ?? 0, latestOwnMessageMs ?? 0)
-			: undefined;
+	const latestOwnMessageMs = latestMessageTime(ownMessages, true);
+	const lastAtMs = maxTime(last?.createdAtMs, latestOwnMessageMs);
 	return {
 		conversationId: record.conversationId,
 		role: record.role ?? spawn?.Role,
@@ -1025,6 +1070,152 @@ export function deriveSubagentStatus(
 		toolCalls: planners.reduce((sum, step) => sum + step.toolCalls.length, 0),
 		startedAtMs: ordered[0]?.createdAtMs,
 		lastAtMs,
+	};
+}
+
+const SWARM_CONVERSATION_ID_PATTERN = /^[\w-]+$/;
+const ACTIVE_SWARM_PHASES = new Set(["STARTING", "RUNNING", "WORKING"]);
+
+/** One non-coordinator entry of `<parent>/.system_generated/swarm/members.json`. */
+export interface SwarmMemberRecord {
+	name: string;
+	conversationId: string;
+	role: string;
+	desiredState?: string;
+	phase?: string;
+	wakeMode?: string;
+	requestedModel?: string;
+}
+
+export interface SwarmMemberStatus {
+	name: string;
+	conversationId: string;
+	role: string;
+	state: "working" | "parked" | "idle" | "killed";
+	model?: string;
+	requestedModel?: string;
+	activity?: string;
+	startedAtMs?: number;
+	lastAtMs?: number;
+}
+
+/** Parses `<systemDir>/swarm/members.json`, skipping coordinator and invalid entries. */
+export function parseSwarmMembersFile(raw: string): SwarmMemberRecord[] {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return [];
+	}
+	const obj = asRecord(parsed);
+	const members = asRecord(obj?.members);
+	if (!members) return [];
+	const records: SwarmMemberRecord[] = [];
+	for (const [rawName, rawEntry] of Object.entries(members)) {
+		const name = rawName.trim();
+		if (!name) continue;
+		const entry = asRecord(rawEntry);
+		if (!entry) continue;
+		const conversationId = asString(entry.conversation_id)?.trim();
+		if (!conversationId || !SWARM_CONVERSATION_ID_PATTERN.test(conversationId)) continue;
+		const role = asString(entry.role)?.trim() || "worker";
+		if (role === "coordinator") continue;
+		const desiredState = asString(entry.desired_state)?.trim() || undefined;
+		const phase = asString(entry.phase)?.trim() || undefined;
+		const wakeMode = asString(entry.wake_mode)?.trim() || undefined;
+		const requestedModel = asString(entry.model)?.trim() || undefined;
+		records.push({
+			name,
+			conversationId,
+			role,
+			...(desiredState ? { desiredState } : {}),
+			...(phase ? { phase } : {}),
+			...(wakeMode ? { wakeMode } : {}),
+			...(requestedModel ? { requestedModel } : {}),
+		});
+	}
+	return records;
+}
+
+/** Derives one swarm worker's current status from its roster entry, transcript steps and inbox messages. */
+export function deriveSwarmMemberStatus(
+	member: SwarmMemberRecord,
+	steps: readonly TranscriptStep[],
+	messages: readonly TaskMessage[] = [],
+): SwarmMemberStatus {
+	const ordered = [...steps].sort((a, b) => a.index - b.index);
+	const planners = ordered.filter((step) => step.type === "PLANNER_RESPONSE");
+	const lastPlanner = planners.at(-1);
+	const last = ordered.at(-1);
+	const pending = deriveAgyActivity(ordered, messages).tasks.filter((task) => !task.finished);
+	const waitingFor = pending.at(-1);
+	const waitingText = waitingFor ? describePendingTask(waitingFor) : undefined;
+
+	const killed = member.desiredState === "KILLED" || member.phase === "KILLED";
+	const parked = !killed && (member.wakeMode === "mentions" || member.wakeMode === "anything");
+
+	let state: SwarmMemberStatus["state"];
+	let activity: string | undefined;
+
+	if (killed) {
+		state = "killed";
+		activity = "stopped";
+	} else if (parked) {
+		state = "parked";
+		const lastAnswer =
+			lastPlanner && lastPlanner.toolCalls.length === 0 ? firstLine(lastPlanner.content) : undefined;
+		activity = waitingText ?? lastAnswer ?? "waiting on board";
+	} else if (ordered.length === 0) {
+		const starting =
+			messages.length > 0 ||
+			member.wakeMode === "working" ||
+			(member.phase !== undefined && ACTIVE_SWARM_PHASES.has(member.phase.toUpperCase()));
+		state = starting ? "working" : "idle";
+		activity = starting ? "starting …" : undefined;
+	} else if (!lastPlanner) {
+		state = "working";
+		activity = "starting …";
+	} else if (lastPlanner.toolCalls.length > 0 && !isErrorOrCanceledStepStatus(lastPlanner.status)) {
+		state = "working";
+		if (waitingFor && waitingText && waitingFor.stepIndex > lastPlanner.index) {
+			activity = waitingText;
+		} else if (last && last.index > lastPlanner.index && last.type !== "GENERIC") {
+			activity = "thinking …";
+		} else {
+			activity = summarizeToolCallsActivity(lastPlanner.toolCalls);
+		}
+	} else if (hasRunningStepFrom(ordered, lastPlanner.index)) {
+		state = "working";
+		activity = waitingText ?? "thinking …";
+	} else if (
+		hasTrailingMessageOrInput(ordered, lastPlanner.index) ||
+		hasNewerNonTaskMessage(messages, last?.createdAtMs)
+	) {
+		state = "working";
+		activity = "thinking …";
+	} else if (waitingText) {
+		state = "working";
+		activity = waitingText;
+	} else {
+		state = "idle";
+		activity = firstLine(lastPlanner.content);
+	}
+
+	const ownModel = latestStepModel(planners);
+	const requestedModel = member.requestedModel;
+	const startedAtMs = ordered[0]?.createdAtMs ?? earliestMessageTime(messages);
+	const lastAtMs = maxTime(last?.createdAtMs, latestMessageTime(messages));
+
+	return {
+		name: member.name,
+		conversationId: member.conversationId,
+		role: member.role,
+		state,
+		...(ownModel ? { model: ownModel } : {}),
+		...(requestedModel ? { requestedModel } : {}),
+		...(activity ? { activity } : {}),
+		...(startedAtMs !== undefined ? { startedAtMs } : {}),
+		...(lastAtMs !== undefined ? { lastAtMs } : {}),
 	};
 }
 

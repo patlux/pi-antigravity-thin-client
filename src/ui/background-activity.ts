@@ -8,6 +8,7 @@ import {
 	type BackgroundTask,
 	formatDuration,
 	type SubagentStatus,
+	type SwarmMemberStatus,
 	singleLine,
 	splitAgyModel,
 	type TriggerOutcome,
@@ -251,6 +252,7 @@ function taskLabel(task: BackgroundTask): string {
 }
 
 const MAX_SUBAGENT_LINES = 6;
+const MAX_SWARM_MEMBER_LINES = 6;
 
 function isInheritModel(value: string | undefined): boolean {
 	return value !== undefined && value.trim().toLowerCase() === "inherit";
@@ -323,6 +325,48 @@ function renderSubagentLine(status: SubagentStatus, now: number, spinner: string
 	return ` ${mark} ${parts.join("  ")}`;
 }
 
+function swarmMemberModelLabel(status: SwarmMemberStatus): string {
+	const model = formatAgyModel(status.model);
+	if (model) return model;
+	if (isInheritModel(status.requestedModel)) return "";
+	return formatAgyModel(status.requestedModel) ?? "";
+}
+
+function renderSwarmMemberLine(status: SwarmMemberStatus, now: number, spinner: string, theme: ThemeLike): string {
+	const mark =
+		status.state === "working"
+			? spinner
+			: status.state === "parked"
+				? theme.fg("dim", "⏸")
+				: status.state === "killed"
+					? theme.fg("error", "✗")
+					: theme.fg("success", "✓");
+	const displayName = status.name.startsWith("@") ? status.name : `@${status.name}`;
+	const roleTrimmed = status.role.trim();
+	const role = roleTrimmed && roleTrimmed.toLowerCase() !== "worker" ? roleTrimmed : "";
+	const end = status.state === "working" || status.state === "parked" ? now : (status.lastAtMs ?? now);
+	const elapsed = status.startedAtMs !== undefined ? formatElapsed(end - status.startedAtMs) : "";
+	const model = swarmMemberModelLabel(status);
+	const activity =
+		status.state === "idle"
+			? status.activity
+				? `done: ${status.activity}`
+				: "done"
+			: status.state === "killed"
+				? (status.activity ?? "stopped")
+				: status.state === "parked"
+					? (status.activity ?? "waiting on board")
+					: (status.activity ?? "");
+	const parts = [
+		theme.fg("toolTitle", displayName),
+		role ? theme.fg("muted", role) : "",
+		elapsed ? theme.fg("dim", elapsed) : "",
+		model ? theme.fg("muted", model) : "",
+		activity ? theme.fg("toolOutput", activity) : "",
+	].filter((part) => part.length > 0);
+	return ` ${mark} ${parts.join("  ")}`;
+}
+
 /** Widget lines for running background tasks and an autonomous turn in progress. */
 export function renderActivityLines(
 	snapshot: ActivityDisplay,
@@ -333,12 +377,25 @@ export function renderActivityLines(
 	const running = snapshot.tasks.filter((task) => !task.finished);
 	const subagents = snapshot.subagents ?? [];
 	const working = subagents.filter((status) => status.state === "working");
+	const swarmMembers = snapshot.swarmMembers ?? [];
+	const activeSwarm = swarmMembers.filter((status) => status.state === "working" || status.state === "parked");
 	const live = isLiveFresh(snapshot.live, now) ? snapshot.live : undefined;
-	if (snapshot.tasks.length === 0 && subagents.length === 0 && !snapshot.runningTurn && !live) return [];
+	if (
+		snapshot.tasks.length === 0 &&
+		subagents.length === 0 &&
+		swarmMembers.length === 0 &&
+		!snapshot.runningTurn &&
+		!live
+	) {
+		return [];
+	}
 	const spinner = theme.fg("accent", SPINNER[frame % SPINNER.length]);
 	const parts: string[] = [];
 	if (running.length > 0) parts.push(running.length === 1 ? "1 background task" : `${running.length} background tasks`);
 	if (working.length > 0) parts.push(working.length === 1 ? "1 subagent" : `${working.length} subagents`);
+	if (activeSwarm.length > 0) {
+		parts.push(activeSwarm.length === 1 ? "1 swarm worker" : `${activeSwarm.length} swarm workers`);
+	}
 	const header = parts.length > 0 ? ` · ${parts.join(" · ")}` : "";
 	const lines = [`${theme.fg("customMessageLabel", theme.bold("Antigravity"))}${theme.fg("muted", header)}`];
 	for (const task of snapshot.tasks) {
@@ -369,6 +426,13 @@ export function renderActivityLines(
 	}
 	if (subagents.length > MAX_SUBAGENT_LINES) {
 		lines.push(theme.fg("muted", `   … ${subagents.length - MAX_SUBAGENT_LINES} more subagents`));
+	}
+	for (const status of swarmMembers.slice(0, MAX_SWARM_MEMBER_LINES)) {
+		lines.push(renderSwarmMemberLine(status, now, spinner, theme));
+	}
+	if (swarmMembers.length > MAX_SWARM_MEMBER_LINES) {
+		const extra = swarmMembers.length - MAX_SWARM_MEMBER_LINES;
+		lines.push(theme.fg("muted", `   … ${extra} more ${extra === 1 ? "swarm worker" : "swarm workers"}`));
 	}
 	const turn = snapshot.runningTurn;
 	if (live) {
@@ -441,11 +505,14 @@ export class BackgroundActivityView {
 		this.latest = snapshot;
 		if (!ctx?.hasUI) return;
 		const subagents = snapshot.subagents ?? [];
+		const swarmMembers = snapshot.swarmMembers ?? [];
+		const activeSwarm = swarmMembers.filter((status) => status.state === "working" || status.state === "parked");
 		const running =
 			snapshot.tasks.filter((task) => !task.finished).length +
-			subagents.filter((status) => status.state === "working").length;
+			subagents.filter((status) => status.state === "working").length +
+			activeSwarm.length;
 		const working = Boolean(snapshot.runningTurn) || isLiveFresh(snapshot.live, Date.now());
-		const visible = snapshot.tasks.length > 0 || subagents.length > 0 || working;
+		const visible = snapshot.tasks.length > 0 || subagents.length > 0 || swarmMembers.length > 0 || working;
 		if (!visible) {
 			this.clear();
 			return;
