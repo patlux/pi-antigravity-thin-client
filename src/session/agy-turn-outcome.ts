@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { isRetryableAssistantError } from "@earendil-works/pi-ai";
 import type { AcpPromptStopReason } from "../acp/protocol.ts";
 import { type BridgeConfig, resolveAgyConversationsDir } from "../config.ts";
 
@@ -294,6 +295,41 @@ function extractValidationRequired(text: string): { readonly validationUrl?: str
 	return undefined;
 }
 
+const NON_RETRYABLE_BACKEND_ERROR_FALLBACK =
+	"Antigravity stopped this turn because of a backend error. Send your message again to try again.";
+
+function isPiRetryableErrorText(errorMessage: string): boolean {
+	return isRetryableAssistantError({
+		role: "assistant",
+		content: [],
+		api: "antigravity-acp",
+		provider: "antigravity",
+		model: "antigravity",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "error",
+		errorMessage,
+		timestamp: 0,
+	});
+}
+
+function toNonRetryableApiErrorMessage(rawMessage: string): string {
+	const trimmed = rawMessage.trim();
+	if (!trimmed) {
+		return "Antigravity stopped this turn because of an error.";
+	}
+	// Thin-client UX guard: keep generic upstream failures outside Pi's automatic retry
+	// classifier so Pi shows the real error instead of scheduling an auto-retry that
+	// HumanPromptGate immediately refuses.
+	return isPiRetryableErrorText(trimmed) ? NON_RETRYABLE_BACKEND_ERROR_FALLBACK : trimmed;
+}
+
 /**
  * Pure classifier for an Antigravity turn outcome from the ACP `stopReason` and
  * optional `step_type = 17` (`CORTEX_STEP_TYPE_ERROR_MESSAGE`) payload text.
@@ -369,7 +405,7 @@ export function classifyAntigravityTurnOutcome(
 		return {
 			kind: "api_error",
 			httpStatus,
-			message: apiError.message || "Antigravity stopped this turn because of an error.",
+			message: toNonRetryableApiErrorMessage(apiError.message),
 		};
 	}
 

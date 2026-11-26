@@ -722,6 +722,22 @@ describe("SQLite turn outcome classifier and watermark inspection", () => {
 		assert.equal(statusFmt.kind, "api_error");
 		assert.equal(statusFmt.httpStatus, 503);
 		assert.equal(statusFmt.message, "Backend temporarily down");
+		assert.equal(isRetryableAssistantError(makeFailedAssistant(statusFmt.message)), false);
+
+		for (const retryWordingPayload of [
+			"Error 503, Message: Service temporarily unavailable, Status: UNAVAILABLE",
+			"Error 500, Message: Internal server error, Status: INTERNAL",
+			"UNAVAILABLE (code 503): The model is overloaded right now",
+		]) {
+			const normalized = classifyAntigravityTurnOutcome("end_turn", retryWordingPayload, fixedNowMs);
+			assert.ok(normalized);
+			assert.equal(normalized.kind, "api_error");
+			assert.equal(
+				isRetryableAssistantError(makeFailedAssistant(normalized.message)),
+				false,
+				`generic API error must stay non-retryable for Pi: ${normalized.message}`,
+			);
+		}
 
 		const unrecognized = classifyAntigravityTurnOutcome("end_turn", "opaque binary blob", fixedNowMs);
 		assert.deepEqual(unrecognized, {

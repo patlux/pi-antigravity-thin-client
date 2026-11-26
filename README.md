@@ -67,7 +67,7 @@ Do not install it together with `pi-antigravity-bridge`. Both register the same 
 
 Continuing works only from the latest message. If the Antigravity conversation got further prompts after the point Pi shows (from a later message on another branch after `/tree`, a forked Pi session or another client), the package refuses the prompt: Antigravity cannot go back without rewriting its history. If the conversation is gone, it refuses too, because the only way out would be to replay Pi's history.
 
-`/agy status` shows the backend state; `/agy login` and `/agy logout` manage the Antigravity sign-in. `/agy agent-mode` switches Antigravity's own execution mode (`default`, `accept-edits`, `plan`).
+`/agy status` shows the backend state; `/agy login` and `/agy logout` manage the Antigravity sign-in. `/agy agent-mode` switches Antigravity's own execution mode (`default`, `accept-edits`, `plan`, `auto`).
 
 There is no way to use anything but Antigravity's own tools: upstream's `/agy mode` and `/agy bridge` do not exist here, and its tool-mode and bridge settings (`toolMode`, `bridgePiMcp`, `bridgePiSkills`, `bridgePiAgentsMd` in `antigravity.json`, `PI_AGY_TOOL_MODE`, `PI_AGY_BRIDGE_*`) are ignored.
 
