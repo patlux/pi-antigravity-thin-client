@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Box, type Component, Spacer, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { Box, type Component, Container, Spacer, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import type { ActivitySnapshot } from "../background/activity-watcher.ts";
 import {
 	type AutonomousAction,
@@ -187,8 +187,9 @@ export function describeTrigger(trigger: AutonomousTrigger, theme: ThemeLike): s
 }
 
 /**
- * Card for a turn agy took on its own: header, what woke it up, its answer, and
- * its tool calls when expanded.
+ * Card for a turn agy took on its own: a box with the header, what woke it up and
+ * its tool calls (listed when expanded), then its answer below the box like an
+ * assistant message. `renderText` sets the answer's padding.
  */
 export function renderAutonomousEntry(
 	data: AutonomousEntryData,
@@ -210,10 +211,6 @@ export function renderAutonomousEntry(
 	for (const trigger of data.triggers) {
 		box.addChild(new Text(describeTrigger(trigger, theme), 0, 0));
 	}
-	if (data.text.trim()) {
-		box.addChild(new Spacer(1));
-		box.addChild(renderText(data.text));
-	}
 	if (data.actions.length > 0) {
 		const shown = expanded ? data.actions : [];
 		const lines = shown.map(
@@ -229,7 +226,12 @@ export function renderAutonomousEntry(
 	if (data.state === "interrupted") {
 		box.addChild(new Text(theme.fg("warning", "Interrupted by your message; the rest is in the conversation."), 0, 0));
 	}
-	return box;
+	if (!data.text.trim()) return box;
+	const card = new Container();
+	card.addChild(box);
+	card.addChild(new Spacer(1));
+	card.addChild(renderText(data.text));
+	return card;
 }
 
 function taskLabel(task: BackgroundTask): string {

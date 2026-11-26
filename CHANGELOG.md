@@ -8,6 +8,10 @@ Fork releases of pi-antigravity-thin-client. The upstream changelog of pi-antigr
 
 - Long answers in the "Antigravity · on its own" card showed `<truncated N bytes>` and lost their middle part. `agy` cuts fields of more than about 4 KB in `transcript.jsonl` and writes them whole only to `transcript_full.jsonl`; the package now reads `transcript_full.jsonl` and falls back to `transcript.jsonl` only when the full file is missing. This also keeps long command lines of background tasks whole. Cards recorded before this fix keep their cut text.
 
+### Changed
+
+- The answer of a turn Antigravity took on its own now stands below the "Antigravity · on its own" card, padded like any other answer, instead of inside the card's background. The card keeps the header, what woke Antigravity, the tool calls and the interruption note.
+
 ## 0.2.3 - 2026-11-26
 
 Upstream base: pi-antigravity-bridge 0.1.16.

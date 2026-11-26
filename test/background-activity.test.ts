@@ -743,6 +743,20 @@ describe("background activity display", () => {
 		assert.match(collapsed, /Ausgabe: fertig/);
 		assert.match(collapsed, /1 tool call/);
 		assert.doesNotMatch(collapsed, /echo hi/);
+
+		// The answer stands below the box, outside its background.
+		const boxedTheme: ThemeLike = { ...plainTheme, bg: (_color, text) => `«${text}»` };
+		const lines = renderAutonomousEntry(data, false, boxedTheme, (text) => new Text(text, 1, 0)).render(120);
+		const answerRow = lines.findIndex((line) => line.includes("Ausgabe: fertig"));
+		const toolRow = lines.findIndex((line) => line.includes("1 tool call"));
+		assert.ok(toolRow >= 0 && answerRow > toolRow, JSON.stringify(lines));
+		assert.ok(lines[toolRow].startsWith("«"), "tool calls stay in the box");
+		assert.ok(!lines[answerRow].includes("«"), "the answer has no box background");
+		assert.ok(lines.slice(0, toolRow + 1).every((line) => line.startsWith("«")));
+
+		// Without an answer the card is the box alone.
+		const silent = renderAutonomousEntry({ ...data, text: "" }, false, boxedTheme, (text) => new Text(text, 1, 0)).render(120);
+		assert.ok(silent.every((line) => line.startsWith("«")), JSON.stringify(silent));
 		const expanded = renderAutonomousEntry(data, true, plainTheme, (text) => new Text(text, 0, 0)).render(80).join("\n");
 		assert.match(expanded, /→ run_command echo hi/);
 	});

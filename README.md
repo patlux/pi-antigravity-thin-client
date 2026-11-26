@@ -85,11 +85,11 @@ Antigravity moves long commands and `schedule` timers into background tasks. A w
 
 ### Turns Antigravity takes on its own
 
-When a background task, a timer or a subagent finishes, Antigravity wakes up and continues without a prompt from Pi. The widget shows such a turn live (current tool, last line of the answer). When it ends, a card "Antigravity · on its own" shows what woke Antigravity, the model of that turn and its answer. The card is stored in the Pi session but is never sent to a model.
+When a background task, a timer or a subagent finishes, Antigravity wakes up and continues without a prompt from Pi. The widget shows such a turn live (current tool, last line of the answer). When it ends, a card "Antigravity · on its own" shows what woke Antigravity, the model of that turn and its tool calls; the answer follows below the card like any other answer. The card is stored in the Pi session but is never sent to a model.
 
 ![Antigravity continues on its own after the background task finished: the widget shows the tool it runs](https://raw.githubusercontent.com/patlux/pi-antigravity-thin-client/main/assets/screenshots/own-turn-live.png)
 
-![The card for the finished turn names the finished task, the model and Antigravity's answer](https://raw.githubusercontent.com/patlux/pi-antigravity-thin-client/main/assets/screenshots/own-turn-card.png)
+![The card for the finished turn names the finished task and the model; Antigravity's answer follows below it](https://raw.githubusercontent.com/patlux/pi-antigravity-thin-client/main/assets/screenshots/own-turn-card.png)
 
 ### Subagents
 

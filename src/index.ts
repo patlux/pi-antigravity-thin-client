@@ -240,7 +240,8 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 			entry.data,
 			options.expanded,
 			theme,
-			(text) => new Markdown(text, 0, 0, getMarkdownTheme()),
+			// Below the box, padded like an assistant message.
+			(text) => new Markdown(text, 1, 0, getMarkdownTheme()),
 			options.keyHint("app.tools.expand", "to expand"),
 		);
 	});
