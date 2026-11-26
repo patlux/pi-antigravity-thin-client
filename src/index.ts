@@ -276,6 +276,9 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 		processManager,
 		coordinator,
 		onRefreshProviderModels: refreshAndReRegisterModels,
+		onLogout: () => {
+			background.stop();
+		},
 	});
 
 	// 4. 注册可选的反向 AGY Skills 发现钩子
@@ -293,7 +296,25 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 	});
 
 	// 5. 会话生命周期与状态栏同步钩子
-	pi.on("session_start", (_event, ctx) => {
+	let activePiSessionId: string | undefined;
+
+	pi.on("session_start", async (_event, ctx) => {
+		let nextPiSessionId: string | undefined;
+		try {
+			nextPiSessionId = ctx.sessionManager?.getSessionId?.();
+		} catch {
+			nextPiSessionId = undefined;
+		}
+		const previousPiSessionId =
+			activePiSessionId && activePiSessionId !== nextPiSessionId ? activePiSessionId : undefined;
+		activePiSessionId = nextPiSessionId;
+
+		let invalidatePrevious: Promise<void> | undefined;
+		if (previousPiSessionId) {
+			background.stop();
+			invalidatePrevious = coordinator.invalidatePiSession(previousPiSessionId).catch(() => {});
+		}
+
 		currentConfig = loadBridgeConfig({
 			cwd: ctx.cwd,
 			isProjectTrusted: ctx.isProjectTrusted(),
@@ -301,17 +322,24 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 		coordinator.setConfig(currentConfig);
 		coordinator.setActiveContext(ctx);
 		toolActivation.syncForContext(ctx, currentConfig);
+		background.sync(ctx);
 
-		// 若首次加载尚无本地缓存快照或缓存已超过 6 小时，复用内置 Singleflight 后台静默探测一次最新模型目录
-		const diskCache = readCachedCatalog();
-		const isCacheStale =
-			!diskCache ||
-			typeof diskCache.updatedAt !== "number" ||
-			Date.now() - diskCache.updatedAt > MODEL_CACHE_STALE_MS;
-		if (isCacheStale) {
-			backgroundRefreshController?.abort();
-			backgroundRefreshController = new AbortController();
-			void refreshAndReRegisterModels(ctx, backgroundRefreshController.signal).catch(() => {});
+		if (invalidatePrevious) {
+			await invalidatePrevious;
+		}
+
+		// Only refresh a stale catalog in interactive UI sessions; headless runs must never spawn agy acp on startup.
+		if (ctx.hasUI) {
+			const diskCache = readCachedCatalog();
+			const isCacheStale =
+				!diskCache ||
+				typeof diskCache.updatedAt !== "number" ||
+				Date.now() - diskCache.updatedAt > MODEL_CACHE_STALE_MS;
+			if (isCacheStale) {
+				backgroundRefreshController?.abort();
+				backgroundRefreshController = new AbortController();
+				refreshAndReRegisterModels(ctx, backgroundRefreshController.signal).catch(() => {});
+			}
 		}
 	});
 
@@ -329,12 +357,14 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 	pi.on("model_select", (_event, ctx) => {
 		coordinator.setActiveContext(ctx);
 		toolActivation.syncForContext(ctx, coordinator.config);
+		background.sync(ctx);
 		updateAntigravityStatusBar(ctx, coordinator.config, coordinator.getTelemetrySnapshot());
 	});
 
 	pi.on("before_agent_start", (_event, ctx) => {
 		coordinator.setActiveContext(ctx);
 		toolActivation.syncForContext(ctx, coordinator.config);
+		background.clearLive();
 	});
 
 	pi.on("turn_end", async (event: TurnEndEvent, ctx) => {
@@ -369,16 +399,19 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_compact", async (_event, ctx) => {
 		// 上下文压缩完成后关闭旧 ACP 会话，使下一轮请求自动携带压缩摘要开启轻装新会话
+		background.stop();
 		await coordinator.invalidatePiSession(ctx.sessionManager.getSessionId());
 		updateAntigravityStatusBar(ctx, coordinator.config, coordinator.getTelemetrySnapshot());
 	});
 
 	pi.on("session_tree", (_event, ctx) => {
 		coordinator.setActiveContext(ctx);
+		background.sync(ctx);
 		updateAntigravityStatusBar(ctx, coordinator.config, coordinator.getTelemetrySnapshot());
 	});
 
 	pi.on("session_shutdown", async () => {
+		activePiSessionId = undefined;
 		background.stop();
 		backgroundRefreshController?.abort();
 		backgroundRefreshController = undefined;

@@ -20,6 +20,7 @@ import type {
 	AcpSessionListResult,
 	AcpSessionLoadResult,
 	AcpSessionSummary,
+	AcpToolCallContentItem,
 } from "../acp/protocol.ts";
 import {
 	ANTIGRAVITY_API_ID,
@@ -33,7 +34,11 @@ import {
 	type ToolMode,
 } from "../config.ts";
 import { isPiMcpRelatedTool } from "../mcp/pi-mcp-forwarder.ts";
-import { AGY_SESSION_ANCHOR_CUSTOM_TYPE, type AgySessionAnchor } from "../session/checkpoint-sync.ts";
+import {
+	AGY_SESSION_ANCHOR_CUSTOM_TYPE,
+	type AgySessionAnchor,
+	captureSqliteCheckpoint,
+} from "../session/checkpoint-sync.ts";
 import { computeTranscriptDigest } from "../session/reconcile.ts";
 import type { TurnCoordinator } from "../session/turn-coordinator.ts";
 import { createZeroUsage } from "../stream/event-mapper.ts";
@@ -191,6 +196,7 @@ export interface CommandDependencies {
 	processManager: AcpProcessManager;
 	coordinator: TurnCoordinator;
 	onRefreshProviderModels: (ctx: ExtensionContext) => Promise<number>;
+	onLogout?: () => void;
 }
 
 /** `/agy mode` and `/agy bridge` of upstream: switching away from agy-tools does not exist here. */
@@ -232,7 +238,7 @@ function buildCompletions(prefix: string): AutocompleteItem[] | null {
 
 /** 注册统一的 `/agy` 斜杠命令入口 */
 export function registerAntigravityCommands(deps: CommandDependencies): void {
-	const { pi, processManager, coordinator, onRefreshProviderModels } = deps;
+	const { pi, processManager, coordinator, onRefreshProviderModels, onLogout } = deps;
 
 	pi.registerCommand("agy", {
 		description: "Antigravity: status, agy execution mode, model refresh, sessions, login",
@@ -278,7 +284,7 @@ export function registerAntigravityCommands(deps: CommandDependencies): void {
 					return;
 				}
 				case "logout": {
-					await handleLogoutSubcommand(ctx, processManager, coordinator);
+					await handleLogoutSubcommand(ctx, processManager, coordinator, onLogout);
 					return;
 				}
 				case "sessions":
@@ -410,8 +416,15 @@ async function handleLoginSubcommand(
 		});
 
 		if (exitStatus === 0) {
-			const count = await onRefreshProviderModels(ctx);
-			ctx.ui.notify(`Signed in; ${count} models loaded.`, "info");
+			try {
+				const count = await onRefreshProviderModels(ctx);
+				ctx.ui.notify(`Signed in; ${count} models loaded.`, "info");
+			} catch (error) {
+				ctx.ui.notify(
+					`Signed in, but model reload failed: ${error instanceof Error ? error.message : String(error)}`,
+					"error",
+				);
+			}
 		} else {
 			ctx.ui.notify("The sign-in did not complete. You can also run `agy acp --login` in a separate terminal and then `/agy refresh`.", "warning");
 		}
@@ -425,10 +438,12 @@ async function handleLogoutSubcommand(
 	ctx: ExtensionCommandContext,
 	processManager: AcpProcessManager,
 	coordinator: TurnCoordinator,
+	onLogout?: () => void,
 ): Promise<void> {
 	try {
 		const conn = await processManager.acquire(coordinator.config);
 		await conn.request("auth/logout", {}, { timeoutMs: 10_000 });
+		onLogout?.();
 		await coordinator.dispose();
 		ctx.ui.notify("Signed out of Antigravity.", "info");
 	} catch (error) {
@@ -437,6 +452,37 @@ async function handleLogoutSubcommand(
 			"error",
 		);
 	}
+}
+
+function extractReplayedToolOutput(
+	content: readonly AcpToolCallContentItem[] | undefined,
+	rawOutput: unknown,
+): Array<TextContent | ImageContent> {
+	if (content && content.length > 0) {
+		const blocks: Array<TextContent | ImageContent> = [];
+		for (const item of content) {
+			if (item.type === "content") {
+				if (item.content.type === "text") {
+					blocks.push({ type: "text", text: item.content.text });
+				} else if (item.content.type === "image") {
+					blocks.push({
+						type: "image",
+						data: item.content.data,
+						mimeType: item.content.mimeType,
+					});
+				}
+			} else if (item.type === "diff") {
+				blocks.push({ type: "text", text: `Updated ${item.path}` });
+			}
+		}
+		if (blocks.length > 0) {
+			return blocks;
+		}
+	}
+	if (typeof rawOutput === "string" && rawOutput.trim().length > 0) {
+		return [{ type: "text", text: rawOutput }];
+	}
+	return [];
 }
 
 async function handleSessionsImportSubcommand(
@@ -449,12 +495,22 @@ async function handleSessionsImportSubcommand(
 		return;
 	}
 
-	const conn = await processManager.acquire(coordinator.config);
-	const listRes = await conn.request<AcpSessionListResult>(
-		"session/list",
-		{ cwd: ctx.cwd },
-		{ timeoutMs: 15_000 },
-	);
+	let conn: Awaited<ReturnType<AcpProcessManager["acquire"]>>;
+	let listRes: AcpSessionListResult;
+	try {
+		conn = await processManager.acquire(coordinator.config);
+		listRes = await conn.request<AcpSessionListResult>(
+			"session/list",
+			{ cwd: ctx.cwd },
+			{ timeoutMs: 15_000 },
+		);
+	} catch (error) {
+		ctx.ui.notify(
+			`Failed to list Antigravity sessions: ${error instanceof Error ? error.message : String(error)}`,
+			"error",
+		);
+		return;
+	}
 
 	const sessions: AcpSessionSummary[] = listRes.sessions ?? [];
 	if (sessions.length === 0) {
@@ -474,6 +530,21 @@ async function handleSessionsImportSubcommand(
 
 	const idx = labels.indexOf(pickedLabel);
 	const target = topSessions[idx >= 0 ? idx : 0];
+
+	// If the current Pi session already holds an active ledger for this agy session,
+	// tear it down first so session/load's auxiliary listener and closeSessionSafe do
+	// not hijack or close an active ledger behind its back.
+	if (coordinator.getTelemetrySnapshot().agySessionId === target.sessionId) {
+		try {
+			await coordinator.invalidatePiSession();
+		} catch (error) {
+			ctx.ui.notify(
+				`Failed to close active session before import: ${error instanceof Error ? error.message : String(error)}`,
+				"error",
+			);
+			return;
+		}
+	}
 
 	// 通过 session/load 收集回放事件流并组装为标准 Pi 消息序列（保留文本、思考与历史工具记录）
 	const replayedMessages: Array<UserMessage | AssistantMessage | ToolResultMessage> = [];
@@ -588,7 +659,7 @@ async function handleSessionsImportSubcommand(
 			pendingToolCallIds.push(update.toolCallId);
 			replayedToolResults.set(update.toolCallId, {
 				toolName: classified.mirrorToolName,
-				content: [],
+				content: extractReplayedToolOutput(update.content, update.rawOutput),
 				isError: update.status === "failed",
 			});
 			return;
@@ -600,28 +671,9 @@ async function handleSessionsImportSubcommand(
 			if (update.status === "failed") {
 				entry.isError = true;
 			}
-			if (update.content && update.content.length > 0) {
-				const blocks: Array<TextContent | ImageContent> = [];
-				for (const item of update.content) {
-					if (item.type === "content") {
-						if (item.content.type === "text") {
-							blocks.push({ type: "text", text: item.content.text });
-						} else if (item.content.type === "image") {
-							blocks.push({
-								type: "image",
-								data: item.content.data,
-								mimeType: item.content.mimeType,
-							});
-						}
-					} else if (item.type === "diff") {
-						blocks.push({ type: "text", text: `Updated ${item.path}` });
-					}
-				}
-				if (blocks.length > 0) {
-					entry.content = blocks;
-				}
-			} else if (typeof update.rawOutput === "string" && update.rawOutput.trim().length > 0) {
-				entry.content = [{ type: "text", text: update.rawOutput }];
+			const nextContent = extractReplayedToolOutput(update.content, update.rawOutput);
+			if (nextContent.length > 0) {
+				entry.content = nextContent;
 			}
 		}
 	});
@@ -638,11 +690,38 @@ async function handleSessionsImportSubcommand(
 		);
 		flushUser();
 		flushAssistant(pendingToolCallIds.length > 0 ? "toolUse" : "stop");
+	} catch (error) {
+		ctx.ui.notify(
+			`Failed to load Antigravity session: ${error instanceof Error ? error.message : String(error)}`,
+			"error",
+		);
+		return;
 	} finally {
 		unsubscribe();
-		await conn.closeSessionSafe(target.sessionId);
+		await conn.closeSessionSafe(target.sessionId).catch(() => {});
 	}
 
+	let droppedTrailingUsers = 0;
+	while (
+		replayedMessages.length > 0 &&
+		replayedMessages[replayedMessages.length - 1].role === "user"
+	) {
+		replayedMessages.pop();
+		droppedTrailingUsers++;
+	}
+
+	const sessionLabel = target.title?.trim() || target.sessionId.slice(0, 8);
+	if (replayedMessages.length === 0) {
+		ctx.ui.notify(
+			droppedTrailingUsers > 0
+				? `Cannot import session "${sessionLabel}": it contains only ${droppedTrailingUsers} unanswered user ${droppedTrailingUsers === 1 ? "message" : "messages"} and no completed turns.`
+				: `Cannot import session "${sessionLabel}": it has no messages to import.`,
+			"warning",
+		);
+		return;
+	}
+
+	const dbCheckpoint = await captureSqliteCheckpoint(coordinator.config, target.sessionId);
 	const importedAnchor: AgySessionAnchor = {
 		version: 1,
 		agySessionId: target.sessionId,
@@ -652,28 +731,40 @@ async function handleSessionsImportSubcommand(
 		mountDigest: "",
 		toolsDigest: "",
 		importedRaw: true,
+		...(dbCheckpoint ? { dbCheckpoint } : {}),
 	};
 
-	await ctx.newSession({
-		setup: async (sessionManager) => {
-			for (const msg of replayedMessages) {
-				sessionManager.appendMessage(msg);
-			}
-			if (target.title?.trim()) {
-				sessionManager.appendSessionInfo(target.title.trim());
-			}
-			// 直接在 setup 阶段通过新会话自身的 sessionManager 写入恢复锚点，避免旧扩展闭包因 session 替换失效
-			sessionManager.appendCustomEntry(AGY_SESSION_ANCHOR_CUSTOM_TYPE, importedAnchor);
-		},
-		withSession: async (replacedCtx) => {
-			const modelHint =
-				replacedCtx.model?.provider !== ANTIGRAVITY_PROVIDER_ID
-					? " The current model is not an Antigravity model; select an `antigravity/…` model with `/model` to continue this conversation."
-					: "";
-			replacedCtx.ui.notify(
-				`Imported session "${target.title || target.sessionId.slice(0, 8)}" (${replayedMessages.length} messages).${modelHint}`,
-				"info",
-			);
-		},
-	});
+	try {
+		await ctx.newSession({
+			setup: async (sessionManager) => {
+				for (const msg of replayedMessages) {
+					sessionManager.appendMessage(msg);
+				}
+				if (target.title?.trim()) {
+					sessionManager.appendSessionInfo(target.title.trim());
+				}
+				// 直接在 setup 阶段通过新会话自身的 sessionManager 写入恢复锚点，避免旧扩展闭包因 session 替换失效
+				sessionManager.appendCustomEntry(AGY_SESSION_ANCHOR_CUSTOM_TYPE, importedAnchor);
+			},
+			withSession: async (replacedCtx) => {
+				const modelHint =
+					replacedCtx.model?.provider !== ANTIGRAVITY_PROVIDER_ID
+						? " The current model is not an Antigravity model; select an `antigravity/…` model with `/model` to continue this conversation."
+						: "";
+				const skippedNote =
+					droppedTrailingUsers > 0
+						? `; skipped ${droppedTrailingUsers} unanswered trailing user ${droppedTrailingUsers === 1 ? "message" : "messages"}`
+						: "";
+				replacedCtx.ui.notify(
+					`Imported session "${target.title || target.sessionId.slice(0, 8)}" (${replayedMessages.length} messages${skippedNote}).${modelHint}`,
+					"info",
+				);
+			},
+		});
+	} catch (error) {
+		ctx.ui.notify(
+			`Failed to create imported Pi session: ${error instanceof Error ? error.message : String(error)}`,
+			"error",
+		);
+	}
 }

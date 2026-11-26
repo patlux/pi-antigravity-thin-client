@@ -33,6 +33,19 @@ function isCommandContext(value: object): value is ExtensionCommandContext {
 	return "hasUI" in value && "ui" in value && "cwd" in value;
 }
 
+function writeStubAgyScript(dir: string, name: string, source: string): string {
+	if (process.platform === "win32") {
+		const script = path.join(dir, `${name}.mjs`);
+		fs.writeFileSync(script, source);
+		const wrapper = path.join(dir, `${name}.cmd`);
+		fs.writeFileSync(wrapper, `@node "${script}" %*\r\n`);
+		return wrapper;
+	}
+	const script = path.join(dir, name);
+	fs.writeFileSync(script, `#!/usr/bin/env node\n${source}`, { mode: 0o755 });
+	return script;
+}
+
 function stubPi(recorder: Recorder): ExtensionAPI {
 	const stub = {
 		appendEntry() {},
@@ -57,9 +70,18 @@ function stubPi(recorder: Recorder): ExtensionAPI {
 	return stub;
 }
 
-function stubContext(recorder: Recorder, cwd: string): ExtensionCommandContext {
+function stubContext(
+	recorder: Recorder,
+	cwd: string,
+	options?: {
+		mode?: "tui" | "rpc" | "json" | "print";
+		confirmResult?: boolean;
+		selectResult?: string | undefined;
+	},
+): ExtensionCommandContext {
 	const stub = {
 		hasUI: true,
+		mode: options?.mode ?? "tui",
 		cwd,
 		model: { provider: "antigravity", id: "gemini-4-neon" },
 		isProjectTrusted: () => false,
@@ -70,8 +92,35 @@ function stubContext(recorder: Recorder, cwd: string): ExtensionCommandContext {
 			setStatus(key: string, text: string | undefined) {
 				recorder.statuses.push({ key, text });
 			},
-			async select() {
-				return undefined;
+			async select(_title: string, items: string[]) {
+				return options?.selectResult !== undefined ? options.selectResult : items[0];
+			},
+			async confirm() {
+				return options?.confirmResult ?? true;
+			},
+			custom<T>(
+				factory: (
+					tui: { stop(): void; start(): void; requestRender(force?: boolean): void },
+					theme: Record<string, never>,
+					kb: Record<string, never>,
+					done: (result: T) => void,
+				) => unknown,
+			): Promise<T> {
+				return new Promise<T>((resolve, reject) => {
+					let resolved = false;
+					factory(
+						{ stop() {}, start() {}, requestRender() {} },
+						{},
+						{},
+						(result) => {
+							resolved = true;
+							resolve(result);
+						},
+					);
+					if (!resolved) {
+						reject(new Error("custom UI factory did not call done()"));
+					}
+				});
 			},
 		},
 	};
@@ -81,6 +130,16 @@ function stubContext(recorder: Recorder, cwd: string): ExtensionCommandContext {
 
 async function withAgyCommand(
 	fn: (run: (args: string) => Promise<void>, agy: CommandOptions, recorder: Recorder, agentDir: string) => Promise<void>,
+	options?: {
+		agyBinFactory?: (root: string) => string;
+		onRefreshProviderModels?: (ctx: ExtensionContext) => Promise<number>;
+		onLogout?: () => void;
+		ctxOptions?: {
+			mode?: "tui" | "rpc" | "json" | "print";
+			confirmResult?: boolean;
+			selectResult?: string | undefined;
+		};
+	},
 ): Promise<void> {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-command-"));
 	const agentDir = path.join(root, "agent");
@@ -88,21 +147,26 @@ async function withAgyCommand(
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	const recorder: Recorder = { commands: new Map(), activeToolChanges: [], notes: [], statuses: [] };
 	const pi = stubPi(recorder);
-	const coordinator = new TurnCoordinator(pi, new AcpProcessManager(), new AgyTurnMirrorBroker(), {
+	const agyBin =
+		options?.agyBinFactory?.(root) ??
+		writeStubAgyScript(root, "mock-agy-noop", "process.exit(1);\n");
+	const processManager = new AcpProcessManager();
+	const coordinator = new TurnCoordinator(pi, processManager, new AgyTurnMirrorBroker(), {
 		...DEFAULT_BRIDGE_CONFIG,
-		agyBin: path.join(root, "no-agy"),
+		agyBin,
 		geminiDir: path.join(root, ".gemini"),
 	});
 	try {
 		registerAntigravityCommands({
 			pi,
-			processManager: new AcpProcessManager(),
+			processManager,
 			coordinator,
-			onRefreshProviderModels: async () => 0,
+			onRefreshProviderModels: options?.onRefreshProviderModels ?? (async () => 0),
+			onLogout: options?.onLogout,
 		});
 		const agy = recorder.commands.get("agy");
 		assert.ok(agy, "/agy is registered");
-		const ctx = stubContext(recorder, root);
+		const ctx = stubContext(recorder, root, options?.ctxOptions);
 		await fn((args) => agy.handler(args, ctx), agy, recorder, agentDir);
 		assert.equal(coordinator.config.toolMode, "agy-tools");
 		assert.equal(coordinator.config.bridgePiMcp, false);
@@ -138,6 +202,129 @@ describe("/agy command in the thin client", () => {
 			});
 		});
 	}
+
+	it("/agy login reports refresh failures via ui.notify instead of throwing", async () => {
+		await withAgyCommand(
+			async (run, _agy, recorder) => {
+				await run("login");
+				assert.equal(recorder.notes.length, 1);
+				assert.equal(recorder.notes[0].level, "error");
+				assert.match(recorder.notes[0].message, /Signed in, but model reload failed: catalog offline/);
+			},
+			{
+				agyBinFactory: (root) => writeStubAgyScript(root, "mock-agy-login", "process.exit(0);\n"),
+				onRefreshProviderModels: async () => {
+					throw new Error("catalog offline");
+				},
+			},
+		);
+	});
+
+	it("/agy logout invokes onLogout callback after auth/logout succeeds", async () => {
+		let logoutCalls = 0;
+		const rpcMock = `
+import * as readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+rl.on("line", (line) => {
+	if (!line.trim()) return;
+	const msg = JSON.parse(line);
+	if (msg.method === "initialize") {
+		send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { auth: { logout: {} } } } });
+	} else if (msg.method === "auth/logout") {
+		send({ jsonrpc: "2.0", id: msg.id, result: {} });
+	} else if (msg.id !== undefined) {
+		send({ jsonrpc: "2.0", id: msg.id, result: {} });
+	}
+});
+`;
+		await withAgyCommand(
+			async (run, _agy, recorder) => {
+				await run("logout");
+				assert.equal(logoutCalls, 1);
+				assert.deepEqual(recorder.notes, [{ message: "Signed out of Antigravity.", level: "info" }]);
+			},
+			{
+				agyBinFactory: (root) => writeStubAgyScript(root, "mock-agy-logout", rpcMock),
+				onLogout: () => {
+					logoutCalls++;
+				},
+			},
+		);
+	});
+
+	it("/agy sessions notifies cleanly when process startup, session/list, or session/load fails", async () => {
+		// 1. acquire failure (mock process exits immediately)
+		await withAgyCommand(
+			async (run, _agy, recorder) => {
+				await run("sessions");
+				assert.equal(recorder.notes.length, 1);
+				assert.equal(recorder.notes[0].level, "error");
+				assert.match(recorder.notes[0].message, /Failed to list Antigravity sessions:/);
+			},
+			{
+				agyBinFactory: (root) => writeStubAgyScript(root, "mock-agy-crash", "process.exit(1);\n"),
+			},
+		);
+
+		// 2. session/list RPC error
+		const listErrMock = `
+import * as readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+rl.on("line", (line) => {
+	if (!line.trim()) return;
+	const msg = JSON.parse(line);
+	if (msg.method === "initialize") {
+		send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { sessionCapabilities: { list: {}, load: {}, close: {} } } } });
+	} else if (msg.method === "session/list") {
+		send({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: "list broken" } });
+	}
+});
+`;
+		await withAgyCommand(
+			async (run, _agy, recorder) => {
+				await run("sessions");
+				assert.equal(recorder.notes.length, 1);
+				assert.equal(recorder.notes[0].level, "error");
+				assert.match(recorder.notes[0].message, /Failed to list Antigravity sessions: list broken/);
+			},
+			{
+				agyBinFactory: (root) => writeStubAgyScript(root, "mock-agy-list-err", listErrMock),
+			},
+		);
+
+		// 3. session/load RPC error
+		const loadErrMock = `
+import * as readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+rl.on("line", (line) => {
+	if (!line.trim()) return;
+	const msg = JSON.parse(line);
+	if (msg.method === "initialize") {
+		send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { sessionCapabilities: { list: {}, load: {}, close: {} } } } });
+	} else if (msg.method === "session/list") {
+		send({ jsonrpc: "2.0", id: msg.id, result: { sessions: [{ sessionId: "sess-broken-1", cwd: "/tmp", title: "Broken" }] } });
+	} else if (msg.method === "session/load") {
+		send({ jsonrpc: "2.0", id: msg.id, error: { code: -32001, message: "corrupt transcript" } });
+	} else if (msg.id !== undefined) {
+		send({ jsonrpc: "2.0", id: msg.id, result: {} });
+	}
+});
+`;
+		await withAgyCommand(
+			async (run, _agy, recorder) => {
+				await run("sessions");
+				assert.equal(recorder.notes.length, 1);
+				assert.equal(recorder.notes[0].level, "error");
+				assert.match(recorder.notes[0].message, /Failed to load Antigravity session: corrupt transcript/);
+			},
+			{
+				agyBinFactory: (root) => writeStubAgyScript(root, "mock-agy-load-err", loadErrMock),
+			},
+		);
+	});
 });
 
 describe("footer badge", () => {

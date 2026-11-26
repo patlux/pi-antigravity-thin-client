@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AcpSessionUpdatePayload } from "../acp/protocol.ts";
+import { ANTIGRAVITY_PROVIDER_ID } from "../catalog/model-discovery.ts";
 import { resolveAgyAppDataDir } from "../config.ts";
 import type { TurnCoordinator } from "../session/turn-coordinator.ts";
 import type { EmptyResultContext } from "../tools/agy-mirror-tools.ts";
@@ -89,25 +90,44 @@ export class BackgroundActivityController {
 		}
 		this.live = live;
 		if (this.liveExpiry) clearTimeout(this.liveExpiry);
-		this.liveExpiry = setTimeout(() => this.render(), LIVE_STALE_MS + 100);
+		this.liveExpiry = setTimeout(() => {
+			this.liveExpiry = undefined;
+			this.render();
+		}, LIVE_STALE_MS + 100);
 		this.liveExpiry.unref?.();
+		this.render();
+	}
+
+	/** Clears live out-of-turn activity (for example when the user starts a new turn). */
+	clearLive(): void {
+		this.live = undefined;
+		if (this.liveExpiry) clearTimeout(this.liveExpiry);
+		this.liveExpiry = undefined;
 		this.render();
 	}
 
 	/** Follows the agy conversation behind the current Pi session. */
 	sync(ctx: ExtensionContext | undefined = this.coordinator.getActiveContext()): void {
-		if (!ctx) return;
+		if (!ctx || ctx.model?.provider !== ANTIGRAVITY_PROVIDER_ID) {
+			this.stop();
+			return;
+		}
 		let piSessionId: string | undefined;
 		try {
 			piSessionId = ctx.sessionManager.getSessionId();
 		} catch {
+			this.stop();
 			return;
 		}
 		const agySessionId = this.coordinator.getTelemetrySnapshot(piSessionId).agySessionId;
-		if (!agySessionId || this.watcher?.agySessionId === agySessionId) return;
+		if (!agySessionId) {
+			this.stop();
+			return;
+		}
+		if (this.watcher?.agySessionId === agySessionId) return;
 		this.stop();
 		const recorded = recordedStartSteps(ctx, agySessionId);
-		this.watcher = new AgyActivityWatcher({
+		const watcher = new AgyActivityWatcher({
 			agySessionId,
 			systemDir: path.join(
 				resolveAgyAppDataDir(this.coordinator.config),
@@ -117,13 +137,15 @@ export class BackgroundActivityController {
 			),
 			isAlive: () => this.coordinator.isAgySessionAlive(agySessionId),
 			onSnapshot: (snapshot) => {
+				if (this.watcher !== watcher) return;
 				this.snapshot = snapshot;
 				this.render();
 			},
 			onTurnFinished: (turn) => this.record(agySessionId, turn),
 			alreadyRecorded: (startStep) => recorded.has(startStep),
 		});
-		this.watcher.start();
+		this.watcher = watcher;
+		watcher.start();
 	}
 
 	/** Text for a mirror tool card that agy finished without output. */
@@ -171,23 +193,41 @@ export class BackgroundActivityController {
 	private render(): void {
 		const watcher = this.watcher;
 		if (!watcher) return;
+		const ctx = this.coordinator.getActiveContext();
+		if (!ctx || ctx.model?.provider !== ANTIGRAVITY_PROVIDER_ID) {
+			this.view.clear();
+			return;
+		}
 		const base: ActivitySnapshot = this.snapshot ?? {
 			agySessionId: watcher.agySessionId,
 			tasks: [],
 			logTails: new Map(),
 		};
-		this.view.show(this.coordinator.getActiveContext(), { ...base, live: this.live });
+		this.view.show(ctx, { ...base, live: this.live });
 	}
 
 	private record(agySessionId: string, turn: AutonomousTurn): void {
+		if (this.watcher?.agySessionId !== agySessionId) return;
+		const ctx = this.coordinator.getActiveContext();
+		if (!ctx || ctx.model?.provider !== ANTIGRAVITY_PROVIDER_ID) return;
+		let piSessionId: string | undefined;
+		try {
+			piSessionId = ctx.sessionManager.getSessionId();
+		} catch {
+			return;
+		}
+		if (this.coordinator.getTelemetrySnapshot(piSessionId).agySessionId !== agySessionId) {
+			return;
+		}
 		// The finished turn replaces the live line.
 		if (this.live && (turn.endedAtMs ?? Date.now()) >= this.live.startedAtMs - 5_000) {
 			this.live = undefined;
+			if (this.liveExpiry) clearTimeout(this.liveExpiry);
+			this.liveExpiry = undefined;
 			this.render();
 		}
 		this.pi.appendEntry(AUTONOMOUS_ENTRY_TYPE, toAutonomousEntryData(agySessionId, turn));
-		const ctx = this.coordinator.getActiveContext();
-		if (ctx?.hasUI) {
+		if (ctx.hasUI) {
 			ctx.ui.notify("Antigravity continued on its own", "info");
 		}
 	}
