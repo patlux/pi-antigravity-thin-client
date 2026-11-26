@@ -79,7 +79,9 @@ export function withoutTimestampHeader(text: string): string {
 	const lines = text.split("\n");
 	let start = 0;
 	while (start < lines.length && /^(?:Created|Completed) At:\s*\S/.test(lines[start].trim())) start++;
-	return start === 0 ? text : lines.slice(start).join("\n").replace(/^\s*\n/, "");
+	if (start === 0) return text;
+	const rest = lines.slice(start).join("\n").replace(/^\s*\n/, "");
+	return rest.trim().length === 0 ? "" : rest;
 }
 
 function formatDurationSuffix(durationMs: number | undefined, theme: Theme): string {
@@ -244,7 +246,14 @@ export function getMirrorToolRenderers(toolName: AgyMirrorToolName): ToolRendere
 
 			// 2. 终端执行工具：流式阶段滚动展示尾部输出，报错时高亮
 			if (toolName === "agy_bash") {
-				const lines = withoutTimestampHeader(rawText).split("\n");
+				const bodyText = withoutTimestampHeader(rawText);
+				if (!bodyText) {
+					if (options.isPartial) {
+						return new Text(theme.fg("muted", "Running..."), 0, 0);
+					}
+					return new Text("", 0, 0);
+				}
+				const lines = bodyText.split("\n");
 				if (!options.expanded && options.isPartial && lines.length > BASH_STREAMING_TAIL_LINES) {
 					const tail = lines.slice(-BASH_STREAMING_TAIL_LINES);
 					const skipped = lines.length - tail.length;
@@ -279,21 +288,30 @@ export function getMirrorToolRenderers(toolName: AgyMirrorToolName): ToolRendere
 
 			// 3. 文件读取与写入：按文件后缀启用原生语法高亮
 			if (toolName === "agy_read" || toolName === "agy_write") {
-				const ctxArgs = (
-					context.args && typeof context.args === "object" ? context.args : {}
-				) as Record<string, unknown>;
-				const targetPath =
-					details.path ||
-					(typeof ctxArgs.path === "string" ? ctxArgs.path : undefined);
-				const lang = targetPath ? getLanguageFromPath(targetPath) : undefined;
-				const highlighted = lang ? highlightCode(rawText, lang) : rawText.split("\n").map((l) => theme.fg("toolOutput", l));
+				let renderedLines: string[];
+				if (context.isError) {
+					renderedLines = rawText.split("\n").map((l) => theme.fg("error", l));
+				} else {
+					const ctxPath =
+						context.args &&
+						typeof context.args === "object" &&
+						"path" in context.args &&
+						typeof context.args.path === "string"
+							? context.args.path
+							: undefined;
+					const targetPath = details.path || ctxPath;
+					const lang = targetPath ? getLanguageFromPath(targetPath) : undefined;
+					renderedLines = lang
+						? highlightCode(rawText, lang)
+						: rawText.split("\n").map((l) => theme.fg("toolOutput", l));
+				}
 				const shownCount = options.expanded
-					? highlighted.length
-					: Math.min(highlighted.length, COLLAPSED_PREVIEW_LINES);
+					? renderedLines.length
+					: Math.min(renderedLines.length, COLLAPSED_PREVIEW_LINES);
 				return new Text(
 					appendExpandHint(
-						highlighted.slice(0, shownCount),
-						highlighted.length,
+						renderedLines.slice(0, shownCount),
+						renderedLines.length,
 						shownCount,
 						theme,
 						context.keyHint.bind(context),
@@ -304,7 +322,14 @@ export function getMirrorToolRenderers(toolName: AgyMirrorToolName): ToolRendere
 			}
 
 			// 4. 通用工具 / 搜索 / 子代理输出
-			const lines = rawText.split("\n");
+			const bodyText = withoutTimestampHeader(rawText);
+			if (!bodyText) {
+				if (options.isPartial) {
+					return new Text(theme.fg("muted", "Running..."), 0, 0);
+				}
+				return new Text("", 0, 0);
+			}
+			const lines = bodyText.split("\n");
 			const shownCount = options.expanded
 				? lines.length
 				: Math.min(lines.length, COLLAPSED_PREVIEW_LINES);

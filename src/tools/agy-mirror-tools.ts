@@ -165,13 +165,9 @@ export function classifyAgyToolCall(input: {
 		mirrorToolName = "agy_subagent";
 	} else if (internalTool) {
 		mirrorToolName = "agy_tool";
-	} else if (kind === "execute" || command !== undefined) {
-		// A shell command's title is its command line; words such as `--workflow=`
-		// in it do not make it a subagent.
-		mirrorToolName = "agy_bash";
-	} else if (isExplicitSubagentTitle) {
-		mirrorToolName = "agy_subagent";
-	} else if (lowerTitle.startsWith("run ")) {
+	} else if (kind === "execute" || command !== undefined || lowerTitle.startsWith("run ")) {
+		// Shell commands and explicit file/search tools may mention words such as
+		// `workflow`, `subagent`, or `swarm`; classify them before subagent title heuristics.
 		mirrorToolName = "agy_bash";
 	} else if (hasDiffBlock || kind === "edit" || lowerTitle.startsWith("edit")) {
 		mirrorToolName = "agy_edit";
@@ -188,7 +184,7 @@ export function classifyAgyToolCall(input: {
 		lowerTitle.includes("find")
 	) {
 		mirrorToolName = "agy_search";
-	} else if (agentRole !== undefined) {
+	} else if (isExplicitSubagentTitle || agentRole !== undefined) {
 		mirrorToolName = "agy_subagent";
 	}
 
@@ -338,8 +334,17 @@ export interface EmptyResultContext {
 export class AgyTurnMirrorBroker {
 	private readonly calls = new Map<string, TrackedMirrorCallState>();
 	private fallbackUiContext?: ExtensionContext;
-	private permissionMutex: Promise<void> = Promise.resolve();
+	private uiDialogMutex: Promise<void> = Promise.resolve();
 	private emptyResultNote?: (context: EmptyResultContext) => string | undefined;
+
+	private enqueueUiDialog<T>(run: () => Promise<T>): Promise<T> {
+		const task = this.uiDialogMutex.then(run, run);
+		this.uiDialogMutex = task.then(
+			() => undefined,
+			() => undefined,
+		);
+		return task;
+	}
 
 	/** Supplies a note for calls that agy finished without output (background tasks, timers). */
 	setEmptyResultNote(note: ((context: EmptyResultContext) => string | undefined) | undefined): void {
@@ -369,7 +374,9 @@ export class AgyTurnMirrorBroker {
 		},
 	): ClassifiedMirrorCall {
 		const classified = classifyAgyToolCall(payload);
+		const isTerminal = payload.status === "completed" || payload.status === "failed";
 		let state = this.calls.get(payload.toolCallId);
+		const isStaleNonTerminal = Boolean(state?.completed && !isTerminal);
 
 		if (!state) {
 			state = {
@@ -401,13 +408,18 @@ export class AgyTurnMirrorBroker {
 			};
 			this.calls.set(payload.toolCallId, state);
 		} else {
-			if (payload.title) state.title = payload.title;
-			if (payload.kind) state.kind = payload.kind;
-			if (payload.status) state.status = payload.status;
-			if (payload.locations?.[0]?.path) {
+			if (payload.title && (!isStaleNonTerminal || !state.title)) state.title = payload.title;
+			if (payload.kind && (!isStaleNonTerminal || !state.kind)) state.kind = payload.kind;
+			if (payload.status && !isStaleNonTerminal) state.status = payload.status;
+			if (payload.locations?.[0]?.path && (!isStaleNonTerminal || !state.path)) {
 				state.path = normalizeMirrorFilePath(payload.locations[0].path);
 			}
-			if (typeof payload.locations?.[0]?.line === "number") state.line = payload.locations[0].line;
+			if (
+				typeof payload.locations?.[0]?.line === "number" &&
+				(!isStaleNonTerminal || state.line === undefined)
+			) {
+				state.line = payload.locations[0].line;
+			}
 			if (typeof classified.arguments.path === "string" && !state.path) {
 				state.path = classified.arguments.path;
 			}
@@ -417,37 +429,38 @@ export class AgyTurnMirrorBroker {
 			if (typeof classified.arguments.limit === "number" && state.limit === undefined) {
 				state.limit = classified.arguments.limit;
 			}
-			if (typeof classified.arguments.command === "string") {
+			if (typeof classified.arguments.command === "string" && (!isStaleNonTerminal || !state.command)) {
 				state.command = classified.arguments.command;
 			}
-			if (typeof classified.arguments.query === "string") {
+			if (typeof classified.arguments.query === "string" && (!isStaleNonTerminal || !state.query)) {
 				state.query = classified.arguments.query;
 			}
-			if (typeof classified.arguments.agentRole === "string") {
+			if (typeof classified.arguments.agentRole === "string" && (!isStaleNonTerminal || !state.agentRole)) {
 				state.agentRole = classified.arguments.agentRole;
 			}
-			if (typeof classified.arguments.tool === "string") {
+			if (typeof classified.arguments.tool === "string" && (!isStaleNonTerminal || !state.tool)) {
 				state.tool = classified.arguments.tool;
 			}
-			state.args = { ...state.args, ...displayArguments(classified.arguments) };
+			state.args = isStaleNonTerminal
+				? { ...displayArguments(classified.arguments), ...state.args }
+				: { ...state.args, ...displayArguments(classified.arguments) };
 		}
 
 		if (payload.content && payload.content.length > 0) {
 			const merged = mergeContentItems(payload.content);
-			if (merged.blocks.length > 0) {
+			if (merged.blocks.length > 0 && (!isStaleNonTerminal || state.contentBlocks.length === 0)) {
 				state.contentBlocks = merged.blocks;
 			}
-			if (merged.diffs.length > 0) {
+			if (merged.diffs.length > 0 && (!isStaleNonTerminal || state.diffs.length === 0)) {
 				state.diffs = merged.diffs;
 			}
 		}
 
 		const rawText = formatRawOutputFallback(payload.rawOutput);
-		if (rawText) {
+		if (rawText && (!isStaleNonTerminal || !state.rawOutputText)) {
 			state.rawOutputText = rawText;
 		}
 
-		const isTerminal = payload.status === "completed" || payload.status === "failed";
 		if (isTerminal) {
 			state.completed = true;
 			state.failed = payload.status === "failed";
@@ -456,7 +469,7 @@ export class AgyTurnMirrorBroker {
 				state.resolveCompletion = undefined;
 				resolver(this.buildToolResult(state));
 			}
-		} else if (state.onUpdate) {
+		} else if (state.onUpdate && !state.completed) {
 			state.onUpdate(this.buildToolResult(state));
 		}
 
@@ -572,7 +585,7 @@ export class AgyTurnMirrorBroker {
 	handlePermissionRequest(
 		params: AcpRequestPermissionParams,
 	): Promise<AcpRequestPermissionResult> {
-		const run = async (): Promise<AcpRequestPermissionResult> => {
+		return this.enqueueUiDialog(async (): Promise<AcpRequestPermissionResult> => {
 			const callId = params.toolCall?.toolCallId;
 			const callState = callId ? this.calls.get(callId) : undefined;
 			const uiCtx = callState?.activeCtx ?? this.fallbackUiContext;
@@ -606,97 +619,92 @@ export class AgyTurnMirrorBroker {
 					optionId: chosen.optionId,
 				},
 			};
-		};
-
-		const task = this.permissionMutex.then(run, run);
-		this.permissionMutex = task.then(
-			() => undefined,
-			() => undefined,
-		);
-		return task;
+		});
 	}
 
-	/** 处理 ACP `elicitation/create` 结构化提问请求 */
-	async handleElicitationRequest(
+	/** 处理 ACP `elicitation/create` 结构化提问请求（与权限弹窗共用 FIFO 互斥锁） */
+	handleElicitationRequest(
 		params: AcpElicitationCreateParams,
 	): Promise<AcpElicitationCreateResult> {
-		const uiCtx = this.fallbackUiContext;
-		if (!uiCtx || !uiCtx.hasUI) {
-			throw new Error("Interactive UI unavailable in current mode");
-		}
-
-		const signal = uiCtx.signal;
-		if (params.mode === "url" && params.url) {
-			const confirmed = await uiCtx.ui.confirm(
-				params.message || "Confirm external authorization",
-				`Confirm once you have completed this step: ${params.url}`,
-				{ signal },
-			);
-			return { action: confirmed ? "accept" : "decline" };
-		}
-
-		const props = params.requestedSchema?.properties;
-		if (!props || Object.keys(props).length === 0) {
-			const answer = await uiCtx.ui.input(params.message || "Your answer", undefined, { signal });
-			if (answer === undefined) {
-				return { action: "cancel" };
+		return this.enqueueUiDialog(async (): Promise<AcpElicitationCreateResult> => {
+			const uiCtx = this.fallbackUiContext;
+			if (!uiCtx || !uiCtx.hasUI) {
+				throw new Error("Interactive UI unavailable in current mode");
 			}
+
+			const signal = uiCtx.signal;
+			if (params.mode === "url" && params.url) {
+				const confirmed = await uiCtx.ui.confirm(
+					params.message || "Confirm external authorization",
+					`Confirm once you have completed this step: ${params.url}`,
+					{ signal },
+				);
+				return { action: confirmed ? "accept" : "decline" };
+			}
+
+			const props = params.requestedSchema?.properties;
+			if (!props || Object.keys(props).length === 0) {
+				const answer = await uiCtx.ui.input(params.message || "Your answer", undefined, { signal });
+				if (answer === undefined) {
+					return { action: "cancel" };
+				}
+				return {
+					action: "accept",
+					content: { response: answer },
+				};
+			}
+
+			const content: Record<string, unknown> = {};
+			for (const [key, propSchema] of Object.entries(props)) {
+				const fieldTitle = propSchema.title || propSchema.description || key;
+				const promptTitle = params.message ? `${params.message} — ${fieldTitle}` : fieldTitle;
+
+				if (Array.isArray(propSchema.enum) && propSchema.enum.length > 0) {
+					const displayChoices =
+						Array.isArray(propSchema.enumNames) &&
+						propSchema.enumNames.length === propSchema.enum.length
+							? propSchema.enumNames
+							: propSchema.enum;
+					const picked = await uiCtx.ui.select(promptTitle, displayChoices, { signal });
+					if (picked === undefined) {
+						return { action: "cancel" };
+					}
+					const choiceIdx = displayChoices.indexOf(picked);
+					content[key] = choiceIdx >= 0 ? propSchema.enum[choiceIdx] : picked;
+					continue;
+				}
+
+				if (propSchema.type === "boolean") {
+					const picked = await uiCtx.ui.select(promptTitle, ["Yes", "No"], { signal });
+					if (picked === undefined) {
+						return { action: "cancel" };
+					}
+					content[key] = picked === "Yes";
+					continue;
+				}
+
+				const rawInput = await uiCtx.ui.input(
+					promptTitle,
+					propSchema.default !== undefined ? String(propSchema.default) : undefined,
+					{ signal },
+				);
+				if (rawInput === undefined) {
+					return { action: "cancel" };
+				}
+
+				if (propSchema.type === "number" || propSchema.type === "integer") {
+					const num = Number(rawInput);
+					content[key] = Number.isFinite(num) ? num : rawInput;
+				} else {
+					content[key] = rawInput;
+				}
+			}
+
 			return {
 				action: "accept",
-				content: { response: answer },
+				content,
 			};
-		}
-
-		const content: Record<string, unknown> = {};
-		for (const [key, propSchema] of Object.entries(props)) {
-			const fieldTitle = propSchema.title || propSchema.description || key;
-			const promptTitle = params.message ? `${params.message} — ${fieldTitle}` : fieldTitle;
-
-			if (Array.isArray(propSchema.enum) && propSchema.enum.length > 0) {
-				const displayChoices =
-					Array.isArray(propSchema.enumNames) &&
-					propSchema.enumNames.length === propSchema.enum.length
-						? propSchema.enumNames
-						: propSchema.enum;
-				const picked = await uiCtx.ui.select(promptTitle, displayChoices, { signal });
-				if (picked === undefined) {
-					return { action: "cancel" };
-				}
-				const choiceIdx = displayChoices.indexOf(picked);
-				content[key] = choiceIdx >= 0 ? propSchema.enum[choiceIdx] : picked;
-				continue;
-			}
-
-			if (propSchema.type === "boolean") {
-				const picked = await uiCtx.ui.select(promptTitle, ["Yes", "No"], { signal });
-				if (picked === undefined) {
-					return { action: "cancel" };
-				}
-				content[key] = picked === "Yes";
-				continue;
-			}
-
-			const rawInput = await uiCtx.ui.input(
-				promptTitle,
-				propSchema.default !== undefined ? String(propSchema.default) : undefined,
-				{ signal },
-			);
-			if (rawInput === undefined) {
-				return { action: "cancel" };
-			}
-
-			if (propSchema.type === "number" || propSchema.type === "integer") {
-				const num = Number(rawInput);
-				content[key] = Number.isFinite(num) ? num : rawInput;
-			} else {
-				content[key] = rawInput;
-			}
-		}
-
-		return {
-			action: "accept",
-			content,
-		};
+		});
 	}
 
 	private buildToolResult(
