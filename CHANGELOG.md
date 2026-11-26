@@ -4,8 +4,22 @@ Fork releases of pi-antigravity-thin-client. The upstream changelog of pi-antigr
 
 ## Unreleased
 
+### Added
+
+- Native Antigravity `swarm` visibility: the background widget now reads `.system_generated/swarm/members.json` read-only to display active, parked, and recently finished swarm workers (deduplicated against subagents), and mirror tool cards render `swarm`, `post_message`, `read_board`, `swarm_wait`, and `update_steps` with concise summaries.
+- Complete ACP `elicitation/create` (plus v1 `session/elicitation` and `_session/elicitation`) form support: titled `oneOf` choices, `array` multi-select with `minItems`/`maxItems`, optional `<id>__other` / `<id>_other` free-text companion folding, skippable optional fields, and `ask_question` field titles.
+- Support for Antigravity's `auto` execution mode in configuration and `/agy agent-mode` (falling back to `default` with a warning when a session does not advertise `auto`), plus `current_mode_update` synchronization and a version hint in `/agy status` when `agy` is older than `1.5.1`.
+- Per-model `thought_level` discovery via zero-quota `session/set_config_option` probing during catalog refresh, along with grouped `configOptions` and category-based option matching.
+- Read-only SQLite turn outcome inspection (`step_type = 17`) on `end_turn` and `refusal` to surface silent upstream failures — quota exhaustion with reset timestamps/delays, `INVALID_THINKING_SIGNATURE`, 403 `VALIDATION_REQUIRED` links, `SUBSCRIPTION_REQUIRED`, and API errors — cleanly as non-retryable errors.
+- A 15-minute prompt inactivity watchdog (paused while permission or elicitation dialogs are open or mirror tools are executing) so stalled `agy` turns fail cleanly instead of hanging indefinitely.
+
 ### Fixed
 
+- Interactive `interaction_*` questions sent over `session/request_permission` now render as questions instead of `"Approve: …"` prompts and no longer fail the turn when a chosen option carries a `reject_*` kind; normal approval prompts surface `_meta["agy.security.warning"]` warnings and enrich generic titles with command or file details.
+- `/agy logout` now calls ACP v1 `"logout"` first and falls back to `"auth/logout"` on `-32601` (Method not found).
+- Spawned `agy acp` processes now set `AGY_CLI_DISABLE_AUTO_UPDATE="true"` by default, allow 90 seconds for cold `initialize` unpacking, clean up `.meta`, `brain/<id>/`, and `annotations/<id>.pbtxt` for empty probe and orphaned sessions, and tolerate up to 5 seconds for post-cancel prompt settling.
+- Out-of-turn `usage_update` notifications now trigger an immediate background poll when live autonomous activity is showing so the finished card replaces the live line promptly; SQLite step usage parsing also accounts for protobuf field 10 (`responseTokens`), and mirror broker payloads cap huge outputs and diffs in memory.
+- Failed `session/set_config_option` switches for `model` or `mode` now warn via UI notification instead of failing silently.
 - Long answers in the "Antigravity · on its own" card showed `<truncated N bytes>` and lost their middle part. `agy` cuts fields of more than about 4 KB in `transcript.jsonl` and writes them whole only to `transcript_full.jsonl`; the package now reads `transcript_full.jsonl` and falls back to `transcript.jsonl` only when the full file is missing or empty, waiting briefly for the full transcript on newly truncated turns and decoding multi-byte UTF-8 safely across incremental reads. Cards recorded before this fix keep their cut text.
 - Shell commands, file operations (`read`, `edit`, `write`), and searches whose path, query, or command line contains `workflow`, `subagent`, or `swarm` were shown as subagent cards. Explicit command, file, and search classifications now run before subagent title heuristics.
 - Switching sessions (`/new`, `/resume`, `/fork`, `/agy sessions`), compacting, logging out, or switching away from an Antigravity model could leave the previous background watcher and live widget active and append autonomous turn cards or titles into the wrong Pi session. Watchers and previous-session ledgers are now stopped on transitions, and live out-of-turn activity clears when the user starts a new turn.
