@@ -79,11 +79,120 @@ describe("HumanPromptGate", () => {
 	});
 
 	it("accepts skill and template expansions of typed slash commands", () => {
-		const gate = new HumanPromptGate();
+		let now = 10_000;
+		const gate = new HumanPromptGate({ now: () => now });
 		const expanded = user('<skill name="review">Review steps</skill>\n\nthe parser', 1);
 		gate.noteInput("interactive", "/skill:review the parser");
+		now += 100;
 		gate.noteUserMessage(expanded);
 		gate.authorize([expanded], false);
+
+		const templateExpanded = user("Run the full release checklist for v0.3", 2);
+		gate.noteInput("interactive", "/release v0.3");
+		now += 500;
+		gate.noteUserMessage(templateExpanded);
+		gate.authorize([templateExpanded], false);
+
+		const agyPrefixedTemplate = user("Expanded agy review template", 3);
+		gate.noteInput("interactive", "/agy-review src/");
+		now += 50;
+		gate.noteUserMessage(agyPrefixedTemplate);
+		gate.authorize([agyPrefixedTemplate], false);
+	});
+
+	it("accepts prompts whose leading or trailing whitespace was trimmed by Pi", () => {
+		const gate = new HumanPromptGate();
+		const trimmed = user("fix the build", 1);
+		gate.noteInput("interactive", "  fix the build\n ");
+		gate.noteUserMessage(trimmed);
+		gate.authorize([trimmed], false);
+
+		const prefixed = user("fix the build\nwith details", 2);
+		gate.noteInput("interactive", "\tfix the build  ");
+		gate.noteUserMessage(prefixed);
+		gate.authorize([prefixed], false);
+	});
+
+	it("preserves empty-text image-only matching without letting whitespace authorize non-empty text", () => {
+		const gate = new HumanPromptGate();
+		const imageOnly: UserMessage = {
+			role: "user",
+			content: [{ type: "image", data: "AAAA", mimeType: "image/png" }],
+			timestamp: 1,
+		};
+		gate.noteInput("interactive", "");
+		gate.noteUserMessage(imageOnly);
+		gate.authorize([imageOnly], false);
+
+		const whitespaceInputImageOnly: UserMessage = {
+			role: "user",
+			content: [{ type: "image", data: "BBBB", mimeType: "image/png" }],
+			timestamp: 2,
+		};
+		gate.noteInput("interactive", "   \n  ");
+		gate.noteUserMessage(whitespaceInputImageOnly);
+		gate.authorize([whitespaceInputImageOnly], false);
+
+		// A dangling whitespace-only input must never match a non-empty automated message.
+		gate.noteInput("interactive", "   ");
+		const automated = user("Continue the goal.", 3);
+		gate.noteUserMessage(automated);
+		assert.equal(gate.isHuman(automated), false);
+		assert.throws(
+			() => gate.authorize([automated], false),
+			new RegExp(escape(AUTOMATED_PROMPT_REFUSED)),
+		);
+	});
+
+	it("refuses stale slash commands, bridge-local /agy commands, and slash commands followed by non-interactive input", () => {
+		let now = 50_000;
+		const gate = new HumanPromptGate({ now: () => now });
+
+		// Stale /goal command (> 2000 ms old) must not authorize a later automated message.
+		gate.noteInput("interactive", "/goal start");
+		now += 2_500;
+		const staleGoalMsg = user("<goal>Continue working</goal>", 1);
+		gate.noteUserMessage(staleGoalMsg);
+		assert.equal(gate.isHuman(staleGoalMsg), false);
+		assert.throws(
+			() => gate.authorize([staleGoalMsg], false),
+			new RegExp(escape(AUTOMATED_PROMPT_REFUSED)),
+		);
+
+		// Bridge-local /agy commands must never authorize an unrelated user-role message, even immediately.
+		for (const cmd of ["/agy", "/agy status", "/AGY sessions"]) {
+			gate.noteInput("interactive", cmd);
+			now += 20;
+			const afterBridgeCmd = user(`automated after ${cmd}`, now);
+			gate.noteUserMessage(afterBridgeCmd);
+			assert.equal(gate.isHuman(afterBridgeCmd), false, cmd);
+			assert.throws(
+				() => gate.authorize([afterBridgeCmd], false),
+				new RegExp(escape(AUTOMATED_PROMPT_REFUSED)),
+			);
+		}
+
+		// A recent slash command followed by a non-interactive input must not match an automated message.
+		gate.noteInput("interactive", "/skill:review");
+		now += 10;
+		gate.noteInput("extension", "trigger");
+		now += 10;
+		const afterNonInteractive = user("Expanded automated message from extension", 4);
+		gate.noteUserMessage(afterNonInteractive);
+		assert.equal(gate.isHuman(afterNonInteractive), false);
+		assert.throws(
+			() => gate.authorize([afterNonInteractive], false),
+			new RegExp(escape(AUTOMATED_PROMPT_REFUSED)),
+		);
+
+		// A fresh /skill:... after a stale /goal or /agy status still works cleanly.
+		gate.noteInput("interactive", "/agy status");
+		now += 10;
+		gate.noteInput("interactive", "/skill:review parser");
+		now += 50;
+		const legitExpanded = user('<skill name="review">steps</skill>\n\nparser', 5);
+		gate.noteUserMessage(legitExpanded);
+		gate.authorize([legitExpanded], false);
 	});
 
 	it("does not lend a handled input to a later extension message", () => {

@@ -64,11 +64,36 @@ export function hasLocalConversationDb(config: BridgeConfig, agySessionId: strin
 	return fs.existsSync(dbPath);
 }
 
+function isOnlyFailedOrAbortedTurns(
+	delta: readonly (UserMessage | AssistantMessage | ToolResultMessage)[],
+): boolean {
+	if (delta.length === 0) return false;
+	const last = delta[delta.length - 1];
+	if (
+		last.role !== "assistant" ||
+		(last.stopReason !== "aborted" && last.stopReason !== "error")
+	) {
+		return false;
+	}
+	for (const message of delta) {
+		if (message.role === "toolResult") return false;
+		if (
+			message.role === "assistant" &&
+			message.stopReason !== "aborted" &&
+			message.stopReason !== "error"
+		) {
+			return false;
+		}
+	}
+	return true;
+}
+
 /**
  * 沿当前会话树分支（`sessionManager.getBranch()`）回溯匹配最优历史锚点。
  *
  * `priorMessages` 为本轮新增用户输入之前的历史可见消息序列：
  * - 若某个锚点的 `messageCount === priorMessages.length` 且摘要、工具模式与系统提示词一致，可直接走 `session/resume`；
+ * - 若锚点之后仅包含无工具结果的失败/中止轮次（例如策略拒绝或启动失败），且前缀摘要一致，同样按 `exact` 交由后续 SQLite 校验判断是否可直接 `session/resume`；
  * - 若锚点命中更早的 `priorMessages.slice(0, k)` 前缀且具备 `dbCheckpoint`，可尝试只读 SQLite 快照分叉恢复。
  */
 export function findBranchAnchorForHistory(options: {
@@ -106,16 +131,18 @@ export function findBranchAnchorForHistory(options: {
 			return { kind: "exact", anchor };
 		}
 
-		if (
-			!bestForkCandidate &&
-			config.enableSqliteFork &&
-			anchor.dbCheckpoint &&
-			anchor.messageCount > 0 &&
-			anchor.messageCount < priorMessages.length
-		) {
-			const sliceDigest = computeTranscriptDigest(priorMessages.slice(0, anchor.messageCount));
-			if (sliceDigest === anchor.transcriptDigest) {
-				bestForkCandidate = anchor;
+		if (anchor.messageCount > 0 && anchor.messageCount < priorMessages.length) {
+			const delta = priorMessages.slice(anchor.messageCount);
+			if (isOnlyFailedOrAbortedTurns(delta)) {
+				const sliceDigest = computeTranscriptDigest(priorMessages.slice(0, anchor.messageCount));
+				if (sliceDigest === anchor.transcriptDigest) {
+					return { kind: "exact", anchor };
+				}
+			} else if (!bestForkCandidate && config.enableSqliteFork && anchor.dbCheckpoint) {
+				const sliceDigest = computeTranscriptDigest(priorMessages.slice(0, anchor.messageCount));
+				if (sliceDigest === anchor.transcriptDigest) {
+					bestForkCandidate = anchor;
+				}
 			}
 		}
 	}
@@ -1123,43 +1150,56 @@ function readSqliteWatermarks(db: import("node:sqlite").DatabaseSync): Omit<Sqli
 }
 
 /**
- * 以只读模式采集 AGY 会话 SQLite 数据库的当前高水位检查点。
- * 遇到文件不存在、WAL 锁冲突或跨版本表结构差异时静默返回 `undefined`。
+ * Captures a read-only high-watermark checkpoint of agy's conversation SQLite DB.
+ * Retries briefly when the DB file, schema, or WAL flush is not yet visible or a transient
+ * lock occurs, returning `undefined` if no steps are persisted after all attempts.
  */
 export async function captureSqliteCheckpoint(
 	config: BridgeConfig,
 	agySessionId: string,
+	retryDelaysMs: readonly number[] = [25, 50],
 ): Promise<SqliteDbCheckpoint | undefined> {
 	if (!agySessionId) return undefined;
-	const dbPath = path.join(resolveAgyConversationsDir(config), `${agySessionId}.db`);
-	if (!fs.existsSync(dbPath)) {
-		return undefined;
-	}
-
 	const sqlite = await loadNodeSqlite();
 	if (!sqlite) return undefined;
+	const dbPath = path.join(resolveAgyConversationsDir(config), `${agySessionId}.db`);
 
-	let db: import("node:sqlite").DatabaseSync | undefined;
-	try {
-		db = openSqliteWithTimeout(sqlite, dbPath, true);
-		if (!verifyRequiredTables(db)) {
+	const captureOnce = (): SqliteDbCheckpoint | undefined => {
+		if (!fs.existsSync(dbPath)) {
 			return undefined;
 		}
-
-		// 水位和步骤指纹取自同一个 WAL 读快照。
-		db.exec("BEGIN");
-		const watermarks = readSqliteWatermarks(db);
-		if (watermarks.steps <= 0) return undefined;
-		return { ...watermarks, fingerprint: computeStepsPrefixFingerprint(db, watermarks.steps) };
-	} catch {
-		return undefined;
-	} finally {
+		let db: import("node:sqlite").DatabaseSync | undefined;
 		try {
-			db?.close();
+			db = openSqliteWithTimeout(sqlite, dbPath, true);
+			if (!verifyRequiredTables(db)) {
+				return undefined;
+			}
+
+			// Read watermarks and step fingerprint from a single WAL read snapshot.
+			db.exec("BEGIN");
+			const watermarks = readSqliteWatermarks(db);
+			if (watermarks.steps <= 0) return undefined;
+			return { ...watermarks, fingerprint: computeStepsPrefixFingerprint(db, watermarks.steps) };
 		} catch {
-			// 忽略关闭异常
+			return undefined;
+		} finally {
+			try {
+				db?.close();
+			} catch {
+				// Ignore close errors.
+			}
 		}
+	};
+
+	const first = captureOnce();
+	if (first) return first;
+
+	for (const delay of retryDelaysMs) {
+		await new Promise((resolve) => setTimeout(resolve, delay));
+		const next = captureOnce();
+		if (next) return next;
 	}
+	return undefined;
 }
 
 /**

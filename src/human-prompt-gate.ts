@@ -11,10 +11,18 @@ import {
 /** Upper bound for remembered inputs and messages; only the latest few turns matter. */
 const MAX_PENDING_INPUTS = 16;
 const MAX_REMEMBERED_MESSAGES = 256;
+/** Maximum age of a typed slash command (`/skill:...`, `/template`) to match an expanded message. */
+export const SLASH_EXPANSION_MAX_AGE_MS = 2_000;
+const BRIDGE_LOCAL_COMMAND_PATTERN = /^\/agy(?:\s|$)/i;
 
 interface PendingInput {
 	source: InputSource;
 	text: string;
+	receivedAt: number;
+}
+
+export interface HumanPromptGateOptions {
+	now?: () => number;
 }
 
 /** A user-role message as Pi hands it to extensions and providers. */
@@ -70,10 +78,15 @@ export class HumanPromptGate {
 	private readonly pending: PendingInput[] = [];
 	private readonly human = new Set<string>();
 	private readonly dispatched = new Set<string>();
+	private readonly now: () => number;
+
+	constructor(options?: HumanPromptGateOptions) {
+		this.now = options?.now ?? Date.now;
+	}
 
 	/** Called for every Pi `input` event. */
 	noteInput(source: InputSource, text: string): void {
-		this.pending.push({ source, text });
+		this.pending.push({ source, text, receivedAt: this.now() });
 		while (this.pending.length > MAX_PENDING_INPUTS) {
 			this.pending.shift();
 		}
@@ -124,12 +137,29 @@ export class HumanPromptGate {
 	 * Inputs older than the match were handled without a message and are dropped.
 	 */
 	private takeMatchingInput(text: string): PendingInput | undefined {
-		let index = this.pending.findIndex(
-			(input) =>
-				input.text === text || (input.text.length > 0 && text.startsWith(input.text)),
-		);
+		const trimmedText = text.trim();
+		let index = this.pending.findIndex((input) => {
+			if (input.text === text || (input.text.length > 0 && text.startsWith(input.text))) {
+				return true;
+			}
+			const trimmedInput = input.text.trim();
+			return (
+				trimmedInput === trimmedText ||
+				(trimmedInput.length > 0 && trimmedText.startsWith(trimmedInput))
+			);
+		});
 		if (index < 0) {
-			index = this.pending.findIndex((input) => input.text.startsWith("/"));
+			const now = this.now();
+			index = this.pending.findIndex((input, idx) => {
+				const trimmedInput = input.text.trim();
+				if (!trimmedInput.startsWith("/")) return false;
+				if (BRIDGE_LOCAL_COMMAND_PATTERN.test(trimmedInput)) return false;
+				if (now - input.receivedAt > SLASH_EXPANSION_MAX_AGE_MS) return false;
+				for (let j = idx + 1; j < this.pending.length; j++) {
+					if (this.pending[j].source !== "interactive") return false;
+				}
+				return true;
+			});
 		}
 		if (index < 0) return undefined;
 		const [input] = this.pending.splice(0, index + 1).slice(-1);

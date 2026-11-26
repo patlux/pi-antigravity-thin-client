@@ -335,6 +335,8 @@ interface ManagedSessionLedger {
 	detachedCallIds: Set<string>;
 	/** 记录已确认为宿主 MCP 宣告的 ACP `toolCallId`，防止省略 `title` 的 `tool_call_update` 在 hybrid 下串扰 */
 	hostMcpAnnouncementIds: Set<string>;
+	/** Mirror `tool_call` IDs queued during the active turn so early `tool_call_update` events are accepted while stray updates are ignored. */
+	announcedMirrorCallIds: Set<string>;
 	activePump?: ActiveTurnPump;
 	/** 当前会话在后端仍在途的 `session/prompt` RPC Promise（严禁在它结算前重叠发送下一条 `session/prompt`） */
 	inFlightPrompt?: Promise<void>;
@@ -347,6 +349,7 @@ interface ManagedSessionLedger {
 }
 
 const DEFAULT_SESSION_KEY = "__default_pi_session__";
+const REASONING_SUFFIX_PATTERN = /-(minimal|low|medium|high|xhigh|max)$/i;
 
 /**
  * 判断是否应因 `pi-traffic-optimization` 归档投影状态变更而按需重建瘦身后的 AGY 会话：
@@ -457,17 +460,35 @@ export class TurnCoordinator {
 	}
 
 	/**
-	 * A subagent started as `self` without its own `Model` runs on the parent's
-	 * model and reasoning level; name them on its tool card.
+	 * A subagent started with `model: "inherit"` (any `agentType`) or as `self` without its
+	 * own `Model` runs on the parent's model and reasoning level; name them on its tool card.
 	 */
 	private withParentModel(ledger: ManagedSessionLedger, args: JsonObject): JsonObject {
-		if (args.tool !== "invoke_subagent" || args.model !== undefined || args.agentType !== "self") {
+		if (args.tool !== "invoke_subagent") {
 			return args;
 		}
+		const isInheritModel =
+			typeof args.model === "string" && args.model.trim().toLowerCase() === "inherit";
+		if (args.model !== undefined && !isInheritModel) {
+			return args;
+		}
+		if (!isInheritModel && args.agentType !== "self") {
+			return args;
+		}
+		const baseArgs: JsonObject = isInheritModel ? { ...args } : args;
+		if (isInheritModel) {
+			delete baseArgs.model;
+		}
 		const modelId = ledger.lastSelectedModelId;
-		if (!modelId) return args;
-		const level = ledger.appliedThoughtLevel;
-		return { ...args, parentModel: level ? `${modelId}-${level}` : modelId };
+		if (!modelId) return baseArgs;
+		const level = ledger.appliedThoughtLevel?.trim();
+		const hasReasoningSuffix =
+			REASONING_SUFFIX_PATTERN.test(modelId) ||
+			(level !== undefined &&
+				level.length > 0 &&
+				modelId.toLowerCase().endsWith(`-${level.toLowerCase()}`));
+		const parentModel = level && !hasReasoningSuffix ? `${modelId}-${level}` : modelId;
+		return { ...baseArgs, parentModel };
 	}
 
 	/** Receives agy's updates that arrive while no Pi turn runs. */
@@ -649,6 +670,7 @@ export class TurnCoordinator {
 			});
 		}
 		ledger.parkedCalls.clear();
+		ledger.announcedMirrorCallIds.clear();
 		ledger.pendingGenSlicePool = undefined;
 		if (ledger.activePump) {
 			ledger.activePump.finished = true;
@@ -706,6 +728,7 @@ export class TurnCoordinator {
 		}
 		ledger.parkedCalls.clear();
 		ledger.detachedCallIds.clear();
+		ledger.announcedMirrorCallIds.clear();
 		ledger.activePump = undefined;
 		ledger.inFlightPrompt = undefined;
 
@@ -831,16 +854,20 @@ export class TurnCoordinator {
 				}
 				ledger.usedTokens = update.used;
 			}
+			const isCurrentSession = ledger.piSessionKey === this.resolveCurrentPiSessionKey();
 			if (typeof update.size === "number") {
 				ledger.windowSize = update.size;
 				const activeModel = this.activeContext?.model;
 				const targetModelId =
 					ledger.lastSelectedModelId ??
-					(activeModel?.provider === ANTIGRAVITY_PROVIDER_ID ? activeModel.id : undefined);
+					(isCurrentSession && activeModel?.provider === ANTIGRAVITY_PROVIDER_ID
+						? activeModel.id
+						: undefined);
 				if (targetModelId) {
 					recordObservedContextWindow(targetModelId, update.size);
 				}
 				if (
+					isCurrentSession &&
 					activeModel &&
 					activeModel.provider === ANTIGRAVITY_PROVIDER_ID &&
 					(!ledger.lastSelectedModelId || activeModel.id === ledger.lastSelectedModelId)
@@ -848,15 +875,20 @@ export class TurnCoordinator {
 					activeModel.contextWindow = update.size;
 				}
 			}
-			updateAntigravityStatusBar(
-				this.activeContext,
-				this.currentConfig,
-				this.getTelemetrySnapshot(ledger.piSessionKey),
-			);
+			if (isCurrentSession) {
+				updateAntigravityStatusBar(
+					this.activeContext,
+					this.currentConfig,
+					this.getTelemetrySnapshot(ledger.piSessionKey),
+				);
+			}
 			return;
 		}
 
 		if (update.sessionUpdate === "session_info_update") {
+			if (ledger.piSessionKey !== this.resolveCurrentPiSessionKey()) {
+				return;
+			}
 			const newTitle = update.title?.trim();
 			if (newTitle) {
 				try {
@@ -906,7 +938,10 @@ export class TurnCoordinator {
 			}
 
 			// 模式 A / Hybrid 下的 AGY 原生工具调用
-			ledger.activePump?.queue.push({ kind: "acp_update", update });
+			if (ledger.activePump) {
+				ledger.announcedMirrorCallIds.add(update.toolCallId);
+				ledger.activePump.queue.push({ kind: "acp_update", update });
+			}
 			return;
 		}
 
@@ -914,9 +949,12 @@ export class TurnCoordinator {
 			const isHostMcp =
 				ledger.hostMcpAnnouncementIds.has(update.toolCallId) ||
 				this.isHostMcpToolEvent(ledger, update.title, update.name);
-			// Outside a Pi turn (agy woke up on its own) no mirror tool waits for the
-			// update; registering it would only leave an orphaned entry behind.
-			const awaited = Boolean(ledger.activePump) || this.mirrorBroker.isTracking(update.toolCallId);
+			// Outside a Pi turn (agy woke up on its own) or for a stray/late update
+			// whose tool_call was not announced in this turn, no mirror tool waits for
+			// it; registering it would leave an orphaned entry behind.
+			const awaited =
+				this.mirrorBroker.isTracking(update.toolCallId) ||
+				ledger.announcedMirrorCallIds.has(update.toolCallId);
 			if (!isHostMcp && ledger.toolMode !== "pi-tools" && awaited) {
 				this.mirrorBroker.registerOrUpdateCall(sessionId, update);
 			}
@@ -1141,6 +1179,7 @@ export class TurnCoordinator {
 						visibleMessages.slice(0, idleCandidate.syncedMessageCount),
 					);
 					if (
+						this.currentConfig.enableSqliteFork &&
 						shouldRebuildForProjectionSync(
 							idleCandidate.syncedProjectionDigest,
 							idleCandidate.syncedProjectedCount,
@@ -1150,7 +1189,10 @@ export class TurnCoordinator {
 					) {
 						// pi-traffic-optimization 触发批量 GC（或用户关闭优化恢复原文）：在空闲轮次边界重建瘦身/还原后的新 AGY 会话
 						skipAnchorRestoreForProjectionSync = true;
-					} else if (exceedsSafeSingleStepBudget(continuationPrompts)) {
+					} else if (
+						this.currentConfig.enableSqliteFork &&
+						exceedsSafeSingleStepBudget(continuationPrompts)
+					) {
 						// 热会话中单次追问本身超过单步 64k 安全线：只读分叉并预注入前序分片后无缝续接，失败则落入路径 3 全量预注入重建
 						const toolsReady =
 							idleCandidate.toolsDigest === toolsDigest ||
@@ -1664,6 +1706,7 @@ export class TurnCoordinator {
 				ledger.parkedCalls.delete(callId);
 			}
 			ledger.detachedCallIds.clear();
+			ledger.announcedMirrorCallIds.clear();
 			ledger.activePump = undefined;
 
 			const idleOk = await this.waitForInFlightPrompt(ledger, 2_500, options?.signal);
@@ -2422,21 +2465,25 @@ export class TurnCoordinator {
 			if (
 				anchorMatch.kind === "exact" &&
 				conn.capabilities?.sessionCapabilities?.resume &&
-				!shouldRebuildForProjectionSync(
-					anchorMatch.anchor.projectionDigest ?? "",
-					anchorMatch.anchor.projectedCount ?? 0,
-					priorProjection,
-					anchorMatch.anchor.usedTokens,
-				)
+				(!this.currentConfig.enableSqliteFork ||
+					!shouldRebuildForProjectionSync(
+						anchorMatch.anchor.projectionDigest ?? "",
+						anchorMatch.anchor.projectedCount ?? 0,
+						priorProjection,
+						anchorMatch.anchor.usedTokens,
+					))
 			) {
 				const pendingBlocks = convertUserMessagesToPromptBlocks(pendingUserMessages);
-				const pendingPlan = buildPromptBlocksPreloadPlan(pendingBlocks, {
-					segmentLabel: "user-message-part",
-				});
+				const pendingPlan = this.currentConfig.enableSqliteFork
+					? buildPromptBlocksPreloadPlan(pendingBlocks, {
+							segmentLabel: "user-message-part",
+						})
+					: undefined;
 
 				// 若本轮单条新提问本身超过单步 64k 安全线，先只读分叉并预注入前序分片，再恢复分叉会话仅发最后一片
 				if (
 					!params.signal?.aborted &&
+					pendingPlan &&
 					pendingPlan.preloadedTurns.length > 0 &&
 					this.currentConfig.enableSqliteFork &&
 					anchorMatch.anchor.dbCheckpoint
@@ -2481,7 +2528,11 @@ export class TurnCoordinator {
 					}
 				}
 
-				if (!sessionInfo && !params.signal?.aborted && pendingPlan.preloadedTurns.length === 0) {
+				if (
+					!sessionInfo &&
+					!params.signal?.aborted &&
+					(!pendingPlan || pendingPlan.preloadedTurns.length === 0)
+				) {
 					try {
 						sessionInfo = await conn.request<AcpSessionResumeResult>(
 							"session/resume",
@@ -2493,7 +2544,7 @@ export class TurnCoordinator {
 							},
 							{ timeoutMs: 20_000, signal: params.signal },
 						);
-						initialPromptBlocks = pendingPlan.finalPromptBlocks;
+						initialPromptBlocks = pendingPlan ? pendingPlan.finalPromptBlocks : pendingBlocks;
 						priorHistoryRestored = true;
 						syncedProjectionDigest = anchorMatch.anchor.projectionDigest ?? "";
 						syncedProjectedCount = anchorMatch.anchor.projectedCount ?? 0;
@@ -2695,6 +2746,7 @@ export class TurnCoordinator {
 				parkedCalls: ledgerDraft.parkedCalls!,
 				detachedCallIds: ledgerDraft.detachedCallIds!,
 				hostMcpAnnouncementIds: new Set<string>(),
+				announcedMirrorCallIds: new Set<string>(),
 			});
 
 			this.ledgers.set(params.piSessionKey, ledger);
@@ -3036,6 +3088,7 @@ export class TurnCoordinator {
 						ledger.agySessionId,
 						update,
 					);
+					ledger.announcedMirrorCallIds.delete(update.toolCallId);
 					await writer.appendToolCallStreaming(
 						{
 							id: update.toolCallId,
@@ -3061,6 +3114,7 @@ export class TurnCoordinator {
 								ledger.agySessionId,
 								extra.update,
 							);
+							ledger.announcedMirrorCallIds.delete(extra.update.toolCallId);
 							writer.appendToolCall({
 								id: extra.update.toolCallId,
 								name: extraClassified.mirrorToolName,
@@ -3169,6 +3223,7 @@ export class TurnCoordinator {
 					if (!signal?.aborted) {
 						await this.emitUpstreamTelemetryForStep(ledger, pump, model, options, { status: 499 });
 					}
+					ledger.announcedMirrorCallIds.clear();
 					ledger.activePump = undefined;
 					writer.fail("aborted", "Request aborted");
 					return;
@@ -3178,6 +3233,7 @@ export class TurnCoordinator {
 						status: 400,
 					});
 					this.dropDeferredSteer(ledger);
+					ledger.announcedMirrorCallIds.clear();
 					ledger.activePump = undefined;
 					writer.fail("error", "Model refused the request");
 					return;
@@ -3186,6 +3242,7 @@ export class TurnCoordinator {
 				if (pump.permissionDeclined && !writer.message.content.some((b) => b.type === "text" && b.text.trim())) {
 					await this.emitUpstreamTelemetryForStep(ledger, pump, model, options, { status: 403 });
 					this.dropDeferredSteer(ledger);
+					ledger.announcedMirrorCallIds.clear();
 					ledger.activePump = undefined;
 					writer.fail("error", pump.permissionDeclined);
 					return;
@@ -3226,6 +3283,7 @@ export class TurnCoordinator {
 					continue;
 				}
 
+				ledger.announcedMirrorCallIds.clear();
 				ledger.activePump = undefined;
 
 				if (
@@ -3267,6 +3325,7 @@ export class TurnCoordinator {
 				}
 				this.mirrorBroker.abortSessionCalls(ledger.agySessionId, "ACP prompt error");
 				this.dropDeferredSteer(ledger);
+				ledger.announcedMirrorCallIds.clear();
 				ledger.activePump = undefined;
 				writer.fail(signal?.aborted ? "aborted" : "error", errMsg);
 				return;
@@ -4050,6 +4109,7 @@ export class TurnCoordinator {
 		}
 		ledger.parkedCalls.clear();
 		ledger.detachedCallIds.clear();
+		ledger.announcedMirrorCallIds.clear();
 		ledger.activePump = undefined;
 		ledger.inFlightPrompt = undefined;
 
