@@ -17,7 +17,8 @@
  * ends, a message wakes it, it answers); `pi --continue` and the next prompt must
  * reattach with `session/resume` and send only the typed text. Then a forked Pi
  * session must refuse after the original went on, and `/agy sessions` must import
- * the conversation and continue it.
+ * the conversation and continue it. Last, a new Pi session stops a turn after agy
+ * ran a tool; the next prompt must go on in the same agy conversation.
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import * as assert from "node:assert/strict";
@@ -240,12 +241,42 @@ async function main() {
 	check("5 sends only the typed prompt", () => assert.deepEqual(promptsSent(mark), typedPrompt("imported question epsilon")));
 	await quit(target);
 
-	check("only the four typed prompts reached agy", () =>
+	// 6. Stop a turn after agy ran a tool (Esc), then send the next prompt.
+	target = await startPi([]);
+	mark = calls().length;
+	await type(target, "run a tool and keep working zeta");
+	await waitFor(target, /MOCK TOOL OUTPUT/);
+	await sleep(800);
+	tmux("send-keys", "-t", target, "Escape");
+	const stoppedConversation = prompts(mark)[0]?.sessionId;
+	assert.ok(stoppedConversation, "the stopped prompt reached the mock");
+	const deadline = Date.now() + 10_000;
+	while (Date.now() < deadline && !calls().slice(mark).some((call) => call.method === "session/cancel")) await sleep(200);
+	await sleep(1000);
+	show("6: the stopped turn", target);
+	const afterStop = calls().length;
+	await type(target, "after stop eta");
+	await waitFor(target, /heard: after stop eta|refusing/);
+	show("6: the prompt after the stop", target);
+	check("6 the stop cancels the agy turn", () =>
+		assert.ok(calls().slice(mark, afterStop).some((call) => call.method === "session/cancel" && call.sessionId === stoppedConversation)));
+	check("6 the next prompt continues the same agy conversation", () => {
+		assert.doesNotMatch(pane(target), /refusing/);
+		assert.ok(!calls().slice(afterStop).some((call) => call.method === "session/new"), "no new agy conversation");
+		assert.equal(prompts(afterStop)[0]?.sessionId, stoppedConversation);
+		assert.match(pane(target), /turn=2 heard: after stop eta/);
+	});
+	check("6 sends only the typed prompt", () => assert.deepEqual(promptsSent(afterStop), typedPrompt("after stop eta")));
+	await quit(target);
+
+	check("only the typed prompts reached agy", () =>
 		assert.deepEqual(promptsSent(0), [
 			...typedPrompt("first question alpha"),
 			...typedPrompt("second question beta"),
 			...typedPrompt("third question gamma"),
 			...typedPrompt("imported question epsilon"),
+			...typedPrompt("run a tool and keep working zeta"),
+			...typedPrompt("after stop eta"),
 		]));
 }
 

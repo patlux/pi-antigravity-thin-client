@@ -117,7 +117,7 @@ All interface texts are in English. Upstream's texts were Chinese and are transl
 
 `node scripts/screenshots/capture.mjs` takes the screenshots again. It runs Pi with this package against a scripted stand-in for `agy` (`scripts/screenshots/mock-agy.mjs`) in a temporary home, so nothing reaches Antigravity. It needs `pi` and `tmux`, and `resvg` with fixed fonts for the PNG files (through `nix` when they are not on `PATH`).
 
-`npm run test:e2e-resume` checks [continuing a conversation](#continue-a-conversation) in the real Pi: `pi --continue` after Antigravity worked on its own, a forked Pi session that must refuse, and `/agy sessions`. It runs against its own stand-in for `agy` (`scripts/e2e/mock-agy.mjs`) in a temporary home whose `PATH` has no other `agy`, and checks every ACP request the stand-in got. It needs `pi` and `tmux`.
+`npm run test:e2e-resume` checks [continuing a conversation](#continue-a-conversation) in the real Pi: `pi --continue` after Antigravity worked on its own, a forked Pi session that must refuse, `/agy sessions`, and the next prompt after stopping a turn in which agy already ran a tool. It runs against its own stand-in for `agy` (`scripts/e2e/mock-agy.mjs`) in a temporary home whose `PATH` has no other `agy`, and checks every ACP request the stand-in got. It needs `pi` and `tmux`.
 
 ## Upstream
 

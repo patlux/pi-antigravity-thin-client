@@ -56,6 +56,8 @@ const CONFIG_OPTIONS = [
 ];
 const sessionResult = (sessionId) => ({ sessionId, configOptions: CONFIG_OPTIONS, _meta: { antigravity: { tier: { id: "ultra", name: "Google AI Ultra" } } } });
 const update = (sessionId, u) => send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: u } });
+/** Prompts agy is still working on, by conversation; `session/cancel` ends them. */
+const runningPrompts = new Map();
 
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("close", () => process.exit(0));
@@ -107,6 +109,17 @@ rl.on("line", (line) => {
 			const text = (p.prompt ?? []).map((b) => (b.type === "text" ? b.text : `[${b.type}]`)).join("\n");
 			log({ method: msg.method, sessionId: p.sessionId, prompt: p.prompt });
 			if (!fs.existsSync(dbPath(p.sessionId))) return fail("no such conversation");
+			if (text.startsWith("run a tool and keep working")) {
+				// agy runs one shell command, then keeps working until the client cancels.
+				appendSteps(p.sessionId, [14, 21]);
+				const h = readHistory(p.sessionId);
+				h.items.push({ role: "user", text });
+				writeHistory(p.sessionId, h);
+				update(p.sessionId, { sessionUpdate: "tool_call", toolCallId: "mock-tool-1", title: "echo mock tool", kind: "execute", status: "pending", rawInput: { CommandLine: "echo mock tool" } });
+				update(p.sessionId, { sessionUpdate: "tool_call_update", toolCallId: "mock-tool-1", status: "completed", rawOutput: "MOCK TOOL OUTPUT" });
+				runningPrompts.set(p.sessionId, msg.id);
+				return;
+			}
 			const turn = appendSteps(p.sessionId, [14, 15]);
 			const answer = `MOCK conv=${p.sessionId.slice(0, 8)} turn=${turn} heard: ${text}`;
 			const h = readHistory(p.sessionId);
@@ -114,6 +127,15 @@ rl.on("line", (line) => {
 			writeHistory(p.sessionId, h);
 			update(p.sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: answer } });
 			return reply({ stopReason: "end_turn", usage: { inputTokens: 10, outputTokens: 5 } });
+		}
+		case "session/cancel": {
+			log({ method: msg.method, sessionId: p.sessionId });
+			const running = runningPrompts.get(p.sessionId);
+			if (running !== undefined) {
+				runningPrompts.delete(p.sessionId);
+				send({ jsonrpc: "2.0", id: running, result: { stopReason: "cancelled" } });
+			}
+			return;
 		}
 		default:
 			log({ method: msg.method, sessionId: p.sessionId });
