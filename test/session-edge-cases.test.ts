@@ -155,6 +155,7 @@ import { DatabaseSync } from "node:sqlite";
 const rootDir = path.dirname(fileURLToPath(import.meta.url));
 const callsLog = path.join(rootDir, "calls.jsonl");
 let sessionCounter = 0;
+const stalledPrompts = new Map();
 
 function send(obj) {
 	process.stdout.write(JSON.stringify(obj) + "\\n");
@@ -277,6 +278,11 @@ rl.on("line", (line) => {
 	}
 
 	if (msg.method === "session/cancel") {
+		const stalledId = stalledPrompts.get(msg.params?.sessionId);
+		if (stalledId !== undefined) {
+			stalledPrompts.delete(msg.params.sessionId);
+			send({ jsonrpc: "2.0", id: stalledId, result: { stopReason: "cancelled" } });
+		}
 		return;
 	}
 
@@ -393,6 +399,35 @@ rl.on("line", (line) => {
 				});
 				send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
 			}, 40);
+			return;
+		}
+
+		if (text.startsWith("STALL_AFTER_TOOL")) {
+			// agy runs one tool, then keeps working until the client cancels the turn.
+			send({
+				jsonrpc: "2.0",
+				method: "session/update",
+				params: {
+					sessionId,
+					update: {
+						sessionUpdate: "tool_call",
+						toolCallId: "stall-call-1",
+						title: "echo stall",
+						kind: "execute",
+						status: "pending",
+						rawInput: { CommandLine: "echo stall" },
+					},
+				},
+			});
+			send({
+				jsonrpc: "2.0",
+				method: "session/update",
+				params: {
+					sessionId,
+					update: { sessionUpdate: "tool_call_update", toolCallId: "stall-call-1", status: "completed", rawOutput: "stall output" },
+				},
+			});
+			stalledPrompts.set(sessionId, msg.id);
 			return;
 		}
 
@@ -1236,6 +1271,92 @@ describe("session coordination and resume edge cases", () => {
 				"late duplicate tool_call_update must not re-register an orphan in mirrorBroker",
 			);
 			assert.equal(broker.isTracking("stray-call-999"), false);
+		} finally {
+			await coordinator.dispose();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("Task 6: continues the live agy session after the user stops a turn that already ran mirror tools", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-edge-t6-abort-tools-"));
+		const mock = writeEdgeCaseMockAgy(root);
+		const config: BridgeConfig = {
+			...DEFAULT_BRIDGE_CONFIG,
+			agyBin: mock.bin,
+			geminiDir: path.join(root, ".gemini"),
+		};
+		const broker = new AgyTurnMirrorBroker();
+		const coordinator = new TurnCoordinator(createStubPi(), new AcpProcessManager(), broker, config);
+		const mirrorTools = createAgyMirrorToolDefinitions(broker);
+		const tools = mirrorTools.map((t) => ({
+			name: t.name,
+			description: t.description,
+			parameters: t.parameters,
+		}));
+		const piSessionId = "edge-t6-abort-tools";
+		coordinator.setActiveContext(
+			interactiveContext(root, { sessionManager: { getSessionId: () => piSessionId, getBranch: () => [] } }),
+		);
+
+		try {
+			const u1 = makeUser("first prompt", 1);
+			typedByHuman(coordinator.humanPromptGate, u1);
+			const a1 = await coordinator
+				.streamSimple(TEST_MODEL, normalizeContext({ messages: [u1], tools }), { sessionId: piSessionId })
+				.result();
+			assert.equal(a1.stopReason, "stop", a1.errorMessage);
+
+			// agy runs a mirror tool, then the user stops the turn while agy keeps working.
+			const u2 = makeUser("STALL_AFTER_TOOL", 2);
+			typedByHuman(coordinator.humanPromptGate, u2);
+			const step1 = await coordinator
+				.streamSimple(TEST_MODEL, normalizeContext({ messages: [u1, a1, u2], tools }), { sessionId: piSessionId })
+				.result();
+			assert.equal(step1.stopReason, "toolUse", step1.errorMessage);
+			const call = step1.content.find((c): c is ToolCall => c.type === "toolCall");
+			assert.ok(call);
+			assert.equal(call.name, "agy_bash");
+			const mirror = mirrorTools.find((t) => t.name === call.name);
+			assert.ok(mirror);
+			const execResult = await mirror.execute(call.id, call.arguments, undefined, undefined, interactiveToolContext(root));
+			const toolResult: ToolResultMessage = {
+				role: "toolResult",
+				toolCallId: call.id,
+				toolName: call.name,
+				content: execResult.content,
+				isError: false,
+				timestamp: 3,
+			};
+
+			const abort = new AbortController();
+			const stopped = coordinator.streamSimple(
+				TEST_MODEL,
+				normalizeContext({ messages: [u1, a1, u2, step1, toolResult], tools }),
+				{ sessionId: piSessionId, signal: abort.signal },
+			);
+			setTimeout(() => abort.abort(), 100);
+			const aborted = await stopped.result();
+			assert.equal(aborted.stopReason, "aborted");
+
+			fs.rmSync(mock.callsLog, { force: true });
+			const u3 = makeUser("follow-up after stop", 4);
+			typedByHuman(coordinator.humanPromptGate, u3);
+			const sent: unknown[] = [];
+			const next = await coordinator
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({ messages: [u1, a1, u2, step1, toolResult, aborted, u3], tools }),
+					{ sessionId: piSessionId, onPayload: (payload) => { sent.push(payload); } },
+				)
+				.result();
+
+			assert.equal(next.stopReason, "stop", next.errorMessage);
+			assert.equal(next.responseId, a1.responseId);
+			const methods = readMockCalls(mock.callsLog).map((c) => c.method);
+			assert.ok(!methods.includes("session/new"), methods.join(","));
+			assert.ok(!methods.includes("session/resume"), methods.join(","));
+			assert.equal(sent.length, 1);
+			assert.deepEqual(promptOfPayload(sent[0]), [{ type: "text", text: "follow-up after stop" }]);
 		} finally {
 			await coordinator.dispose();
 			fs.rmSync(root, { recursive: true, force: true });

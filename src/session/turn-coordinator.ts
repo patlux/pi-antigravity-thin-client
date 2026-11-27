@@ -101,6 +101,7 @@ import {
 	waitForSqliteToolStepsSettled,
 } from "./checkpoint-sync.ts";
 import { checkAgyConversationSinceAnchor } from "./agy-resume.ts";
+import { isAgyOwnedMirrorStep } from "./aborted-agy-turn.ts";
 import {
 	ANTIGRAVITY_QUOTA_EXCEEDED_PREFIX,
 	classifyAntigravityTurnOutcome,
@@ -1454,17 +1455,18 @@ export class TurnCoordinator {
 
 		// 若增量片段中仅包含因按 Esc 中断或报错失败的未完结轮次（无任何已执行工具结果），
 		// 跳过失败片段仅提取末尾新增用户消息，在同一热缓存会话上无损续接，避免误拆长会话退化为截断重放。
-		if (delta.some((m) => m.role === "toolResult")) {
-			return undefined;
-		}
+		// Thin client: mirror tool steps of a stopped agy turn are agy's own history and pass too.
 		let lastFailedAssistantIdx = -1;
 		for (let i = 0; i < delta.length; i++) {
 			const m = delta[i];
-			if (m.role === "assistant") {
-				if (m.stopReason !== "aborted" && m.stopReason !== "error") {
+			if (m.role === "toolResult") {
+				if (!isAgyOwnedMirrorStep(m, ledger.toolMode)) return undefined;
+			} else if (m.role === "assistant") {
+				if (m.stopReason === "aborted" || m.stopReason === "error") {
+					lastFailedAssistantIdx = i;
+				} else if (!isAgyOwnedMirrorStep(m, ledger.toolMode)) {
 					return undefined;
 				}
-				lastFailedAssistantIdx = i;
 			}
 		}
 		if (lastFailedAssistantIdx === -1 || lastFailedAssistantIdx >= delta.length - 1) {
