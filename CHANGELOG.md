@@ -2,6 +2,14 @@
 
 Fork releases of pi-antigravity-thin-client. Versions follow SemVer; entries come from the Markdown changesets in `.changeset/`. See [CONTRIBUTING.md](CONTRIBUTING.md) for the release workflow. The upstream changelog of pi-antigravity-bridge is in [docs/upstream/CHANGELOG.md](docs/upstream/CHANGELOG.md).
 
+## 0.3.1 - 2026-11-27
+
+Upstream base: pi-antigravity-bridge 0.1.16.
+
+### Fixed
+
+- Stopping an Antigravity turn after it had already run tools no longer breaks the conversation: the next prompt continues on the same agy session instead of failing with the replay refusal.
+
 ## 0.3.0 - 2026-11-27
 
 Upstream base: pi-antigravity-bridge 0.1.16.
