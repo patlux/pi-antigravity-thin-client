@@ -547,6 +547,11 @@ export class AcpClientConnection {
 		return !this.closed && this.proc.exitCode === null && !this.proc.killed;
 	}
 
+	/** Fork: an RPC is waiting for agy, or a session on this process is still open. */
+	get hasOpenWork(): boolean {
+		return this.pending.size > 0 || this.activeSessions.size > 0 || this.orphanedSessionOpenRpcs.size > 0;
+	}
+
 	get capabilities(): AcpInitializeResult["agentCapabilities"] | undefined {
 		return this.initResult?.agentCapabilities;
 	}
@@ -975,6 +980,8 @@ export class AcpProcessManager {
 	private readonly pool = new Map<string, AcpClientConnection>();
 	private readonly initializing = new Map<string, Promise<AcpClientConnection>>();
 	private readonly initializingConns = new Set<AcpClientConnection>();
+	/** Fork: when `acquire` last handed out each pooled process (src/session/idle-release.ts). */
+	private readonly lastAcquiredAtMs = new Map<AcpClientConnection, number>();
 	private sharedHandlers: AcpServerHandlers = {};
 	private disposeEpoch = 0;
 
@@ -1016,6 +1023,7 @@ export class AcpProcessManager {
 
 		const existing = this.pool.get(key);
 		if (existing?.isAlive) {
+			this.lastAcquiredAtMs.set(existing, Date.now());
 			await existing.ensureInitialized(signal);
 			return existing;
 		}
@@ -1034,6 +1042,7 @@ export class AcpProcessManager {
 						throw new Error("Antigravity ACP process pool is closed");
 					}
 					this.pool.set(key, conn);
+					this.lastAcquiredAtMs.set(conn, Date.now());
 					return conn;
 				} catch (error) {
 					await conn.dispose();
@@ -1059,7 +1068,30 @@ export class AcpProcessManager {
 			}
 		}
 		this.initializingConns.delete(target);
+		this.lastAcquiredAtMs.delete(target);
 		await target.dispose();
+	}
+
+	/**
+	 * Fork: stops pooled processes that nobody uses: not `inUse`, no open RPC or session,
+	 * and not handed out by `acquire` for `idleMs`. Returns how many it stopped.
+	 */
+	async releaseIdle(
+		inUse: (conn: AcpClientConnection) => boolean,
+		idleMs: number,
+		nowMs: number = Date.now(),
+	): Promise<number> {
+		const idle: AcpClientConnection[] = [];
+		for (const conn of this.pool.values()) {
+			const acquiredAt = this.lastAcquiredAtMs.get(conn) ?? 0;
+			if (!inUse(conn) && !conn.hasOpenWork && nowMs - acquiredAt >= idleMs) {
+				idle.push(conn);
+			}
+		}
+		for (const conn of idle) {
+			await this.evict(conn);
+		}
+		return idle.length;
 	}
 
 	async disposeAll(): Promise<void> {
@@ -1071,6 +1103,7 @@ export class AcpProcessManager {
 		this.pool.clear();
 		this.initializing.clear();
 		this.initializingConns.clear();
+		this.lastAcquiredAtMs.clear();
 		await Promise.allSettled(Array.from(connections, (conn) => conn.dispose()));
 	}
 }

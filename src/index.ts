@@ -27,6 +27,7 @@ import {
 } from "./catalog/model-discovery.ts";
 import { loadBridgeConfig, resolvePiAgentDir } from "./config.ts";
 import { discoverAgySkillDirectoriesForPi } from "./session/customization-mounter.ts";
+import { IdleAgyReleaser } from "./session/idle-release.ts";
 import { extractVisibleMessages } from "./session/reconcile.ts";
 import { TurnCoordinator } from "./session/turn-coordinator.ts";
 import {
@@ -102,6 +103,9 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 	const mirrorBroker = new AgyTurnMirrorBroker();
 	const coordinator = new TurnCoordinator(pi, processManager, mirrorBroker, currentConfig);
 	const toolActivation = new ToolActivationController(pi);
+	// Fork: stop agy processes of quiet sessions (stale MCP sign-ins, see idle-release.ts).
+	const idleReleaser = new IdleAgyReleaser(coordinator, () => coordinator.config.idleReleaseMinutes);
+	idleReleaser.start();
 
 	const cachedCatalog = readCachedCatalog();
 	if (cachedCatalog?.tier) {
@@ -323,6 +327,7 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 		coordinator.setActiveContext(ctx);
 		toolActivation.syncForContext(ctx, currentConfig);
 		background.sync(ctx);
+		idleReleaser.start();
 
 		if (invalidatePrevious) {
 			await invalidatePrevious;
@@ -412,6 +417,7 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_shutdown", async () => {
 		activePiSessionId = undefined;
+		idleReleaser.stop();
 		background.stop();
 		backgroundRefreshController?.abort();
 		backgroundRefreshController = undefined;

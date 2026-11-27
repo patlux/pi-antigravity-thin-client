@@ -109,6 +109,7 @@ import {
 	snapshotTurnStepWatermark,
 } from "./agy-turn-outcome.ts";
 import { prepareCustomizationMount } from "./customization-mounter.ts";
+import { agyHasPendingWork } from "./idle-release.ts";
 import {
 	buildDetachedToolResultBlocks,
 	buildFreshReplayPlan,
@@ -404,6 +405,10 @@ interface ManagedSessionLedger {
 	 * background tasks and subagents.
 	 */
 	deferredSteerBlocks?: AcpPromptBlock[];
+	/** Fork (idle-release.ts): last prompt or update from agy on this session. */
+	lastActivityAtMs: number;
+	/** Fork (idle-release.ts): transcript digest of the last turn anchor written for this session. */
+	anchoredTranscriptDigest?: string;
 }
 
 const DEFAULT_SESSION_KEY = "__default_pi_session__";
@@ -461,6 +466,8 @@ export class TurnCoordinator {
 	private outOfTurnListener?: (agySessionId: string, update: AcpSessionUpdatePayload) => void;
 	private promptInactivityTimeoutMs = DEFAULT_PROMPT_INACTIVITY_TIMEOUT_MS;
 	private activeDialogDepth = 0;
+	/** Fork (idle-release.ts): `streamSimple` calls that have not finished yet. */
+	private activeStreamSteps = 0;
 
 	constructor(
 		pi: ExtensionAPI,
@@ -728,9 +735,61 @@ export class TurnCoordinator {
 
 		try {
 			this.pi.appendEntry(AGY_SESSION_ANCHOR_CUSTOM_TYPE, anchor);
+			ledger.anchoredTranscriptDigest = anchor.transcriptDigest;
 		} catch {
 			// 非持久化模式或只读上下文下忽略
 		}
+	}
+
+	/**
+	 * Fork (idle-release.ts): stops the agy processes whose Pi sessions have been quiet for
+	 * `idleMs`. A session qualifies only between turns, with its last turn anchored, and while agy
+	 * has no background work in it; the next typed prompt continues it with `session/resume`.
+	 * Returns how many processes stopped.
+	 */
+	async releaseIdleAgyProcesses(options: {
+		idleMs: number;
+		nowMs?: number;
+		hasPendingWork?: (agySessionId: string) => boolean;
+	}): Promise<number> {
+		const nowMs = options.nowMs ?? Date.now();
+		const hasPendingWork =
+			options.hasPendingWork ?? ((id: string) => agyHasPendingWork(this.currentConfig, id));
+		const busy = () =>
+			this.activeStreamSteps > 0 || this.activeDialogDepth > 0 || this.auxUpdateListeners.size > 0;
+		if (busy()) return 0;
+
+		const byConn = new Map<AcpClientConnection, ManagedSessionLedger[]>();
+		for (const ledger of this.ledgers.values()) {
+			const list = byConn.get(ledger.conn) ?? [];
+			list.push(ledger);
+			byConn.set(ledger.conn, list);
+		}
+		for (const [conn, ledgers] of byConn) {
+			if (!conn.isAlive) continue;
+			const quiet = ledgers.every(
+				(ledger) =>
+					!ledger.activePump &&
+					ledger.parkedCalls.size === 0 &&
+					!ledger.inFlightPrompt &&
+					!ledger.deferredSteerBlocks?.length &&
+					!ledger.initialReplayPending &&
+					ledger.anchoredTranscriptDigest !== undefined &&
+					ledger.anchoredTranscriptDigest === ledger.syncedTranscriptDigest &&
+					nowMs - ledger.lastActivityAtMs >= options.idleMs &&
+					!hasPendingWork(ledger.agySessionId),
+			);
+			if (!quiet) continue;
+			for (const ledger of ledgers) {
+				if (busy() || this.ledgers.get(ledger.piSessionKey) !== ledger) continue;
+				await this.teardownLedger(ledger);
+			}
+		}
+
+		if (busy()) return 0;
+		const inUse = new Set<AcpClientConnection>();
+		for (const ledger of this.ledgers.values()) inUse.add(ledger.conn);
+		return this.processManager.releaseIdle((conn) => inUse.has(conn), options.idleMs, nowMs);
 	}
 
 	/** 供 `/agy sessions` 浏览导入后直接建立内存与分支锚点绑定 */
@@ -877,6 +936,7 @@ export class TurnCoordinator {
 		};
 		signal?.addEventListener("abort", onImmediateAbort, { once: true });
 
+		this.activeStreamSteps++;
 		void this.runStreamStep(writer, model, context, options)
 			.catch((error) => {
 				if (!writer.isTerminated) {
@@ -886,6 +946,7 @@ export class TurnCoordinator {
 				}
 			})
 			.finally(() => {
+				this.activeStreamSteps--;
 				signal?.removeEventListener("abort", onImmediateAbort);
 			});
 
@@ -937,6 +998,7 @@ export class TurnCoordinator {
 
 		const ledger = this.ledgersByAgyId.get(sessionId);
 		if (!ledger) return;
+		ledger.lastActivityAtMs = Date.now();
 
 		if (
 			ledger.activePump &&
@@ -2908,6 +2970,7 @@ export class TurnCoordinator {
 				detachedCallIds: ledgerDraft.detachedCallIds!,
 				hostMcpAnnouncementIds: new Set<string>(),
 				announcedMirrorCallIds: new Set<string>(),
+				lastActivityAtMs: Date.now(),
 			});
 
 			this.ledgers.set(params.piSessionKey, ledger);
@@ -3040,6 +3103,8 @@ export class TurnCoordinator {
 		outboundPayload: { sessionId: string; prompt: AcpPromptBlock[] },
 	): void {
 		this.httpMcpBridge.clearSessionCancelled(ledger.agySessionId);
+		ledger.lastActivityAtMs = Date.now();
+		ledger.anchoredTranscriptDigest = undefined;
 		pump.finished = false;
 		pump.turnStartStepIdx = snapshotTurnStepWatermark(this.currentConfig, ledger.agySessionId);
 		pump.lastActivityAtMs = Date.now();
@@ -3062,6 +3127,7 @@ export class TurnCoordinator {
 				pump.queue.push({ kind: "prompt_error", error });
 			})
 			.finally(() => {
+				ledger.lastActivityAtMs = Date.now();
 				if (ledger.inFlightPrompt === trackedRef) {
 					ledger.inFlightPrompt = undefined;
 				}

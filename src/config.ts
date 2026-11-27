@@ -45,6 +45,12 @@ export interface BridgeConfig {
 	sandbox: boolean;
 	/** MCP 工具调用预取消剥离阈值（毫秒，需小于 AGY 180000ms 硬上限） */
 	mcpHoldLimitMs: number;
+	/**
+	 * Fork: minutes without activity after which the agy process of a Pi session stops
+	 * (src/session/idle-release.ts); 0 keeps it running. The next typed prompt continues
+	 * the same conversation.
+	 */
+	idleReleaseMinutes: number;
 	/** 自定义 agy 可执行文件路径 */
 	agyBin?: string;
 	/** 自定义 Gemini 根目录（默认 ~/.gemini） */
@@ -78,6 +84,7 @@ export const DEFAULT_BRIDGE_CONFIG: Readonly<BridgeConfig> = {
 	enableSqliteFork: true,
 	sandbox: false,
 	mcpHoldLimitMs: 165_000,
+	idleReleaseMinutes: 30,
 	geminiDir: path.join(os.homedir(), ".gemini"),
 	appDataDirName: "antigravity-cli",
 };
@@ -131,6 +138,14 @@ function parseStrictBoolean(value: unknown, fallback: boolean): boolean {
 		if (normalized === "false" || normalized === "off" || normalized === "0") return false;
 	}
 	return fallback;
+}
+
+/** Whole minutes from 0 (never stop) to one day; anything else keeps `fallback`. */
+function parseIdleReleaseMinutes(value: unknown, fallback: number): number {
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+		return fallback;
+	}
+	return Math.min(24 * 60, Math.floor(value));
 }
 
 function readJsonFileSafe(filePath: string): Record<string, unknown> | undefined {
@@ -192,6 +207,7 @@ function applyRawConfigObject(base: BridgeConfig, raw: Record<string, unknown>):
 		// 限制在 5 秒至 175 秒之间，确保早于 AGY 180 秒硬超时触发安全剥离
 		next.mcpHoldLimitMs = Math.max(5_000, Math.min(175_000, Math.floor(raw.mcpHoldLimitMs)));
 	}
+	next.idleReleaseMinutes = parseIdleReleaseMinutes(raw.idleReleaseMinutes, next.idleReleaseMinutes);
 
 	if (typeof raw.agyBin === "string" && raw.agyBin.trim().length > 0) {
 		next.agyBin = expandHomeDir(raw.agyBin);
@@ -241,6 +257,12 @@ export function loadBridgeConfig(options: LoadBridgeConfigOptions = {}): BridgeC
 	// 应用公开环境变量覆盖
 	if (env.PI_AGY_BIN?.trim()) {
 		config.agyBin = expandHomeDir(env.PI_AGY_BIN);
+	}
+	if (env.PI_AGY_IDLE_RELEASE_MINUTES?.trim()) {
+		config.idleReleaseMinutes = parseIdleReleaseMinutes(
+			Number(env.PI_AGY_IDLE_RELEASE_MINUTES),
+			config.idleReleaseMinutes,
+		);
 	}
 	if (env.PI_AGY_GEMINI_DIR?.trim()) {
 		config.geminiDir = expandHomeDir(env.PI_AGY_GEMINI_DIR);

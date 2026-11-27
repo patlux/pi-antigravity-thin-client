@@ -4149,3 +4149,122 @@ describe("thin client: continuing an existing Antigravity conversation", () => {
 		assert.ok(!methodsAfterRestart.includes("session/prompt"), methodsAfterRestart.join(","));
 	});
 });
+
+describe("idle release: stopping a quiet agy process", () => {
+	function methodOf(line: string): string {
+		const parsed: unknown = JSON.parse(line);
+		return parsed !== null && typeof parsed === "object" && "method" in parsed ? String(parsed.method) : "";
+	}
+
+	async function withCoordinator(
+		label: string,
+		run: (env: {
+			coordinator: TurnCoordinator;
+			turn: (messages: Message[], sent?: unknown[]) => ReturnType<ReturnType<TurnCoordinator["streamSimple"]>["result"]>;
+			methods: () => string[];
+			piSessionId: string;
+			persistSteps: (agySessionId: string) => void;
+		}) => Promise<void>,
+	): Promise<void> {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), `pi-agy-idle-${label}-`));
+		const config = {
+			...DEFAULT_BRIDGE_CONFIG,
+			agyBin: writeMockAgyExecutable(root, { seedTemplateDbOnNew: true }),
+			geminiDir: path.join(root, ".gemini"),
+		};
+		const entries: { type: "custom"; customType: string; data: unknown }[] = [];
+		const piSessionId = `idle-${label}`;
+		const pi = createStubPiApi();
+		pi.appendEntry = (customType, data) => entries.push({ type: "custom", customType, data });
+		const broker = new AgyTurnMirrorBroker();
+		const coordinator = new TurnCoordinator(pi, new AcpProcessManager(), broker, config);
+		coordinator.setActiveContext(interactiveContext(root, {
+			sessionManager: { getSessionId: () => piSessionId, getBranch: () => entries },
+		}));
+		const tools = createAgyMirrorToolDefinitions(broker).map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
+		const callsLog = path.join(root, "mock-calls.log");
+		try {
+			await run({
+				coordinator,
+				piSessionId,
+				// The mock agy does not write steps; store the prompt and its answer like agy does.
+				persistSteps: (agySessionId) => {
+					const db = new DatabaseSync(path.join(config.geminiDir, config.appDataDirName, "conversations", `${agySessionId}.db`));
+					try {
+						db.exec("INSERT INTO steps (idx, step_type, status) VALUES (0, 14, 3), (1, 15, 3)");
+					} finally { db.close(); }
+				},
+				turn: (messages, sent) => {
+					const last = messages[messages.length - 1];
+					if (last?.role === "user") typedByHuman(coordinator.humanPromptGate, last);
+					return coordinator.streamSimple(TEST_MODEL, normalizeContext({ messages, tools }), {
+						sessionId: piSessionId,
+						onPayload: (payload) => { sent?.push(payload); },
+					}).result();
+				},
+				methods: () => {
+					const lines = fs.existsSync(callsLog) ? fs.readFileSync(callsLog, "utf8").trim().split("\n").filter(Boolean) : [];
+					fs.rmSync(callsLog, { force: true });
+					return lines.map(methodOf);
+				},
+			});
+		} finally {
+			await coordinator.dispose();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	}
+
+	const later = () => Date.now() + 60 * 60_000;
+
+	it("stops the process of an anchored, quiet session and continues it with session/resume", async () => {
+		await withCoordinator("release", async ({ coordinator, turn, methods, piSessionId, persistSteps }) => {
+			const firstUser: UserMessage = { role: "user", content: "FOLLOWUP_MSG:earlier question", timestamp: 1 };
+			const first = await turn([firstUser]);
+			assert.equal(first.stopReason, "stop", first.errorMessage);
+			const agySessionId = first.responseId ?? "";
+			persistSteps(agySessionId);
+			await coordinator.persistTurnAnchor([firstUser, first], piSessionId);
+
+			// Not quiet long enough yet.
+			assert.equal(await coordinator.releaseIdleAgyProcesses({ idleMs: 30 * 60_000, hasPendingWork: () => false }), 0);
+			assert.equal(coordinator.isAgySessionAlive(agySessionId), true);
+
+			methods();
+			assert.equal(await coordinator.releaseIdleAgyProcesses({ idleMs: 30 * 60_000, nowMs: later(), hasPendingWork: () => false }), 1);
+			assert.equal(coordinator.isAgySessionAlive(agySessionId), false);
+			assert.ok(methods().includes("session/close"));
+
+			const sent: unknown[] = [];
+			const nextUser: UserMessage = { role: "user", content: "FOLLOWUP_MSG:next question", timestamp: 2 };
+			const next = await turn([firstUser, first, nextUser], sent);
+			assert.equal(next.stopReason, "stop", next.errorMessage);
+			assert.equal(next.responseId, agySessionId);
+			const after = methods();
+			assert.ok(after.includes("initialize"), after.join(","));
+			assert.ok(after.includes("session/resume"), after.join(","));
+			assert.ok(!after.includes("session/new"), after.join(","));
+			assert.equal(sent.length, 1);
+			assert.deepEqual(
+				sent[0] !== null && typeof sent[0] === "object" && "prompt" in sent[0] ? sent[0].prompt : undefined,
+				[{ type: "text", text: "FOLLOWUP_MSG:next question" }],
+			);
+		});
+	});
+
+	it("keeps the process without a turn anchor or while agy still works in the background", async () => {
+		await withCoordinator("keep", async ({ coordinator, turn, piSessionId }) => {
+			const firstUser: UserMessage = { role: "user", content: "FOLLOWUP_MSG:earlier question", timestamp: 1 };
+			const first = await turn([firstUser]);
+			assert.equal(first.stopReason, "stop", first.errorMessage);
+			const agySessionId = first.responseId ?? "";
+
+			// An aborted or failed turn writes no anchor; only the live process can continue it.
+			assert.equal(await coordinator.releaseIdleAgyProcesses({ idleMs: 30 * 60_000, nowMs: later(), hasPendingWork: () => false }), 0);
+			assert.equal(coordinator.isAgySessionAlive(agySessionId), true);
+
+			await coordinator.persistTurnAnchor([firstUser, first], piSessionId);
+			assert.equal(await coordinator.releaseIdleAgyProcesses({ idleMs: 30 * 60_000, nowMs: later(), hasPendingWork: () => true }), 0);
+			assert.equal(coordinator.isAgySessionAlive(agySessionId), true);
+		});
+	});
+});
